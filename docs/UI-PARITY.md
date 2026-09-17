@@ -143,6 +143,80 @@ real window before we claim parity.
 - Host rows carry an OS brand colour, the label, and a muted `user@host:port`.
 - Row actions (edit, duplicate, delete) appear on hover.
 
+## Chrome metrics (exact, from the app's own stylesheet)
+
+Recovered from `ui-process/assets/main-*.css` `:root` — these are the real
+values, not estimates:
+
+| Variable | Value | Meaning |
+| --- | --- | --- |
+| `--header-height` | **56px** | top bar |
+| `--horizontal-tabs-height` | **51px** | tab row |
+| `--default-font-size` | **14px** | body text |
+| `--app-window-border-radius` | **10px** (0 on Linux/Windows/full-screen) | window corner |
+| `--scrollbar-width` | **8px** | scrollbar |
+| `--max-terminal-width` | 180px | collapsed side panel |
+| `--active-terminal-width` | 240px | expanded side panel |
+| `--default-z-index-overlap` | 1301 | overlay stacking |
+
+Body text is `CircularXX, sans-serif` at 14px with `-webkit-font-smoothing:
+antialiased`; context menus are `border-radius: 6px`, `0 6px 10px #0003`,
+`font-size: 12px`.
+
+## Semantic tokens (exact mapping)
+
+The stylesheet defines a semantic layer over the greys, switched by a
+`.termius-dark-theme` class. This is the mapping to match, dark mode:
+
+| Semantic | Dark value | Hex |
+| --- | --- | --- |
+| `--text-primary` | `white` | `#ffffff` |
+| `--text-secondary` | `dark-grey-7` | `#8d91a5` |
+| `--text-disabled` | `dark-grey-6` | `#5a5e73` |
+| `--text-accent` | `blue` | `#2091f6` |
+| `--surface-lowest` | `dark-grey-1` | `#141729` |
+| **`--main-bg`** | **`dark-grey-2`** | **`#1d2033`** |
+| `--main-side-bg` | `dark-grey-2` | `#1d2033` |
+| `--surface-high` | `dark-grey-3` | `#282b3d` |
+| `--surface-highest` | `dark-grey-4` | `#32364a` |
+| `--main-form-bg` | `dark-grey-4` | `#32364a` |
+| `--background-entity` | `dark-grey-5` | `#3e4257` |
+| `--border-strong` | `dark-grey-5` | `#3e4257` |
+| `--border-basic` | `dark-grey-7-a25` | `#8d91a540` |
+| `--border-light` | `dark-grey-7-a10` | `#8d91a51a` |
+| `--border-extra-light` | `dark-grey-7-a05` | `#8d91a50d` |
+| `--surface-accent` | `blue-a25` | `#2091f640` |
+| `--list-hover` | `dark-grey-5` | `#3e4257` |
+| `--list-select` | `dark-grey-4` | `#32364a` |
+| `--entity-item-background` | `dark-grey-3` | `#282b3d` |
+| `--cf-main-background` | `dark-grey-1` | `#141729` |
+| `--border-accent` / `--button-accent` | `blue` | `#2091f6` |
+
+**Correction to the first draft of this document:** the app background is
+`--main-bg` = **`#1d2033`**, not `#141729`. The darkest grey is
+`--surface-lowest` and `--cf-main-background`, i.e. the command-line/pane
+background behind the chrome, not the window itself. The earlier mapping used
+`#141729` for `background`, which renders the whole window one step too dark.
+
+## Known chrome differences still to close
+
+Measured against a screenshot of the running app. These are the gaps between our
+current shell and the original:
+
+1. **We have three horizontal bands; the original has one.** We draw a custom
+   title bar *and* a tab strip *and* a bottom status bar. The original draws a
+   single 56px header containing the sidebar toggle, tabs, `+`, and the
+   right-aligned actions (update, notifications, account), and **no bottom
+   status bar at all**.
+2. **Sidebar is not collapsible.** The original collapses to a rail
+   (`--max-terminal-width: 180px` collapsed vs `--active-terminal-width: 240px`
+   expanded) and puts host *creation* behind a control rather than an
+   always-visible form pinned to the bottom.
+3. **Window corner radius.** The original is a 10px rounded frameless window.
+4. **Host rows.** The original uses `--entity-item-background` (`#282b3d`) cards
+   with `--list-hover` / `--list-select` states, not bare rows.
+5. **Body text is 14px**, not 13px.
+
 ## Substitutions
 
 Fidelity where it is free, substitution where the original is licensed:
