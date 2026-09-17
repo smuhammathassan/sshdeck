@@ -28,12 +28,25 @@ use keys_pane::KeysPane;
 use palette::PaletteView;
 use settings::SettingsView;
 use sftp_pane::SftpPane;
-use sshdeck_core::session::SessionConfig;
+use sshdeck_core::session::{Session as SshSession, SessionConfig, SessionEvent};
 use sshdeck_core::{Host, HostId, HostStore, SessionState};
 use sshdeck_sftp::SftpClient;
 use terminal::{PaneStatus, TerminalPane};
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_args(&args) {
+        // Headless `--connect … --exec …`: no gpui and no window at all.
+        Ok(Mode::Exec { host, command }) => std::process::exit(run_headless(&host, &command)),
+        Err(message) => {
+            eprintln!("sshdeck: {message}");
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+        // No headless flags: the desktop app, exactly as before.
+        Ok(Mode::Gui) => {}
+    }
+
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
@@ -47,6 +60,154 @@ fn main() {
             })
             .detach();
         });
+}
+
+/// The command-line forms the binary understands.
+#[derive(Debug, PartialEq, Eq)]
+enum Mode {
+    /// No `--connect`/`--exec`: start the desktop app.
+    Gui,
+    /// Run one command over SSH and stream its output to stdout.
+    Exec { host: String, command: String },
+}
+
+/// Usage for the `--connect`/`--exec` form, printed on any argument error.
+const USAGE: &str = "\
+usage: sshdeck [--connect <host-id-or-label> --exec \"<command>\"]
+
+  (no arguments)   start the desktop app
+  --connect        host id or label from the saved inventory
+  --exec           run one command over SSH and stream its output to stdout";
+
+/// Parses the command line with the program name removed.
+///
+/// `--connect` and `--exec` are accepted in either order; no flags at all means
+/// the GUI. Anything else is a usage error whose message `main` prints before
+/// exiting 2. Kept as a pure function so it is testable without a process.
+fn parse_args(args: &[String]) -> Result<Mode, String> {
+    let mut host: Option<String> = None;
+    let mut command: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--connect" => {
+                index += 1;
+                host = Some(
+                    args.get(index)
+                        .ok_or("--connect needs a host id or label")?
+                        .clone(),
+                );
+            }
+            "--exec" => {
+                index += 1;
+                command = Some(args.get(index).ok_or("--exec needs a command")?.clone());
+            }
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+        index += 1;
+    }
+
+    match (host, command) {
+        (None, None) => Ok(Mode::Gui),
+        (None, Some(_)) => Err("--exec requires --connect".to_string()),
+        (Some(_), None) => Err("--connect requires --exec".to_string()),
+        (Some(host), Some(command)) => Ok(Mode::Exec { host, command }),
+    }
+}
+
+/// The `SSHDECK_PASSWORD` override, if one is set.
+///
+/// Development and test affordance; see `connect` for the full note. The value
+/// goes straight to [`SessionConfig::with_password`] and is never logged or
+/// written to disk.
+fn env_password() -> Option<String> {
+    std::env::var("SSHDECK_PASSWORD").ok()
+}
+
+/// Runs one command over SSH with no window, no gpui, and no async runtime.
+///
+/// This is the same transport the terminal pane uses: `Session::connect` owns
+/// the connection thread and, exactly as in the GUI, requests the PTY and login
+/// shell, so the bytes are what a pane would have fed to its grid. `events()` is
+/// an `async_channel::Receiver`; `recv_blocking` (verified on the pinned
+/// async-channel 2.5.0) lets that stream be drained on the main thread.
+///
+/// Returns the process exit code: 0 on a clean close, 1 on a connect failure or
+/// a [`SessionEvent::Error`].
+fn run_headless(target: &str, command: &str) -> i32 {
+    use std::io::Write as _;
+
+    let mut store = HostStore::at_default_path();
+    if let Err(error) = store.load() {
+        eprintln!("sshdeck: could not load hosts: {error}");
+        return 1;
+    }
+    let Some(host) = store
+        .inventory()
+        .hosts()
+        .iter()
+        .find(|host| host.id.as_str() == target || host.label.eq_ignore_ascii_case(target))
+    else {
+        eprintln!("sshdeck: no host matches {target}");
+        return 1;
+    };
+
+    // See `connect`: `SSHDECK_PASSWORD` is a development and test affordance,
+    // never logged, never written to disk, never shown in the UI. Without it a
+    // password host fails `Session::connect` with a missing-secret error, which
+    // is reported below.
+    let mut config = SessionConfig::from_host(host);
+    if matches!(&host.auth, sshdeck_core::AuthMethod::Password { .. }) {
+        if let Some(password) = env_password() {
+            config = config.with_password(password);
+        }
+    }
+
+    let session = match SshSession::connect(config) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("sshdeck: {error}");
+            return 1;
+        }
+    };
+    // The command is queued; the connection thread only reads it once the shell
+    // is open, so it cannot race the PTY setup. The newline runs it.
+    if let Err(error) = session
+        .write(command.as_bytes())
+        .and_then(|()| session.write(b"\n"))
+    {
+        eprintln!("sshdeck: could not send the command: {error}");
+        return 1;
+    }
+
+    // One receiver for the whole session: `events()` clones, and the channel is
+    // competing-consumer, so calling it per iteration would split the stream.
+    let events = session.events();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut failed = false;
+    while let Ok(event) = events.recv_blocking() {
+        match event {
+            // Verbatim: no decoding and no line-splitting.
+            SessionEvent::Data(bytes) => {
+                let _ = out.write_all(&bytes);
+                let _ = out.flush();
+            }
+            SessionEvent::Error(message) => {
+                eprintln!("sshdeck: {message}");
+                failed = true;
+            }
+            // Lifecycle and close events carry no bytes; the channel closing is
+            // what ends the loop.
+            _ => {}
+        }
+    }
+
+    if failed {
+        1
+    } else {
+        0
+    }
 }
 
 /// One open tab: the host it points at and the pane rendering it.
@@ -117,7 +278,7 @@ impl SshDeck {
             });
         }
 
-        Self {
+        let view = Self {
             store,
             selected: None,
             active: None,
@@ -131,6 +292,39 @@ impl SshDeck {
             sftp_attached: None,
             sftp_generation: 0,
             _subscriptions: subscriptions,
+        };
+
+        // Development and test affordance, not a user feature: with
+        // `SSHDECK_AUTOCONNECT` set to a host id or label, connect once as soon
+        // as the view exists so a live session can be measured without a human.
+        // A missing host is a notification, never a startup failure.
+        if let Ok(target) = std::env::var("SSHDECK_AUTOCONNECT") {
+            cx.defer_in(window, move |this, window, cx| {
+                this.auto_connect(&target, window, cx);
+            });
+        }
+        view
+    }
+
+    /// Connects to the `SSHDECK_AUTOCONNECT` host by id or label, if it exists.
+    ///
+    /// Reuses the normal [`Self::connect`] path, so password handling and the
+    /// tab/pane setup are identical to a human double-click. A target with no
+    /// host is a notification; startup continues regardless.
+    fn auto_connect(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let host = self
+            .store
+            .inventory()
+            .hosts()
+            .iter()
+            .find(|host| host.id.as_str() == target || host.label.eq_ignore_ascii_case(target))
+            .cloned();
+        match host {
+            Some(host) => self.connect(host, window, cx),
+            None => window.push_notification(
+                Notification::warning(format!("No host matches {target}")),
+                cx,
+            ),
         }
     }
 
@@ -192,10 +386,20 @@ impl SshDeck {
             // The password lives in the OS keychain, which the vault crate owns.
             // Until that is wired into this view, ask for it once and use it for
             // this connection only: it is never written to the inventory.
-            sshdeck_core::AuthMethod::Password { .. } => {
-                self.prompt_for_secret(&host, window, cx);
-                return;
-            }
+            //
+            // Development and test affordance, not a user feature: when
+            // `SSHDECK_PASSWORD` is set, use it instead of prompting so an
+            // automated run can connect. It is read straight from the
+            // environment into the connection config — never logged, never
+            // written to disk, never shown in the UI. Without it, the prompt is
+            // exactly as before.
+            sshdeck_core::AuthMethod::Password { .. } => match env_password() {
+                Some(password) => SessionConfig::from_host(&host).with_password(password),
+                None => {
+                    self.prompt_for_secret(&host, window, cx);
+                    return;
+                }
+            },
             _ => SessionConfig::from_host(&host),
         };
 
@@ -1139,5 +1343,48 @@ impl Render for SshDeck {
         }
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    fn exec(host: &str, command: &str) -> Mode {
+        Mode::Exec {
+            host: host.to_string(),
+            command: command.to_string(),
+        }
+    }
+
+    #[test]
+    fn connect_and_exec_parse_in_either_order() {
+        assert_eq!(
+            parse_args(&argv(&["--connect", "prod", "--exec", "uptime"])),
+            Ok(exec("prod", "uptime"))
+        );
+        assert_eq!(
+            parse_args(&argv(&["--exec", "uptime", "--connect", "prod"])),
+            Ok(exec("prod", "uptime"))
+        );
+    }
+
+    #[test]
+    fn no_flags_is_the_gui() {
+        assert_eq!(parse_args(&argv(&[])), Ok(Mode::Gui));
+    }
+
+    #[test]
+    fn missing_connect_is_a_usage_error() {
+        assert!(parse_args(&argv(&["--exec", "uptime"])).is_err());
+    }
+
+    #[test]
+    fn unknown_argument_is_a_usage_error() {
+        assert!(parse_args(&argv(&["--connect", "prod", "--exec", "uptime", "--wat"])).is_err());
     }
 }
