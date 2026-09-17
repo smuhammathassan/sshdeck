@@ -336,16 +336,10 @@ impl TelnetCodec {
                     replies.extend_from_slice(&frame(WONT, option));
                 }
             }
-            WONT => {
-                if self.remote[index] {
-                    self.remote[index] = false;
-                }
-            }
-            DONT => {
-                if self.local[index] {
-                    self.local[index] = false;
-                }
-            }
+            // A disable request needs no reply and is idempotent; RFC 854
+            // never acknowledges a `DONT`/`WONT`.
+            WONT => self.remote[index] = false,
+            DONT => self.local[index] = false,
             _ => {}
         }
     }
@@ -403,7 +397,7 @@ mod tests {
         }
     }
 
-    fn codec(policy: impl TelnetPolicy + Send + 'static) -> TelnetCodec {
+    fn codec(policy: impl TelnetPolicy + 'static) -> TelnetCodec {
         TelnetCodec::new(Box::new(policy))
     }
 
