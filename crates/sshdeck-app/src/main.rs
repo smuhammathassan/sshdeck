@@ -17,12 +17,13 @@ use gpui_kit::component::{
     notification::Notification,
     scroll::ScrollableElement as _,
     ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _, Root,
-    Sizable as _, Theme, ThemeMode, WindowExt,
+    Sizable as _, Theme, ThemeMode, ThemeRegistry, WindowExt,
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, px, AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, WindowOptions,
+    div, px, AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
+    WindowOptions,
 };
 use keys_pane::KeysPane;
 use palette::PaletteView;
@@ -51,6 +52,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
+            init_theme(cx);
             cx.spawn(async move |cx| {
                 cx.open_window(WindowOptions::default(), |window, cx| {
                     let view = cx.new(|cx| SshDeck::new(window, cx));
@@ -124,6 +126,108 @@ fn env_password() -> Option<String> {
     std::env::var("SSHDECK_PASSWORD").ok()
 }
 
+/// The name of the dark theme in the bundled theme set, and the one the app
+/// starts in.
+const DEFAULT_THEME: &str = "sshdeck Dark";
+
+/// Registers the bundled Termius-matched theme and makes [`DEFAULT_THEME`] the
+/// startup theme.
+///
+/// Route: the `ThemeSet` is **embedded** with `include_str!` and loaded through
+/// `ThemeRegistry::load_themes_from_str` rather than `ThemeRegistry::watch_dir`.
+/// A bundled macOS app has no reliable working directory, so a path-based
+/// registry would look for `themes/sshdeck.json` relative to wherever the
+/// process happened to launch and miss it; the embedded string cannot miss.
+/// `load_themes_from_str` is public in `gpui-component` 0.6.1 (`theme/registry.rs`)
+/// even though `theme.md` only documents the directory watcher.
+///
+/// `Theme::change` re-applies the selected mode's config **and** projects it to
+/// the Base layer (scrollbars, resize handles); applying the loaded config with
+/// `apply_config` alone would leave that projection stale.
+fn init_theme(cx: &mut App) {
+    const THEME_SET: &str = include_str!("../themes/sshdeck.json");
+
+    if let Err(error) = ThemeRegistry::global_mut(cx).load_themes_from_str(THEME_SET) {
+        // Non-fatal: a theme that will not parse should not stop the app; it
+        // starts in the built-in default instead of the Termius-matched one.
+        eprintln!("sshdeck: could not load the bundled theme: {error}");
+        return;
+    }
+
+    // Clone the configs out of the registry in one immutable borrow, before
+    // touching the mutable globals below.
+    let (light, dark) = {
+        let themes = ThemeRegistry::global(cx).themes();
+        (
+            themes.get(&SharedString::from("sshdeck Light")).cloned(),
+            themes.get(&SharedString::from(DEFAULT_THEME)).cloned(),
+        )
+    };
+    if let Some(light) = light {
+        Theme::global_mut(cx).light_theme = light;
+    }
+    if let Some(dark) = dark {
+        Theme::global_mut(cx).dark_theme = dark;
+    }
+
+    // Dark is the default, regardless of the system appearance.
+    Theme::change(ThemeMode::Dark, None, cx);
+}
+
+/// The script `--exec` writes once the shell is ready: the command, then an
+/// explicit `exit` so the session closes and the process returns the moment the
+/// command finishes, the way `ssh host cmd` does.
+///
+/// ponytail: the transport always opens an interactive login shell with a PTY
+/// (`Session::connect` -> `request_shell`), and it emits no "command finished"
+/// event, so completion is detected by the shell exiting. Ceiling: a command
+/// that replaces the shell or leaves a background job writing to the PTY will
+/// not close cleanly, and the PTY echoes the command/prompt into stdout.
+/// Upgrade path: add an exec-channel mode (request `exec`, no PTY) to
+/// `sshdeck-core::session` and close on its exit-status event.
+fn exec_script(command: &str) -> String {
+    format!("{command}\nexit\n")
+}
+
+/// Splits the `SSHDECK_AUTOCONNECT` value into individual targets.
+///
+/// Development and test affordance only: a comma-separated list opens one
+/// session per entry so a multi-session footprint can be measured. Whitespace
+/// is trimmed and empty entries are dropped, so the original single-host form
+/// keeps working unchanged.
+fn autoconnect_targets(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .collect()
+}
+
+/// Parses the optional port field of the add-host form.
+///
+/// An empty field means the SSH default (22). A non-numeric or out-of-range
+/// value is a real error, so the caller can show a message instead of silently
+/// defaulting to 22 — otherwise `host:2222` would quietly connect to 22.
+fn parse_port(raw: &str) -> Result<u16, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(22);
+    }
+    match raw.parse::<u16>() {
+        Ok(port) if port != 0 => Ok(port),
+        _ => Err(format!(
+            "Port must be a number between 1 and 65535, got \"{raw}\""
+        )),
+    }
+}
+
+/// How long `--exec` waits after the first output before writing the command.
+///
+/// The first [`SessionEvent::Data`] is the honest "the shell has produced
+/// output" signal; this short settle covers a MOTD that arrives in pieces.
+/// It is a supplement, never the primary mechanism.
+const EXEC_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// Runs one command over SSH with no window, no gpui, and no async runtime.
 ///
 /// This is the same transport the terminal pane uses: `Session::connect` owns
@@ -132,8 +236,14 @@ fn env_password() -> Option<String> {
 /// an `async_channel::Receiver`; `recv_blocking` (verified on the pinned
 /// async-channel 2.5.0) lets that stream be drained on the main thread.
 ///
-/// Returns the process exit code: 0 on a clean close, 1 on a connect failure or
-/// a [`SessionEvent::Error`].
+/// The command is not written until the first [`SessionEvent::Data`] arrives.
+/// `Session::connect` returns as soon as the shell has been requested, not when
+/// the shell is reading input, so writing immediately lands during the MOTD and
+/// is echoed a second time at the prompt.
+///
+/// Returns the process exit code: the remote exit status when the server sends
+/// one (like `ssh host cmd`), otherwise 0 on a clean close, or 1 on a connect
+/// failure or a [`SessionEvent::Error`].
 fn run_headless(target: &str, command: &str) -> i32 {
     use std::io::Write as _;
 
@@ -170,15 +280,6 @@ fn run_headless(target: &str, command: &str) -> i32 {
             return 1;
         }
     };
-    // The command is queued; the connection thread only reads it once the shell
-    // is open, so it cannot race the PTY setup. The newline runs it.
-    if let Err(error) = session
-        .write(command.as_bytes())
-        .and_then(|()| session.write(b"\n"))
-    {
-        eprintln!("sshdeck: could not send the command: {error}");
-        return 1;
-    }
 
     // One receiver for the whole session: `events()` clones, and the channel is
     // competing-consumer, so calling it per iteration would split the stream.
@@ -186,19 +287,35 @@ fn run_headless(target: &str, command: &str) -> i32 {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut failed = false;
+    let mut sent = false;
+    let mut exit_code = 0;
     while let Ok(event) = events.recv_blocking() {
         match event {
             // Verbatim: no decoding and no line-splitting.
             SessionEvent::Data(bytes) => {
                 let _ = out.write_all(&bytes);
                 let _ = out.flush();
+                // The shell has produced output, so it is no longer mid-setup.
+                // Write the command exactly once, after a short settle, then
+                // let the loop keep streaming until the shell exits.
+                if !sent {
+                    sent = true;
+                    std::thread::sleep(EXEC_SETTLE);
+                    if let Err(error) = session.write(exec_script(command).as_bytes()) {
+                        eprintln!("sshdeck: could not send the command: {error}");
+                        failed = true;
+                        break;
+                    }
+                }
             }
             SessionEvent::Error(message) => {
                 eprintln!("sshdeck: {message}");
                 failed = true;
             }
-            // Lifecycle and close events carry no bytes; the channel closing is
-            // what ends the loop.
+            // The remote status is the command's own: the appended `exit`
+            // returns the last command's code, like `ssh host cmd`.
+            SessionEvent::Closed(code) => exit_code = code.unwrap_or(0),
+            // Other lifecycle events carry no bytes or status.
             _ => {}
         }
     }
@@ -206,7 +323,7 @@ fn run_headless(target: &str, command: &str) -> i32 {
     if failed {
         1
     } else {
-        0
+        exit_code
     }
 }
 
@@ -238,6 +355,8 @@ struct SshDeck {
     filter: Entity<InputState>,
     draft_label: Entity<InputState>,
     draft_address: Entity<InputState>,
+    draft_username: Entity<InputState>,
+    draft_port: Entity<InputState>,
     /// The in-flight secret prompt, when a host needs a password we do not have.
     secret: Option<(HostId, Entity<InputState>)>,
     /// The command palette while it is open, if at all.
@@ -262,6 +381,9 @@ impl SshDeck {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search hosts"));
         let draft_label = cx.new(|cx| InputState::new(window, cx).placeholder("Label"));
         let draft_address = cx.new(|cx| InputState::new(window, cx).placeholder("hostname or IP"));
+        let draft_username =
+            cx.new(|cx| InputState::new(window, cx).placeholder("username (optional)"));
+        let draft_port = cx.new(|cx| InputState::new(window, cx).placeholder("port (default 22)"));
 
         // Re-render the list as the query changes; the filter itself is applied
         // in `render`, so no filtered copy needs to be kept in state.
@@ -286,6 +408,8 @@ impl SshDeck {
             filter,
             draft_label,
             draft_address,
+            draft_username,
+            draft_port,
             secret: None,
             palette: None,
             overlay: None,
@@ -295,22 +419,28 @@ impl SshDeck {
         };
 
         // Development and test affordance, not a user feature: with
-        // `SSHDECK_AUTOCONNECT` set to a host id or label, connect once as soon
-        // as the view exists so a live session can be measured without a human.
-        // A missing host is a notification, never a startup failure.
-        if let Ok(target) = std::env::var("SSHDECK_AUTOCONNECT") {
+        // `SSHDECK_AUTOCONNECT` set to a comma-separated list of host ids or
+        // labels, connect one session per entry as soon as the view exists so a
+        // multi-session footprint can be measured without a human. The original
+        // single-host form (one id or label, no comma) keeps working. A missing
+        // host is a notification, never a startup failure.
+        if let Ok(targets) = std::env::var("SSHDECK_AUTOCONNECT") {
             cx.defer_in(window, move |this, window, cx| {
-                this.auto_connect(&target, window, cx);
+                for target in autoconnect_targets(&targets) {
+                    this.auto_connect(target, window, cx);
+                }
             });
         }
         view
     }
 
-    /// Connects to the `SSHDECK_AUTOCONNECT` host by id or label, if it exists.
+    /// Connects to one `SSHDECK_AUTOCONNECT` target by id or label, if it exists.
     ///
-    /// Reuses the normal [`Self::connect`] path, so password handling and the
-    /// tab/pane setup are identical to a human double-click. A target with no
-    /// host is a notification; startup continues regardless.
+    /// The env var may hold a comma-separated list; the caller splits it and
+    /// invokes this once per entry. Reuses the normal [`Self::connect`] path, so
+    /// password handling and the tab/pane setup are identical to a human
+    /// double-click. A target with no host is a notification; startup continues
+    /// regardless.
     fn auto_connect(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
         let host = self
             .store
@@ -329,9 +459,22 @@ impl SshDeck {
     }
 
     /// Adds the draft host to the inventory and selects it.
+    ///
+    /// Username and port are both optional in the form, but a port that is
+    /// present must parse: a non-numeric or out-of-range value is a message,
+    /// never a silent fall back to 22 (which would misroute the connection).
     fn add_draft_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let label = self.draft_label.read(cx).value().trim().to_string();
         let address = self.draft_address.read(cx).value().trim().to_string();
+        let username = self.draft_username.read(cx).value().trim().to_string();
+        let port_raw = self.draft_port.read(cx).value().to_string();
+        let port = match parse_port(&port_raw) {
+            Ok(port) => port,
+            Err(message) => {
+                window.push_notification(Notification::warning(message), cx);
+                return;
+            }
+        };
 
         if label.is_empty() || address.is_empty() {
             window.push_notification(
@@ -341,10 +484,10 @@ impl SshDeck {
             return;
         }
 
-        let id = self
-            .store
-            .inventory_mut()
-            .insert(Host::new(&label, &address));
+        let mut host = Host::new(&label, &address);
+        host.username = username;
+        host.port = port;
+        let id = self.store.inventory_mut().insert(host);
         self.selected = Some(id);
 
         if let Err(error) = self.store.save() {
@@ -354,6 +497,10 @@ impl SshDeck {
         self.draft_label
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.draft_address
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.draft_username
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.draft_port
             .update(cx, |state, cx| state.set_value("", window, cx));
         cx.notify();
     }
@@ -927,6 +1074,8 @@ impl SshDeck {
                     .border_color(border)
                     .child(Input::new(&self.draft_label).small())
                     .child(Input::new(&self.draft_address).small())
+                    .child(Input::new(&self.draft_username).small())
+                    .child(Input::new(&self.draft_port).small())
                     .child(
                         Button::new("add-host")
                             .small()
@@ -1386,5 +1535,37 @@ mod tests {
     #[test]
     fn unknown_argument_is_a_usage_error() {
         assert!(parse_args(&argv(&["--connect", "prod", "--exec", "uptime", "--wat"])).is_err());
+    }
+
+    #[test]
+    fn port_defaults_to_22_and_rejects_bad_values() {
+        assert_eq!(parse_port(""), Ok(22));
+        assert_eq!(parse_port("   "), Ok(22));
+        assert_eq!(parse_port("2222"), Ok(2222));
+        assert_eq!(parse_port(" 22 "), Ok(22));
+        assert_eq!(parse_port("65535"), Ok(65535));
+        assert!(parse_port("0").is_err());
+        assert!(parse_port("65536").is_err());
+        assert!(parse_port("-1").is_err());
+        assert!(parse_port("ssh").is_err());
+        assert!(parse_port("22a").is_err());
+    }
+
+    #[test]
+    fn autoconnect_splits_a_comma_separated_list() {
+        assert_eq!(autoconnect_targets("prod"), vec!["prod"]);
+        assert_eq!(
+            autoconnect_targets("prod, staging ,db-2"),
+            vec!["prod", "staging", "db-2"]
+        );
+        assert!(autoconnect_targets("").is_empty());
+        assert!(autoconnect_targets(" , ").is_empty());
+    }
+
+    #[test]
+    fn exec_script_runs_the_command_then_exits() {
+        // The trailing `exit` is what closes the session once the command is
+        // done; without it the caller had to append it by hand.
+        assert_eq!(exec_script("uptime"), "uptime\nexit\n");
     }
 }
