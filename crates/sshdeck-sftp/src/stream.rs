@@ -20,7 +20,10 @@ type WriteFuture = Pin<Box<dyn Future<Output = Result<(), SendError<Bytes>>> + S
 /// A duplex byte stream over the channels [`sshdeck_core::sftp::SftpChannel`]
 /// hands out.
 pub(crate) struct RemoteStream {
-    incoming: Receiver<Bytes>,
+    /// Boxed because `async_channel::Receiver` is `!Unpin`; `russh-sftp`'s
+    /// `SftpSession::new` requires the stream to be `Unpin`, and boxing keeps
+    /// the receiver at one address while letting the stream move freely.
+    incoming: Box<Receiver<Bytes>>,
     outgoing: Sender<Bytes>,
     read: Vec<u8>,
     read_pos: usize,
@@ -32,7 +35,7 @@ pub(crate) struct RemoteStream {
 impl RemoteStream {
     pub(crate) fn new(incoming: Receiver<Bytes>, outgoing: Sender<Bytes>) -> Self {
         Self {
-            incoming,
+            incoming: Box::new(incoming),
             outgoing,
             read: Vec::new(),
             read_pos: 0,
@@ -45,19 +48,20 @@ impl RemoteStream {
 
 impl AsyncRead for RemoteStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
         loop {
-            if self.read_pos < self.read.len() {
-                let start = self.read_pos;
-                let n = (self.read.len() - start).min(buf.remaining());
-                buf.put_slice(&self.read[start..start + n]);
-                self.read_pos += n;
-                if self.read_pos == self.read.len() {
-                    self.read.clear();
-                    self.read_pos = 0;
+            if this.read_pos < this.read.len() {
+                let start = this.read_pos;
+                let n = (this.read.len() - start).min(buf.remaining());
+                buf.put_slice(&this.read[start..start + n]);
+                this.read_pos += n;
+                if this.read_pos == this.read.len() {
+                    this.read.clear();
+                    this.read_pos = 0;
                 }
                 return Poll::Ready(Ok(()));
             }
@@ -66,25 +70,25 @@ impl AsyncRead for RemoteStream {
                 return Poll::Ready(Ok(()));
             }
 
-            if self.pending_read.is_none() {
-                let incoming = self.incoming.clone();
+            if this.pending_read.is_none() {
+                let incoming = this.incoming.as_ref().clone();
                 let future: ReadFuture = Box::pin(async move { incoming.recv().await });
-                self.pending_read = Some(future);
+                this.pending_read = Some(future);
             }
 
-            let result = match self.pending_read.as_mut() {
+            let result = match this.pending_read.as_mut() {
                 Some(future) => match future.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(result) => result,
                 },
                 None => return Poll::Ready(Ok(())),
             };
-            self.pending_read = None;
+            this.pending_read = None;
 
             match result {
                 Ok(bytes) => {
-                    self.read = bytes.to_vec();
-                    self.read_pos = 0;
+                    this.read = bytes.to_vec();
+                    this.read_pos = 0;
                 }
                 // Closed and drained: end of stream.
                 Err(_) => return Poll::Ready(Ok(())),
@@ -95,48 +99,50 @@ impl AsyncRead for RemoteStream {
 
 impl AsyncWrite for RemoteStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
+        let this = self.get_mut();
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
 
-        if self.pending_write.is_none() {
-            let outgoing = self.outgoing.clone();
+        if this.pending_write.is_none() {
+            let outgoing = this.outgoing.clone();
             let data = Bytes::copy_from_slice(buf);
-            self.pending_write_len = buf.len();
+            this.pending_write_len = buf.len();
             let future: WriteFuture = Box::pin(async move { outgoing.send(data).await });
-            self.pending_write = Some(future);
+            this.pending_write = Some(future);
         }
 
-        let result = match self.pending_write.as_mut() {
+        let result = match this.pending_write.as_mut() {
             Some(future) => match future.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(result) => result,
             },
             None => return Poll::Ready(Ok(0)),
         };
-        self.pending_write = None;
+        this.pending_write = None;
 
-        let len = self.pending_write_len;
+        let len = this.pending_write_len;
         match result {
             Ok(()) => Poll::Ready(Ok(len)),
             Err(_) => Poll::Ready(Err(closed())),
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        if self.pending_write.is_some() {
-            let result = match self.pending_write.as_mut() {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let this = self.get_mut();
+        if this.pending_write.is_some() {
+            let result = match this.pending_write.as_mut() {
                 Some(future) => match future.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(result) => result,
                 },
                 None => Ok(()),
             };
-            self.pending_write = None;
+            this.pending_write = None;
             if result.is_err() {
                 return Poll::Ready(Err(closed()));
             }
@@ -144,16 +150,14 @@ impl AsyncWrite for RemoteStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
-        match self.as_mut().poll_flush(cx) {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let this = self.get_mut();
+        match AsyncWrite::poll_flush(Pin::new(&mut *this), cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
             Poll::Ready(Ok(())) => {}
         }
-        self.outgoing.close();
+        this.outgoing.close();
         Poll::Ready(Ok(()))
     }
 }

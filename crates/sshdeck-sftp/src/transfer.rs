@@ -570,7 +570,9 @@ mod tests {
         let id = block_on(queue.enqueue(upload()));
         assert!(block_on(queue.cancel(id)));
         queue.close();
-        block_on(TransferQueue::run_worker(queue, executor));
+        // `run_worker` takes the handle by value; the clone shares the same
+        // state, so the assertions below still observe the real queue.
+        block_on(TransferQueue::run_worker(queue.clone(), executor));
 
         assert_eq!(
             drain_events(&events_rx),
@@ -629,9 +631,11 @@ mod tests {
         });
 
         // Wait until it is running, cancel, then let it re-check the token.
-        started_rx.recv().expect("worker started");
+        // The test is synchronous, so use the blocking channel API: `recv`
+        // and `send` return futures in async-channel 2.5, not `Result`s.
+        started_rx.recv_blocking().expect("worker started");
         assert!(block_on(queue.cancel(id)));
-        resume_tx.send(true).expect("resume");
+        resume_tx.send_blocking(true).expect("resume");
 
         queue.close();
         worker.join().expect("worker finishes");

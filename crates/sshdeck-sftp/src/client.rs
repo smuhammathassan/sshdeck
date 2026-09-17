@@ -83,7 +83,7 @@ enum Command {
     },
     Cancel {
         id: TransferId,
-        reply: Sender<bool>,
+        reply: Sender<Result<bool, SftpError>>,
     },
 }
 
@@ -372,7 +372,7 @@ fn dispatch(sftp: &Arc<SftpSession>, queue: &TransferQueue, command: Command) {
                 let _ = reply.send(Ok(queue.enqueue(transfer).await)).await;
             }
             Command::Cancel { id, reply } => {
-                let _ = reply.send(queue.cancel(id).await).await;
+                let _ = reply.send(Ok(queue.cancel(id).await)).await;
             }
         }
     });
