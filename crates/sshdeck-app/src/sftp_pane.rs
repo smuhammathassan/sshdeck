@@ -1657,11 +1657,7 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 }
 
 fn describe_failure(path: &str, error: &SftpError) -> String {
-    match error {
-        SftpError::NotFound => format!("Folder not found: {path}"),
-        SftpError::PermissionDenied => format!("Permission denied: {path}"),
-        other => format!("Failed to read {path}: {other}"),
-    }
+    format!("Failed to read {path}: {error}")
 }
 
 fn kind_label(kind: FileKind) -> &'static str {

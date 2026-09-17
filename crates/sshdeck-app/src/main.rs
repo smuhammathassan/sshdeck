@@ -1245,7 +1245,6 @@ impl SshDeck {
         // Header stays dark navy #1d2033 in both Light and Dark (hardcoded; no theme token covers it in Light).
         let header_bg = rgb(0x1d2033);
         let header_fg = rgb(0xffffff);
-        let header_muted = rgb(0x8d91a5);
 
         let actions = div()
             .flex()
@@ -1853,6 +1852,12 @@ impl SshDeck {
                 cx.theme().muted_foreground,
                 "sftp".to_string(),
             ),
+            MainTab::NewTab => (
+                "New Tab".to_string(),
+                IconName::SquareTerminal,
+                cx.theme().muted_foreground,
+                "new tab".to_string(),
+            ),
             MainTab::Session(index) => {
                 if let Some(session) = self.sessions.get(index) {
                     let title = session.status.title.clone().unwrap_or_else(|| {
@@ -2199,6 +2204,7 @@ impl SshDeck {
                     )
                     .child(
                         div()
+                            .id("btn-vault-add-member")
                             .size(px(24.))
                             .rounded_full()
                             .bg(rgb(0x2091f6))
@@ -2681,6 +2687,7 @@ impl SshDeck {
                     // Share this host
                     .child(
                         div()
+                            .id("share-this-host-btn")
                             .flex()
                             .flex_row()
                             .items_center()
@@ -2756,8 +2763,8 @@ impl SshDeck {
                                                 if password_visible {
                                                     match &host.auth {
                                                         sshdeck_core::AuthMethod::Password {
-                                                            password,
-                                                        } => password.clone(),
+                                                            secret_ref,
+                                                        } => secret_ref.clone(),
                                                         _ => "(no password set)".to_string(),
                                                     }
                                                 } else {
@@ -2902,6 +2909,7 @@ impl SshDeck {
                                         )
                                         .child(
                                             div()
+                                                .id("btn-terminal-theme-select")
                                                 .flex()
                                                 .flex_row()
                                                 .items_center()
@@ -2958,7 +2966,12 @@ impl SshDeck {
                                                     .children(themes.into_iter().map(|th| {
                                                         let th_str = th.to_string();
                                                         let is_cur = th == selected_theme;
+                                                        let th_id = SharedString::from(format!(
+                                                            "theme-opt-{}",
+                                                            th.replace(' ', "-")
+                                                        ));
                                                         div()
+                                                            .id(th_id)
                                                             .flex()
                                                             .flex_row()
                                                             .items_center()
