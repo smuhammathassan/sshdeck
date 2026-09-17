@@ -20,12 +20,19 @@ use russh::keys::{
 };
 use russh::{ChannelMsg, Disconnect};
 
+use crate::forward::{self, Forward, ForwardConfig};
 use crate::{AuthMethod, Host, SessionState};
+
+/// Caps how many keyboard-interactive rounds we will answer, so a misbehaving
+/// server cannot loop us forever.
+const MAX_INTERACTIVE_ROUNDS: usize = 8;
 
 /// Commands from the UI thread to the connection thread.
 enum Command {
     Write(Bytes),
     Resize { cols: u32, rows: u32 },
+    Forward(forward::ForwardSetup),
+    AgentForward,
     Close,
 }
 
@@ -128,9 +135,11 @@ impl SessionConfig {
             return Err(SessionError::Connect("host address is empty".into()));
         }
         match &self.auth {
-            AuthMethod::KeyboardInteractive => Err(SessionError::Unsupported(
-                "keyboard-interactive authentication",
-            )),
+            AuthMethod::KeyboardInteractive if self.password.is_none() => {
+                Err(SessionError::Unsupported(
+                    "keyboard-interactive authentication needs a resolved secret",
+                ))
+            }
             AuthMethod::None => Err(SessionError::Unsupported("none authentication")),
             AuthMethod::Password { .. } if self.password.is_none() => {
                 Err(SessionError::MissingSecret("password"))
@@ -203,6 +212,24 @@ impl Session {
         })
     }
 
+    /// Starts a port forward on this connection. Progress (including bind
+    /// failures) arrives on [`Forward::events`]. The command is processed once
+    /// the shell channel is open.
+    pub fn forward(&self, config: ForwardConfig) -> Result<Forward, SessionError> {
+        config
+            .validate()
+            .map_err(|err| SessionError::Connect(err.to_string()))?;
+        let (forward, setup) = Forward::channel(config);
+        self.send(Command::Forward(setup))?;
+        Ok(forward)
+    }
+
+    /// Asks the server to allow agent forwarding on this connection. Incoming
+    /// `auth-agent@openssh.com` channels are piped to the local `SSH_AUTH_SOCK`.
+    pub fn request_agent_forwarding(&self) -> Result<(), SessionError> {
+        self.send(Command::AgentForward)
+    }
+
     /// A handle to the session's event stream. `async_channel` is
     /// competing-consumer, so call this once and own the receiver; a second
     /// receiver would split events rather than duplicate them.
@@ -239,6 +266,8 @@ impl Drop for Session {
 struct KnownHostsHandler {
     host: String,
     port: u16,
+    /// Routes for running `-R` forwards, filled in by the connection thread.
+    routes: forward::Routes,
 }
 
 impl client::Handler for KnownHostsHandler {
@@ -269,6 +298,47 @@ impl client::Handler for KnownHostsHandler {
             ))),
         }
     }
+
+    /// A `-R` connection arrived. Accept it and pipe it to the local target
+    /// registered for this bind address/port; reject anything we did not ask
+    /// for.
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        match forward::resolve(&self.routes, connected_address, connected_port) {
+            Some(route) => {
+                reply.accept().await;
+                let originator = originator_address.to_string();
+                tokio::spawn(forward::bridge_forwarded(channel, route, originator));
+            }
+            None => {
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// The server offered an agent-forwarding channel; pipe it to the local
+    /// `SSH_AUTH_SOCK` (only opened when the caller requested forwarding).
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        tokio::spawn(forward::bridge_agent(channel));
+        Ok(())
+    }
 }
 
 async fn emit(tx: &Sender<SessionEvent>, event: SessionEvent) {
@@ -295,9 +365,11 @@ async fn run_session(
 ) -> Result<(), SessionError> {
     emit(events, SessionEvent::State(SessionState::Connecting)).await;
 
+    let routes = forward::Routes::default();
     let handler = KnownHostsHandler {
         host: config.address().to_string(),
         port: config.port(),
+        routes: routes.clone(),
     };
     // ponytail: 1 MiB window and 32 buffered channel messages, on the modest end
     // of RUSSH-GAP.md §8's recommendation; the terminal scrollback is the only
@@ -315,7 +387,15 @@ async fn run_session(
     authenticate(&mut handle, config).await?;
     emit(events, SessionEvent::Connected).await;
 
-    let channel = handle.channel_open_session().await?;
+    // `Handle` is `Send` but not `Sync` (it owns the reply receiver), and the
+    // forwarding tasks need `&Handle`; a mutex gives them that without moving
+    // the session loop off this task.
+    let handle = Arc::new(tokio::sync::Mutex::new(handle));
+
+    let channel = {
+        let connection = handle.lock().await;
+        connection.channel_open_session().await?
+    };
     let (mut read, write) = channel.split();
     // A real PTY + shell so interactive terminal bytes flow. The initial size is
     // a placeholder; the UI sends the first real size via `resize`.
@@ -331,6 +411,12 @@ async fn run_session(
                 Ok(Command::Write(data)) => write.data_bytes(data).await?,
                 Ok(Command::Resize { cols, rows }) => {
                     write.window_change(cols, rows, 0, 0).await?;
+                }
+                Ok(Command::Forward(setup)) => {
+                    tokio::spawn(forward::serve(handle.clone(), setup, routes.clone()));
+                }
+                Ok(Command::AgentForward) => {
+                    write.agent_forward(true).await?;
                 }
                 Ok(Command::Close) | Err(_) => {
                     let _ = write.eof().await;
@@ -353,7 +439,12 @@ async fn run_session(
         }
     }
 
-    let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+    {
+        let connection = handle.lock().await;
+        let _ = connection
+            .disconnect(Disconnect::ByApplication, "", "")
+            .await;
+    }
     emit(events, SessionEvent::Closed(exit_code)).await;
     Ok(())
 }
@@ -427,7 +518,41 @@ async fn authenticate(
                 }
             }
         }
-        AuthMethod::KeyboardInteractive | AuthMethod::None => Err(SessionError::Unsupported(
+        AuthMethod::KeyboardInteractive => {
+            let password = config
+                .password
+                .clone()
+                .ok_or(SessionError::MissingSecret("password"))?;
+            let mut response = handle
+                .authenticate_keyboard_interactive_start(
+                    config.username.clone(),
+                    Option::<String>::None,
+                )
+                .await?;
+            // ponytail: the resolved password answers every prompt. Servers that
+            // ask for OTPs or several distinct factors need a prompt callback on
+            // SessionEvent; until that exists those flows fail rather than guess.
+            for _ in 0..MAX_INTERACTIVE_ROUNDS {
+                match response {
+                    client::KeyboardInteractiveAuthResponse::Success => return Ok(()),
+                    client::KeyboardInteractiveAuthResponse::Failure { .. } => {
+                        return Err(SessionError::Connect(
+                            "keyboard-interactive was rejected".into(),
+                        ));
+                    }
+                    client::KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                        let answers = vec![password.clone(); prompts.len()];
+                        response = handle
+                            .authenticate_keyboard_interactive_respond(answers)
+                            .await?;
+                    }
+                }
+            }
+            Err(SessionError::Connect(
+                "keyboard-interactive did not finish".into(),
+            ))
+        }
+        AuthMethod::None => Err(SessionError::Unsupported(
             "authentication method not implemented",
         )),
     }

@@ -10,5 +10,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 async-channel = "2"
 bytes = "1"
+# ssh-key generation needs a CryptoRng; russh neither enables ssh-key's
+# `getrandom` feature nor re-exports an RNG, so use the same rand 0.10 line
+# russh pins (Cargo unifies it with russh's own `rand`).
+rand = { version = "0.10", features = ["thread_rng"] }
 russh = { version = "=0.63.3", features = ["des"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
