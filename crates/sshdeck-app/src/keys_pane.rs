@@ -16,22 +16,49 @@
 //!
 //! Everything that touches disk runs on the background executor; nothing here
 //! blocks a frame.
+//!
+//! Presentation (`docs/re/`, Termius `3.13.24` Keychain and `3.13.37` Known
+//! Hosts):
+//!
+//! * One toolbar row (`56px`, `cx.theme().popover`) holding the section switch,
+//!   the contextual actions and the icon controls, then the body on
+//!   `cx.theme().sidebar` (`#edf1f2` in the light theme) — the reference's
+//!   grey content behind white cards.
+//! * Content is a `flex_wrap` card grid (white, `10px` radius, `shadow_xs`,
+//!   `300px` basis) with a `40px` navy glyph tile, matching the reference's key
+//!   and known-host tiles. A list view is offered as well (44px rows, hairline
+//!   separators) because a fingerprint needs the horizontal room.
+//! * `Certificate`, `Touch ID` and `FIDO2` are rendered **disabled** with a
+//!   tooltip: the reference shows them, `sshdeck_core` has no x509, passkey or
+//!   FIDO2 store, and shipping them enabled would be a dead write path. This is
+//!   the same dead-control convention `logs_pane` uses.
+//! * A changed host key is loud, never a tint: a danger-bordered card with the
+//!   old and new fingerprints side by side in labelled boxes, a danger button
+//!   for the second confirmation, and a `CHANGED` pill on the row it belongs to.
+//!
+//! Hardcoded values (no theme token exists):
+//! * The navy identity tile `rgba(0x1c4774ff)`. Termius uses the same navy for
+//!   key, identity and known-host tiles in both modes; the bundled theme has no
+//!   token for it. Every other colour comes from `cx.theme()` (`popover`,
+//!   `sidebar`, `border`, `muted`, `muted_foreground`, `foreground`, `accent`,
+//!   `primary`, `primary_foreground`, `danger`, `danger_foreground`).
 
 use std::path::{Path, PathBuf};
 
 use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariants as _},
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     notification::Notification,
     scroll::ScrollableElement as _,
-    tab::{Tab, TabBar},
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    WindowExt as _,
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, px, AnyElement, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window,
+    div, px, rgba, AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, Stateful, Styled as _, Subscription, Window,
 };
 use sshdeck_core::keys::{self, KeyKind};
 use sshdeck_core::known_hosts::{self, KnownHostsError, Learned};
@@ -44,6 +71,28 @@ const DEFAULT_PORT: u16 = 22;
 const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
 /// Characters kept at each end when a fingerprint is shortened.
 const SHORT_FINGERPRINT_EDGE: usize = 8;
+/// Grid cards grow from this basis to fill the row, so the grid reflows with
+/// the window instead of clipping.
+const CARD_BASIS: f32 = 300.;
+/// Termius' navy identity tile, RGBA (the alpha byte is part of the literal:
+/// `rgba` reads `0xRRGGBBAA`). The one literal in this pane.
+const TILE_BG: u32 = 0x1c4774ff;
+
+/// Glyphs the bundled default icon set does not carry.
+///
+/// `gpui_kit::component::IconName` exposes only the ~100 default icons and the
+/// app's asset source (`gpui_kit::assets::Assets`) embeds exactly those, so a
+/// key-, host-, fingerprint- or security-key-shaped glyph cannot be named. The
+/// geometry below is ours; only the 24x24 grid follows the bundled Lucide
+/// style, and `Icon::data` renders raw SVG without touching the asset source.
+mod glyph {
+    pub const KEY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="16" r="4"/><path d="M11 13 20 4"/><path d="M16.5 7.5 19 10"/></svg>"#;
+    pub const HOST: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5a7.5 7.5 0 0 1 15 0"/><path d="M8.5 13.5a3.5 3.5 0 0 1 7 0"/><path d="M8.5 13.5V19"/><path d="M15.5 13.5V19"/></svg>"#;
+    pub const GRID: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></svg>"#;
+    pub const LIST: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="5" width="18" height="4" rx="2"/><rect x="3" y="10" width="18" height="4" rx="2"/><rect x="3" y="15" width="18" height="4" rx="2"/></svg>"#;
+    pub const FINGERPRINT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a7 7 0 0 1 7 7v3"/><path d="M12 9a3 3 0 0 1 3 3v6"/><path d="M5 12a7 7 0 0 1 7-7"/><path d="M9 12a3 3 0 0 1 1.5-2.6"/></svg>"#;
+    pub const SECURITY_KEY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="3" width="12" height="16" rx="3"/><circle cx="12" cy="14" r="2.5"/><path d="M10 7.5h4"/></svg>"#;
+}
 
 /// A private key found on disk, with everything the pane can derive from it.
 #[derive(Clone)]
@@ -90,6 +139,13 @@ enum Section {
     Hosts,
 }
 
+/// How the entries are laid out. Termius defaults to the card grid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Grid,
+    List,
+}
+
 /// The outcome of a user-initiated trust attempt.
 enum LearnOutcome {
     AlreadyKnown,
@@ -105,23 +161,32 @@ enum LearnOutcome {
 /// SSH key and known-hosts management. Constructed by the root view.
 pub struct KeysPane {
     section: Section,
+    view: ViewMode,
     keys: Vec<KeyEntry>,
     /// Fingerprint of the selected key; a fingerprint is stable across reloads,
     /// an index is not.
     selected: Option<String>,
     known: Vec<KnownEntry>,
+    filter: Entity<InputState>,
     host_input: Entity<InputState>,
     port_input: Entity<InputState>,
     key_input: Entity<InputState>,
     import_input: Entity<InputState>,
+    /// The import-path row is only drawn while the user asked for it.
+    show_import: bool,
+    /// The trust form is only drawn while the user asked for it.
+    show_trust: bool,
     /// A failed `learn` that needs an explicit replacement decision.
     pending: Option<PendingChange>,
     /// True while a background load or key operation is in flight.
     busy: bool,
+    /// Keeps the filter re-rendering as it is typed; dropped with the pane.
+    _subscriptions: Vec<Subscription>,
 }
 
 impl KeysPane {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search keys and hosts"));
         let host_input = cx.new(|cx| InputState::new(window, cx).placeholder("hostname or IP"));
         let port_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -134,17 +199,30 @@ impl KeysPane {
         let import_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("path to an OpenSSH private key"));
 
+        // Re-render as the query changes; the filter is applied in `render`, so
+        // no filtered copy is kept in state.
+        let subscriptions = vec![cx.subscribe_in(&filter, window, |_, _, event, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })];
+
         let mut pane = Self {
             section: Section::Keys,
+            view: ViewMode::Grid,
             keys: Vec::new(),
             selected: None,
             known: Vec::new(),
+            filter,
             host_input,
             port_input,
             key_input,
             import_input,
+            show_import: false,
+            show_trust: false,
             pending: None,
             busy: true,
+            _subscriptions: subscriptions,
         };
         pane.reload(window, cx);
         pane
@@ -190,6 +268,11 @@ impl KeysPane {
         self.keys.iter().find(|key| key.fingerprint == selected)
     }
 
+    /// The lowercased search text; empty means "everything".
+    fn query(&self, cx: &App) -> String {
+        self.filter.read(cx).value().trim().to_lowercase()
+    }
+
     /// Generates a real key with `sshdeck_core::keys` and writes it 0600.
     fn generate(&mut self, kind: KeyKind, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
@@ -210,6 +293,7 @@ impl KeysPane {
                         pane.selected = Some(entry.fingerprint.clone());
                         pane.keys.push(entry);
                         pane.keys.sort_by(|a, b| a.path.cmp(&b.path));
+                        pane.show_import = false;
                         window.push_notification(
                             Notification::success("Generated a new SSH key"),
                             cx,
@@ -252,6 +336,7 @@ impl KeysPane {
                         pane.selected = Some(entry.fingerprint.clone());
                         pane.keys.push(entry);
                         pane.keys.sort_by(|a, b| a.path.cmp(&b.path));
+                        pane.show_import = false;
                         window.push_notification(Notification::success("Imported the key"), cx);
                     }
                     Err(message) => window.push_notification(Notification::error(message), cx),
@@ -330,6 +415,7 @@ impl KeysPane {
                         );
                         pane.key_input
                             .update(cx, |state, cx| state.set_value("", window, cx));
+                        pane.show_trust = false;
                         pane.reload(window, cx);
                     }
                     LearnOutcome::Changed {
@@ -406,129 +492,61 @@ impl KeysPane {
         .detach();
     }
 
-    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = match self.section {
-            Section::Keys => 0,
-            Section::Hosts => 1,
-        };
-        TabBar::new("keys-pane-tabs")
-            .segmented()
-            .selected_index(selected)
-            .on_click(cx.listener(|this, index, _, cx| {
-                this.section = if *index == 1 {
-                    Section::Hosts
-                } else {
-                    Section::Keys
-                };
-                cx.notify();
-            }))
-            .child(Tab::new().label("SSH keys"))
-            .child(Tab::new().label("Known hosts"))
-    }
+    // ── chrome ────────────────────────────────────────────────────────────
 
-    fn render_keys(&self, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-
-        let rows: Vec<AnyElement> = self
-            .keys
-            .iter()
-            .enumerate()
-            .map(|(index, key)| {
-                let fingerprint = key.fingerprint.clone();
-                let selected = self.selected.as_deref() == Some(fingerprint.as_str());
-                let name = key
-                    .path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("key")
-                    .to_string();
-                let meta = format!("{} · {}", key.kind, short_fingerprint(&fingerprint));
-                div()
-                    .id(SharedString::from(format!("key-row-{index}")))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .when(selected, |el| el.bg(cx.theme().muted))
-                    .child(Icon::new(IconName::HardDrive).small().text_color(muted))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(SharedString::from(name))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .font_family("Menlo")
-                                    .child(SharedString::from(meta)),
-                            ),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected = Some(fingerprint.clone());
-                        cx.notify();
-                    }))
-                    .into_any_element()
-            })
-            .collect();
-
-        let detail = self.render_key_detail(cx);
-
+    /// The single toolbar row: section switch, contextual actions, icon controls.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = cx.theme().border;
         div()
-            .id("keys-scroll")
             .flex()
-            .flex_col()
+            .flex_row()
+            .items_center()
             .gap_3()
-            .flex_1()
-            .min_h(px(0.))
-            .p_3()
-            .overflow_y_scrollbar()
-            .child(self.render_key_actions(cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .when(self.keys.is_empty(), |el| {
-                        el.child(div().text_color(muted).child(
-                            "No private keys found in ~/.ssh or the sshdeck keys directory.",
-                        ))
-                    })
-                    .children(rows),
-            )
-            .when_some(detail, |el, detail| el.child(detail))
-            .into_any_element()
+            .h(px(56.))
+            .px_3()
+            .flex_shrink_0()
+            .bg(cx.theme().popover)
+            .border_b_1()
+            .border_color(border)
+            .child(self.render_section_switch(cx))
+            .child(self.render_actions(cx))
+            .child(div().flex_1())
+            .child(self.render_controls(cx))
     }
 
-    fn render_key_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_2()
-            .rounded_sm()
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().sidebar)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
+    /// The Keychain / Known Hosts switch, drawn as the reference's two marks.
+    fn render_section_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut row = div().flex().flex_row().items_center().gap_1();
+        for (id, mark, label, section) in [
+            ("switch-keys", glyph::KEY, "Keychain", Section::Keys),
+            ("switch-hosts", glyph::HOST, "Known hosts", Section::Hosts),
+        ] {
+            row = row.child(
+                Button::new(id)
+                    .ghost()
+                    .icon(Icon::default().data(mark))
+                    .tooltip(label)
+                    .selected(self.section == section)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.section = section;
+                        cx.notify();
+                    })),
+            );
+        }
+        row
+    }
+
+    /// The section's own actions, mirroring the reference's left cluster.
+    fn render_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut row = div().flex().flex_row().items_center().gap_1();
+        match self.section {
+            Section::Keys => {
+                row = row
                     .child(
                         Button::new("generate-ed25519")
-                            .small()
-                            .primary()
                             .icon(IconName::Plus)
-                            .label("Generate ed25519")
+                            .label("New key")
+                            .tooltip("Generate an ed25519 key")
                             .disabled(self.busy)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.generate(KeyKind::Ed25519, window, cx);
@@ -536,15 +554,239 @@ impl KeysPane {
                     )
                     .child(
                         Button::new("generate-rsa")
-                            .small()
                             .ghost()
-                            .label("Generate RSA")
+                            .label("RSA key")
+                            .tooltip("Generate an RSA key")
                             .disabled(self.busy)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.generate(KeyKind::Rsa, window, cx);
                             })),
-                    ),
+                    )
+                    .child(
+                        Button::new("import-key")
+                            .ghost()
+                            .label("Import")
+                            .tooltip("Import an OpenSSH private key by path")
+                            .selected(self.show_import)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_import = !this.show_import;
+                                cx.notify();
+                            })),
+                    )
+                    // The reference surfaces these three. The core has no x509,
+                    // passkey or FIDO2 store, so they are shown disabled rather
+                    // than wired to nothing (same rule as `logs_pane`).
+                    .child(
+                        Button::new("keys-certificates")
+                            .ghost()
+                            .icon(IconName::FileText)
+                            .label("Certificate")
+                            .tooltip("Certificates are not supported yet")
+                            .disabled(true),
+                    )
+                    .child(
+                        Button::new("keys-touch-id")
+                            .ghost()
+                            .icon(Icon::default().data(glyph::FINGERPRINT))
+                            .label("Touch ID")
+                            .tooltip("Passkeys over Touch ID are not supported yet")
+                            .disabled(true),
+                    )
+                    .child(
+                        Button::new("keys-fido2")
+                            .ghost()
+                            .icon(Icon::default().data(glyph::SECURITY_KEY))
+                            .label("FIDO2")
+                            .tooltip("FIDO2 security keys are not supported yet")
+                            .disabled(true),
+                    );
+            }
+            Section::Hosts => {
+                row = row
+                    .child(
+                        Button::new("trust-host-key-form")
+                            .icon(IconName::Plus)
+                            .label("Trust a host key")
+                            .tooltip("Check a public key against known_hosts and record it")
+                            .selected(self.show_trust)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_trust = !this.show_trust;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("known-hosts-refresh")
+                            .ghost()
+                            .icon(IconName::RotateCw)
+                            .label("Reload")
+                            .tooltip("Re-read known_hosts")
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx))),
+                    );
+            }
+        }
+        row
+    }
+
+    /// Search, layout and reload controls, right-aligned as in the reference.
+    fn render_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = cx.theme().border;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .flex_shrink_0()
+            .child(
+                Button::new("keys-search")
+                    .ghost()
+                    .icon(IconName::Search)
+                    .tooltip("Search")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let handle = this.filter.read(cx).focus_handle(cx);
+                        handle.focus(window, cx);
+                    })),
             )
+            .child(
+                Button::new("keys-view-grid")
+                    .ghost()
+                    .icon(Icon::default().data(glyph::GRID))
+                    .tooltip("Grid view")
+                    .selected(self.view == ViewMode::Grid)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.view = ViewMode::Grid;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("keys-view-list")
+                    .ghost()
+                    .icon(Icon::default().data(glyph::LIST))
+                    .tooltip("List view")
+                    .selected(self.view == ViewMode::List)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.view = ViewMode::List;
+                        cx.notify();
+                    })),
+            )
+            .child(div().w(px(1.)).h(px(20.)).bg(border))
+            .child(
+                Button::new("keys-refresh")
+                    .ghost()
+                    .icon(IconName::RotateCw)
+                    .tooltip("Reload keys and known hosts")
+                    .disabled(self.busy)
+                    .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx))),
+            )
+    }
+
+    /// The filter field, pinned at the top of the content area as the reference
+    /// does with its search bar on the Hosts screen.
+    fn render_filter(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .flex_shrink_0()
+            .px_6()
+            .pt_6()
+            .pb_4()
+            .child(
+                Input::new(&self.filter).small().cleanable(true).prefix(
+                    Icon::new(IconName::Search)
+                        .small()
+                        .text_color(cx.theme().muted_foreground),
+                ),
+            )
+    }
+
+    // ── keys section ──────────────────────────────────────────────────────
+
+    fn render_keys(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let query = self.query(cx);
+        let visible: Vec<&KeyEntry> = self
+            .keys
+            .iter()
+            .filter(|key| {
+                let name = key_name(key);
+                matches_query(
+                    &[name.as_str(), key.kind.as_str(), key.fingerprint.as_str()],
+                    &query,
+                )
+            })
+            .collect();
+
+        let tiles: Vec<AnyElement> = visible
+            .iter()
+            .map(|key| {
+                let fingerprint = key.fingerprint.clone();
+                let selected = self.selected.as_deref() == Some(fingerprint.as_str());
+                let title = key_name(key);
+                let meta = format!(
+                    "{} · {}",
+                    key_type_label(&key.kind),
+                    short_fingerprint(&fingerprint)
+                );
+                let id = SharedString::from(format!("key-{fingerprint}"));
+                let tile = match self.view {
+                    ViewMode::Grid => card(id, glyph::KEY, title, meta, selected, false, cx),
+                    ViewMode::List => list_row(id, glyph::KEY, title, meta, selected, false, cx),
+                };
+                tile.on_click(cx.listener(move |this, _, _, cx| {
+                    this.selected = Some(fingerprint.clone());
+                    cx.notify();
+                }))
+                .into_any_element()
+            })
+            .collect();
+
+        let mut body = div().flex().flex_col().gap_4().w_full();
+        if self.show_import {
+            body = body.child(self.render_import(cx));
+        }
+        body = body.child(section_heading("Keys"));
+        if visible.is_empty() {
+            body = body.child(empty_state(
+                glyph::KEY,
+                if self.keys.is_empty() {
+                    "No private keys yet"
+                } else {
+                    "No key matches the search"
+                },
+                if self.keys.is_empty() {
+                    "Private keys in ~/.ssh and the sshdeck keys directory appear here. Generate one, or import an existing OpenSSH key."
+                } else {
+                    "Clear the search to see every key again."
+                },
+                cx,
+            ));
+        } else {
+            body = body.child(self.layout(tiles));
+        }
+        if let Some(detail) = self.render_key_detail(cx) {
+            body = body.child(detail);
+        }
+        if !visible.is_empty() && !self.keys.is_empty() {
+            body = body.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(muted)
+                    .child("Generated and imported keys are written owner-only (0600)."),
+            );
+        }
+
+        scroll_body("keys-scroll").child(body).into_any_element()
+    }
+
+    /// The import row, drawn only while the user asked for it.
+    fn render_import(&self, cx: &mut Context<Self>) -> AnyElement {
+        panel(cx)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(eyebrow("IMPORT AN OPENSSH PRIVATE KEY", cx))
             .child(
                 div()
                     .flex()
@@ -553,17 +795,20 @@ impl KeysPane {
                     .gap_2()
                     .child(div().flex_1().child(Input::new(&self.import_input).small()))
                     .child(
-                        Button::new("import-key")
-                            .small()
+                        Button::new("import-key-run")
+                            .icon(IconName::Inbox)
                             .label("Import")
-                            .icon(IconName::File)
                             .disabled(self.busy)
                             .on_click(cx.listener(|this, _, window, cx| this.import(window, cx))),
                     ),
             )
-            .child(div().text_xs().text_color(muted).child(
-                "Generated and imported keys are written owner-only (0600) under the sshdeck config directory.",
-            ))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("A copy is normalised into the sshdeck keys directory; the original file is left untouched."),
+            )
+            .into_any_element()
     }
 
     fn render_key_detail(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -571,25 +816,14 @@ impl KeysPane {
         let fingerprint = entry.fingerprint.clone();
         let authorized = entry.authorized.clone();
         let meta = format!("{} · {}", entry.kind, entry.path.display());
-        let muted = cx.theme().muted_foreground;
 
         let copy_key = authorized.clone();
         Some(
-            div()
+            panel(cx)
                 .flex()
                 .flex_col()
-                .gap_2()
-                .p_3()
-                .rounded_sm()
-                .border_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().sidebar)
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("PUBLIC KEY (authorized_keys)"),
-                )
+                .gap_3()
+                .child(eyebrow("PUBLIC KEY (authorized_keys)", cx))
                 .child(
                     div()
                         .flex()
@@ -599,14 +833,14 @@ impl KeysPane {
                         .child(
                             div()
                                 .flex_1()
+                                .min_w(px(0.))
                                 .overflow_hidden()
                                 .font_family("Menlo")
-                                .text_sm()
+                                .text_size(px(13.))
                                 .child(SharedString::from(authorized)),
                         )
                         .child(
                             Button::new("copy-authorized")
-                                .xsmall()
                                 .ghost()
                                 .icon(IconName::Copy)
                                 .tooltip("Copy public key")
@@ -621,181 +855,179 @@ impl KeysPane {
                                 })),
                         ),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("SHA256 FINGERPRINT"),
-                )
+                .child(eyebrow("SHA256 FINGERPRINT", cx))
                 .child(
                     div()
                         .font_family("Menlo")
-                        .text_sm()
+                        .text_size(px(13.))
                         .child(SharedString::from(fingerprint)),
                 )
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(muted)
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
                         .child(SharedString::from(meta)),
                 )
                 .into_any_element(),
         )
     }
 
-    fn render_known_hosts(&self, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
+    // ── known-hosts section ───────────────────────────────────────────────
 
-        let rows: Vec<AnyElement> = self
+    fn render_known_hosts(&self, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.query(cx);
+        let visible: Vec<&KnownEntry> = self
             .known
             .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                let revoked = entry.revoked;
+            .filter(|entry| {
+                matches_query(
+                    &[
+                        entry.hosts.as_str(),
+                        entry.key_type.as_str(),
+                        entry.fingerprint.as_deref().unwrap_or(""),
+                    ],
+                    &query,
+                )
+            })
+            .collect();
+
+        let tiles: Vec<AnyElement> = visible
+            .iter()
+            .map(|entry| {
+                let changed = self.pending.as_ref().is_some_and(|pending| {
+                    hosts_pattern_matches(&entry.hosts, &pending.host, pending.port)
+                });
+                let alarm = entry.revoked || changed;
                 let shown = entry
                     .fingerprint
                     .as_deref()
                     .map(short_fingerprint)
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "fingerprint unavailable".to_string());
+                let title = entry.hosts.clone();
                 let meta = format!("{} · {}", entry.key_type, shown);
-                div()
-                    .id(SharedString::from(format!("known-row-{index}")))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .when(revoked, |el| el.bg(cx.theme().danger.opacity(0.08)))
-                    .child(
-                        Icon::new(if revoked {
-                            IconName::CircleX
-                        } else {
-                            IconName::Globe
-                        })
-                        .small()
-                        .text_color(if revoked {
-                            cx.theme().danger
-                        } else {
-                            muted
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(SharedString::from(entry.hosts.clone()))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .font_family("Menlo")
-                                    .child(SharedString::from(meta)),
-                            ),
-                    )
-                    .when(revoked, |el| {
-                        el.child(
-                            div()
-                                .text_xs()
-                                .px_1()
-                                .rounded_sm()
-                                .bg(cx.theme().danger)
-                                .text_color(cx.theme().danger_foreground)
-                                .child("REVOKED"),
-                        )
-                    })
-                    .into_any_element()
+                let id = SharedString::from(format!("known-{}-{title}", entry.key_type));
+                let row = match self.view {
+                    ViewMode::Grid => card(id, glyph::HOST, title, meta, false, alarm, cx),
+                    ViewMode::List => list_row(id, glyph::HOST, title, meta, false, alarm, cx),
+                };
+                match (entry.revoked, changed) {
+                    (true, _) => row.child(state_pill("REVOKED", cx.theme().danger, cx)),
+                    (false, true) => row.child(state_pill("CHANGED", cx.theme().danger, cx)),
+                    (false, false) => row,
+                }
+                .into_any_element()
             })
             .collect();
 
-        let pending_card = self
-            .pending
-            .clone()
-            .map(|pending| self.render_pending(&pending, cx));
+        let mut body = div().flex().flex_col().gap_4().w_full();
+        if let Some(pending) = self.pending.clone() {
+            body = body.child(self.render_pending(&pending, cx));
+        }
+        if self.show_trust {
+            body = body.child(self.render_trust_form(cx));
+        }
+        body = body.child(section_heading("Known Hosts"));
+        if visible.is_empty() {
+            body = body.child(empty_state(
+                glyph::HOST,
+                if self.known.is_empty() {
+                    "No known hosts yet"
+                } else {
+                    "No host matches the search"
+                },
+                if self.known.is_empty() {
+                    "A host key is recorded here only after you check it and trust it."
+                } else {
+                    "Clear the search to see every recorded host again."
+                },
+                cx,
+            ));
+        } else {
+            body = body.child(self.layout(tiles));
+        }
 
-        div()
-            .id("known-hosts-scroll")
-            .flex()
-            .flex_col()
-            .gap_3()
-            .flex_1()
-            .min_h(px(0.))
-            .p_3()
-            .overflow_y_scrollbar()
-            .when_some(pending_card, |el, card| el.child(card))
-            .child(self.render_trust_form(cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .when(self.known.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .text_color(muted)
-                                .child("No known hosts recorded yet."),
-                        )
-                    })
-                    .children(rows),
-            )
+        scroll_body("known-hosts-scroll")
+            .child(body)
             .into_any_element()
     }
 
-    /// The changed-key warning: old and new fingerprints, then a danger button.
+    /// The changed-key warning: both fingerprints, then a danger button.
+    ///
+    /// This is the man-in-the-middle signal, so it is deliberately loud — a
+    /// danger border, the two fingerprints side by side, and a second explicit
+    /// click before `trust_changed` writes anything.
     fn render_pending(&self, pending: &PendingChange, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        let border = cx.theme().border;
+        let popover = cx.theme().popover;
+        let foreground = cx.theme().foreground;
         let message = format!(
             "The host key recorded for {}:{} is not the one now offered. Only replace it if \
              you have verified the new key out of band — an unexpected change can be a \
              man-in-the-middle attack.",
             pending.host, pending.port
         );
-        let fingerprint_row = |label: &'static str, value: &str, danger: bool| {
+        let fingerprint_box = move |label: &'static str, value: &str, alarm: bool| {
             div()
                 .flex()
                 .flex_col()
-                .gap_1()
-                .child(div().text_xs().text_color(muted).child(label))
+                .gap_2()
+                .flex_1()
+                .min_w(px(0.))
+                .p_3()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(if alarm { danger } else { border })
+                .bg(popover)
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if alarm { danger } else { muted })
+                        .child(label),
+                )
                 .child(
                     div()
                         .font_family("Menlo")
-                        .text_sm()
-                        .text_color(if danger {
-                            cx.theme().danger
-                        } else {
-                            cx.theme().foreground
-                        })
+                        .text_size(px(13.))
+                        .overflow_hidden()
+                        .text_color(if alarm { danger } else { foreground })
                         .child(SharedString::from(value.to_string())),
                 )
         };
         div()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_2()
-            .rounded_sm()
-            .border_1()
-            .border_color(cx.theme().danger)
-            .bg(cx.theme().danger.opacity(0.08))
+            .gap_3()
+            .p_4()
+            .rounded(px(10.))
+            .border_2()
+            .border_color(danger)
+            .bg(popover)
+            .shadow_sm()
             .child(
                 Alert::error("changed-host-key", message)
                     .title("Host key changed — possible man-in-the-middle"),
             )
-            .child(fingerprint_row("RECORDED (OLD)", &pending.old, false))
-            .child(fingerprint_row("OFFERED (NEW)", &pending.new, true))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_stretch()
+                    .gap_3()
+                    .child(fingerprint_box("RECORDED (OLD)", &pending.old, false))
+                    .child(fingerprint_box("OFFERED (NEW)", &pending.new, true)),
+            )
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
+                    .gap_3()
                     .child(
                         Button::new("replace-host-key")
-                            .small()
                             .danger()
                             .icon(IconName::TriangleAlert)
                             .label("Replace recorded key")
@@ -806,30 +1038,32 @@ impl KeysPane {
                     )
                     .child(
                         Button::new("cancel-host-key")
-                            .small()
                             .ghost()
                             .label("Cancel")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.pending = None;
                                 cx.notify();
                             })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(muted)
+                            .child("The recorded key is replaced only by this click."),
                     ),
             )
             .into_any_element()
     }
 
+    /// Trusts a key the user types: `known` classifies, `learn` writes.
     fn render_trust_form(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
-        div()
+        panel(cx)
             .flex()
             .flex_col()
-            .gap_2()
-            .p_2()
-            .rounded_sm()
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().sidebar)
-            .child(div().text_xs().text_color(muted).child("TRUST A HOST KEY"))
+            .gap_3()
+            .child(eyebrow("TRUST A HOST KEY", cx))
             .child(
                 div()
                     .flex()
@@ -844,11 +1078,9 @@ impl KeysPane {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
+                    .gap_3()
                     .child(
-                        Button::new("trust-host-key")
-                            .small()
-                            .primary()
+                        Button::new("trust-host-key-run")
                             .icon(IconName::Check)
                             .label("Check & trust")
                             .disabled(self.busy)
@@ -856,52 +1088,284 @@ impl KeysPane {
                                 this.trust_key(window, cx);
                             })),
                     )
-                    .child(div().text_xs().text_color(muted).child(
+                    .child(div().text_size(px(12.)).text_color(muted).child(
                         "Nothing is written until this click, and a changed key needs a second confirmation.",
                     )),
             )
             .into_any_element()
     }
+
+    /// Grid or list, per the toolbar's layout control.
+    fn layout(&self, tiles: Vec<AnyElement>) -> AnyElement {
+        match self.view {
+            ViewMode::Grid => div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_4()
+                .w_full()
+                .children(tiles)
+                .into_any_element(),
+            ViewMode::List => div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .children(tiles)
+                .into_any_element(),
+        }
+    }
 }
 
 impl Render for KeysPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = match self.section {
-            Section::Keys => self.render_keys(cx),
-            Section::Hosts => self.render_known_hosts(cx),
-        };
         div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(cx.theme().background)
+            .text_size(px(14.))
+            // The grey content surface the reference frames its white cards with.
+            .bg(cx.theme().sidebar)
             .text_color(cx.theme().foreground)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .px_3()
-                    .py_2()
-                    .flex_shrink_0()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(self.render_tabs(cx))
-                    .child(
-                        Button::new("keys-refresh")
-                            .small()
-                            .ghost()
-                            .icon(IconName::RotateCw)
-                            .tooltip("Reload keys and known hosts")
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx))),
-                    ),
-            )
-            .child(body)
+            .child(self.render_toolbar(cx))
+            .child(self.render_filter(cx))
+            .child(match self.section {
+                Section::Keys => self.render_keys(cx),
+                Section::Hosts => self.render_known_hosts(cx),
+            })
     }
 }
+
+// ── view helpers ──────────────────────────────────────────────────────────
+
+/// A vertically scrolling content column with the reference's 24px inset.
+fn scroll_body(id: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .gap_4()
+        .flex_1()
+        .min_h(px(0.))
+        .px_6()
+        .pb_6()
+        .overflow_y_scrollbar()
+}
+
+/// A white card surface: `10px` radius, subtle shadow, no default border.
+fn panel(cx: &App) -> Div {
+    div()
+        .p_4()
+        .rounded(px(10.))
+        .bg(cx.theme().popover)
+        .shadow_xs()
+}
+
+/// The navy square Termius sets behind a key, identity or host glyph.
+fn glyph_tile(glyph: &'static [u8], size: f32, cx: &App) -> impl IntoElement {
+    let inner = size * 0.6;
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .size(px(size))
+        .rounded(px(size * 0.25))
+        .bg(rgba(TILE_BG))
+        .child(
+            Icon::default()
+                .data(glyph)
+                .w(px(inner))
+                .h(px(inner))
+                .text_color(cx.theme().primary_foreground),
+        )
+}
+
+/// One Termius card: navy tile, name, and a secondary line.
+///
+/// Returns the element so the caller can attach its own click handler and any
+/// trailing badge without this helper knowing what the entry means.
+fn card(
+    id: SharedString,
+    glyph: &'static [u8],
+    title: String,
+    meta: String,
+    selected: bool,
+    danger: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let muted = cx.theme().muted_foreground;
+    let accent = cx.theme().accent;
+    let primary = cx.theme().primary;
+    let danger_color = cx.theme().danger;
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .p_2p5()
+        .h(px(60.))
+        .flex_basis(px(CARD_BASIS))
+        .flex_grow_1()
+        .flex_shrink_0()
+        .min_w(px(220.))
+        .rounded(px(10.))
+        .bg(cx.theme().popover)
+        .shadow_xs()
+        .cursor_pointer()
+        .when(danger, |el| el.border_1().border_color(danger_color))
+        .when(selected, |el| el.border_1().border_color(primary))
+        .hover(move |el| el.bg(accent))
+        .child(glyph_tile(glyph, 40., cx))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .truncate()
+                        .child(SharedString::from(title)),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .truncate()
+                        .child(SharedString::from(meta)),
+                ),
+        )
+}
+
+/// One row of the list layout: 44px, hairline separator, hover fill.
+fn list_row(
+    id: SharedString,
+    glyph: &'static [u8],
+    title: String,
+    meta: String,
+    selected: bool,
+    danger: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let muted = cx.theme().muted_foreground;
+    let border = cx.theme().border;
+    let accent = cx.theme().accent;
+    let selected_bg = cx.theme().muted;
+    let danger_color = cx.theme().danger;
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .min_h(px(44.))
+        .px_3()
+        .w_full()
+        .cursor_pointer()
+        .border_b_1()
+        .border_color(border)
+        .when(selected, |el| el.bg(selected_bg))
+        .when(danger, |el| el.border_l_2().border_color(danger_color))
+        .hover(move |el| el.bg(accent))
+        .child(glyph_tile(glyph, 28., cx))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .truncate()
+                        .child(SharedString::from(title)),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .truncate()
+                        .child(SharedString::from(meta)),
+                ),
+        )
+}
+
+/// A solid state pill (`REVOKED`, `CHANGED`).
+fn state_pill(label: &'static str, color: Hsla, cx: &App) -> Div {
+    div()
+        .flex_shrink_0()
+        .px_2()
+        .py_0p5()
+        .rounded(px(6.))
+        .bg(color)
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(cx.theme().danger_foreground)
+        .child(label)
+}
+
+/// A section heading, as the reference's bold "Keys" / "Known Hosts".
+fn section_heading(label: &'static str) -> Div {
+    div()
+        .flex_shrink_0()
+        .text_size(px(14.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(label)
+}
+
+/// A small uppercase caption above a value, as the reference's field labels.
+fn eyebrow(label: &'static str, cx: &App) -> Div {
+    div()
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(cx.theme().muted_foreground)
+        .child(label)
+}
+
+/// A centred empty state, matching the port-forwarding and logs panes.
+fn empty_state(glyph: &'static [u8], title: &'static str, body: &'static str, cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    let foreground = cx.theme().foreground;
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .w_full()
+        .py_16()
+        .child(
+            div()
+                .size(px(72.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(16.))
+                .bg(cx.theme().muted)
+                .child(
+                    Icon::default()
+                        .data(glyph)
+                        .w(px(32.))
+                        .h(px(32.))
+                        .text_color(foreground),
+                ),
+        )
+        .child(div().text_size(px(20.)).text_color(foreground).child(title))
+        .child(
+            div()
+                .max_w(px(420.))
+                .text_center()
+                .text_size(px(14.))
+                .text_color(muted)
+                .child(body),
+        )
+}
+
+// ── filesystem helpers ────────────────────────────────────────────────────
 
 /// The directory the app owns for keys it generates or imports.
 fn keys_dir() -> PathBuf {
@@ -1077,6 +1541,47 @@ fn short_fingerprint(fingerprint: &str) -> String {
         &rest[..SHORT_FINGERPRINT_EDGE],
         &rest[rest.len() - SHORT_FINGERPRINT_EDGE..]
     )
+}
+
+/// The name a key is shown under: its file name, as Termius shows `docker.pem`.
+fn key_name(key: &KeyEntry) -> String {
+    key.path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("key")
+        .to_string()
+}
+
+/// The label Termius prints under a key's name: `Type RSA`, `Type ED25519`.
+fn key_type_label(kind: &str) -> String {
+    let short = match kind {
+        "ssh-ed25519" => "ED25519",
+        "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => "RSA",
+        "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => "ECDSA",
+        "sk-ssh-ed25519@openssh.com" | "sk-ecdsa-sha2-nistp256@openssh.com" => "ED25519-SK",
+        "ssh-dss" => "DSA",
+        other => other,
+    };
+    format!("Type {short}")
+}
+
+/// Case-insensitive substring test over the fields a row shows.
+fn matches_query(fields: &[&str], query: &str) -> bool {
+    query.is_empty()
+        || fields
+            .iter()
+            .any(|field| field.to_lowercase().contains(query))
+}
+
+/// Whether a `known_hosts` host pattern covers `host:port`.
+///
+/// The file stores either `host` or `[host]:port`, comma-separated when several
+/// names share a key; used to mark the row a pending change belongs to.
+fn hosts_pattern_matches(patterns: &str, host: &str, port: u16) -> bool {
+    let bracketed = format!("[{host}]:{port}");
+    patterns
+        .split(',')
+        .any(|pattern| pattern.eq_ignore_ascii_case(host) || pattern == bracketed)
 }
 
 /// A filename safe to write into the keys directory.
@@ -1278,5 +1783,54 @@ mod tests {
         assert_eq!(safe_component("my key"), "my_key");
         assert_eq!(safe_component(".."), "imported_key");
         assert_eq!(safe_component(""), "imported_key");
+    }
+
+    #[test]
+    fn key_types_are_labelled_the_way_the_reference_does() {
+        assert_eq!(key_type_label("ssh-ed25519"), "Type ED25519");
+        assert_eq!(key_type_label("ssh-rsa"), "Type RSA");
+        assert_eq!(key_type_label("rsa-sha2-512"), "Type RSA");
+        assert_eq!(key_type_label("ecdsa-sha2-nistp256"), "Type ECDSA");
+        // An unknown type is shown as recorded rather than silently relabelled.
+        assert_eq!(key_type_label("ssh-future"), "Type ssh-future");
+    }
+
+    #[test]
+    fn the_filter_matches_case_insensitively_across_its_fields() {
+        assert!(matches_query(&["docker.pem", "ssh-rsa"], ""));
+        assert!(matches_query(&["docker.pem", "ssh-rsa"], "DOCKER"));
+        assert!(matches_query(&["docker.pem", "ssh-rsa"], "rsa"));
+        assert!(!matches_query(&["docker.pem", "ssh-rsa"], "ed25519"));
+    }
+
+    #[test]
+    fn a_pending_change_marks_only_the_pattern_it_belongs_to() {
+        assert!(hosts_pattern_matches("example.com", "example.com", 22));
+        assert!(hosts_pattern_matches(
+            "a.example.com,example.com",
+            "example.com",
+            22
+        ));
+        assert!(hosts_pattern_matches(
+            "[example.com]:2222",
+            "example.com",
+            2222
+        ));
+        assert!(hosts_pattern_matches(
+            "[EXAMPLE.com]:2222",
+            "example.com",
+            2222
+        ));
+        // Same host, different port, is a different entry.
+        assert!(!hosts_pattern_matches(
+            "[example.com]:2222",
+            "example.com",
+            22
+        ));
+        assert!(!hosts_pattern_matches(
+            "other.example.com",
+            "example.com",
+            22
+        ));
     }
 }
