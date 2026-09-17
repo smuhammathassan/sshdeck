@@ -7,10 +7,13 @@
 
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::ActiveTheme as _;
+// `push_notification` is a `WindowExt` method; without the trait in scope the
+// window has no such method (see AGENTS.md errata on missing trait imports).
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, font, px, AppContext as _, Bounds, Context, Div, Entity, FocusHandle, FontWeight,
-    KeyDownEvent, ParentElement as _, Render, Rgba, SharedString, Styled as _, Window,
+    div, font, px, AppContext as _, Bounds, Context, Div, FocusHandle, FontWeight, KeyDownEvent,
+    ParentElement as _, Render, Rgba, SharedString, Styled as _, Window,
 };
 use gpui_kit::{InteractiveElement as _, IntoElement};
 use sshdeck_core::session::{Session, SessionConfig, SessionEvent};
@@ -170,7 +173,11 @@ impl TerminalPane {
     /// Connects and returns the pane. A configuration the transport rejects
     /// synchronously (a missing secret, an unsupported auth method) is kept as a
     /// failed state rather than a returned error, so the pane can show why.
-    pub fn new(config: SessionConfig, window: &mut Window, cx: &mut Context<Self>) -> Entity<Self> {
+    ///
+    /// Construct it with `cx.new(|cx| TerminalPane::new(config, window, cx))`
+    /// from the owning view, so construction runs in this pane's own context and
+    /// the event-watch task is spawned against this pane's handle.
+    pub fn new(config: SessionConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let cell = measure_cell(window);
         let focus_handle = cx.focus_handle();
 
@@ -191,8 +198,12 @@ impl TerminalPane {
         // competing-consumer, so a second receiver would split the stream.
         let events = connected.as_ref().ok().map(Session::events);
 
-        let pane = cx.new(|_| Self {
-            session: connected,
+        // A transport that was rejected up front has already been folded into
+        // `status`/`ended` above, and the shell reports that on the tab, so the
+        // pane keeps no handle. `.ok()` after the failure has been recorded is
+        // not a silent discard: the error is preserved in the pane's state.
+        let mut pane = Self {
+            session: connected.ok(),
             terminal: Terminal::new(80, 24, SCROLLBACK_LINES),
             focus_handle,
             cell,
@@ -200,7 +211,7 @@ impl TerminalPane {
             status,
             title: None,
             ended,
-        });
+        };
 
         if let Some(events) = events {
             // One task per pane awaits the session's events and notifies the view
@@ -213,7 +224,7 @@ impl TerminalPane {
             // The shared borrow is taken up front so the closure captures `&Window`
             // rather than the caller's `&mut Window`.
             let window: &Window = window;
-            pane.update(cx, |pane, cx| pane.watch(events, window, cx));
+            pane.watch(events, window, cx);
         }
         pane
     }
@@ -399,15 +410,17 @@ impl TerminalPane {
             // a selection or a highlighted menu row. A `Default` slot resolves to
             // the theme colour it is standing in for, so the swap stays legible
             // on either theme.
+            // Theme slots are `Hsla`; a cell colour is `Rgba`. Convert the theme
+            // default so both arms of each pair are the same type.
             let (fg, bg) = if run.style.inverse {
                 (
-                    run.style.bg.unwrap_or(theme_bg),
-                    run.style.fg.unwrap_or(theme_fg),
+                    run.style.bg.unwrap_or(theme_bg.into()),
+                    run.style.fg.unwrap_or(theme_fg.into()),
                 )
             } else {
                 (
-                    run.style.fg.unwrap_or(theme_fg),
-                    run.style.bg.unwrap_or(theme_bg),
+                    run.style.fg.unwrap_or(theme_fg.into()),
+                    run.style.bg.unwrap_or(theme_bg.into()),
                 )
             };
             // A background is only painted when the cell actually asked for one
@@ -586,7 +599,7 @@ impl Render for TerminalPane {
                     // A canvas paints with `&mut App`, so the pane is reached
                     // through a weak handle rather than `Context::listener`.
                     let view = cx.entity().downgrade();
-                    move |_, size, _, cx| {
+                    move |_, size: gpui_kit::Size<gpui_kit::Pixels>, _, cx| {
                         view.update(cx, |pane, cx| {
                             let cols = (f32::from(size.width) / cell_w).floor().max(1.0) as u16;
                             let rows = (f32::from(size.height) / cell_h).floor().max(1.0) as u16;

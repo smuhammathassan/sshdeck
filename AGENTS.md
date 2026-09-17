@@ -78,6 +78,7 @@ not the prose.
 | `push_notification` on `Context` | Notifications are window-scoped: `window.push_notification(Notification::error(..), cx)`. |
 | `cx.defer(..)` for a toast | `defer` yields only `&mut App`, no window. Use `cx.defer_in(window, ..)`. |
 | Size methods need no import | `.small()`/`.large()` come from the `Sizable` trait; `.disabled()` from `Disableable`; `.when()` from `FluentBuilder` (in `prelude`); `.overflow_y_scrollbar()` from `ScrollableElement`. Missing these traits is the single most common cause of "no method named" errors here. |
+| Colour guides treat `Rgba`/`Rgb`/`Hsla` as interchangeable | `Rgba` and `Hsla` are distinct structs and there is no `Rgb` type. Theme fields (`cx.theme().foreground`, `.background`, …) are `Hsla`; parsed terminal cell colours are `Rgba`. An `Option<Rgba>` cannot fall back to an `Hsla` in `unwrap_or` — convert with `.into()` (`From<Hsla> for Rgba` and `From<Rgba> for Hsla` both exist). |
 
 `gpui-kit = "0.6"` resolves to `gpui-pre 0.3.5` — read that version's source.
 

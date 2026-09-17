@@ -205,7 +205,9 @@ impl SshDeck {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pane = TerminalPane::new(config, window, cx);
+        // Construct the pane inside its own entity context; the shell only holds
+        // the handle. `TerminalPane::new` returns the pane state, not an entity.
+        let pane = cx.new(|cx| TerminalPane::new(config, window, cx));
         // Re-render the chrome whenever the pane's status changes. The pane is
         // the only thing that reads the event channel; the shell just mirrors.
         let subscription = cx.observe_in(&pane, window, |this, pane, _window, cx| {
