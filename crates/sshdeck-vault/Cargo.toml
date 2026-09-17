@@ -5,3 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# Versions verified against crates.io / docs.rs on 2026-09-17 (see the crate
+# report). Exact pins: the on-disk format depends on these algorithms.
+argon2 = { version = "=0.6.0", features = ["zeroize"] }
+base64 = "=0.23.1"
+chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
+getrandom = "=0.4.3"
+# `keyring` 4.x enables the `v1` compatibility API by default, which picks the
+# platform store (Keychain Services on macOS) and needs no extra setup.
+keyring = "=4.2.0"
+zeroize = "=1.9.0"
