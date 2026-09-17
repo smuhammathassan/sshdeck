@@ -217,6 +217,36 @@ current shell and the original:
    with `--list-hover` / `--list-select` states, not bare rows.
 5. **Body text is 14px**, not 13px.
 
+## Header: measured deltas vs the real thing
+
+Comparing our running app against a capture of Termius side by side, the chrome
+is now the right *shape* but four things still read as wrong. These are the
+remaining gaps, most-visible first.
+
+1. **Our header's right side is visually heavy; theirs is almost empty.**
+   Termius has three subtle items: a text button (`Update`), a bell icon, and an
+   account control. We render a two-line status block
+   (`1 connected` / `root@… · password · connected`), a **solid blue filled
+   `Reconnect` button**, and four more icons. A filled primary button in the
+   chrome is the single loudest difference. Connection state belongs in the tab
+   (a dot) and a tooltip, not as text in the header, and `Reconnect` belongs on
+   the session tab's context, not as a primary action.
+2. **Termius has a second tab row.** Directly under the 56px header there is a
+   ~28px band, spanning only the pane (not the sidebar), holding the focused
+   pane's own tabs plus a `+`. We draw the terminal directly under the header.
+3. **Tab rendering.** Theirs: a coloured terminal-type glyph, then the label,
+   then a close `✕`; the active tab is an elevated rounded rect and inactive
+   tabs are fully transparent. Ours uses a connection **dot** where the glyph
+   should be, which reads as a different design.
+4. **Icons.** Theirs are filled/duotone glyphs at a consistent optical weight;
+   ours are thin single-weight line icons, which changes the whole texture of
+   the header. Matching the exact glyphs is not required, but the visual weight
+   is: prefer solid/filled icons in the chrome and keep one size (16px).
+
+Not fixable, for the record: the 10px window corner radius. GPUI has no
+corner-radius field and clips to a rectangular mask, so the native macOS radius
+stands. Do not spend time on it again.
+
 ## Substitutions
 
 Fidelity where it is free, substitution where the original is licensed:

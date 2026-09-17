@@ -127,7 +127,7 @@ chains and `ProxyJump` but does not say how the two share a field. The source
 
 ## Subagents
 
-Delegate to `deepseek4.1` only. No other subagent, for any task.
+Delegate to `muse` or `deepseek4.1`. Nothing else.
 
 ## Legality
 
