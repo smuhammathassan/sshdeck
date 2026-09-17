@@ -13,6 +13,7 @@ mod sftp_pane;
 mod snippets_pane;
 mod terminal;
 
+use forward_pane::ForwardPane;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputContentType, InputEvent, InputState},
@@ -29,9 +30,11 @@ use gpui_kit::{
     Styled as _, Subscription, TitlebarOptions, Window, WindowControlArea, WindowOptions,
 };
 use keys_pane::KeysPane;
+use logs_pane::LogsPane;
 use palette::PaletteView;
 use settings::SettingsView;
 use sftp_pane::SftpPane;
+use snippets_pane::SnippetsPane;
 use sshdeck_core::session::{Session as SshSession, SessionConfig, SessionEvent};
 use sshdeck_core::{Host, HostId, HostStore, SessionState};
 use sshdeck_sftp::SftpClient;
@@ -493,6 +496,12 @@ struct SshDeck {
     /// The SFTP pane, created when the SFTP tab is first selected so a transport
     /// is not opened until then.
     sftp_pane: Option<Entity<SftpPane>>,
+    /// Lazily created panes for the left nav — each is built once and cached so
+    /// in-progress edits survive switching away and back.
+    keys_pane: Option<Entity<KeysPane>>,
+    forward_pane: Option<Entity<ForwardPane>>,
+    snippets_pane: Option<Entity<SnippetsPane>>,
+    logs_pane: Option<Entity<LogsPane>>,
     /// Whether the host sidebar is collapsed to its narrow rail.
     sidebar_collapsed: bool,
     /// Whether the add-host sheet is open. Host creation lives behind the
@@ -551,6 +560,10 @@ impl SshDeck {
             palette: None,
             overlay: None,
             sftp_pane: None,
+            keys_pane: None,
+            forward_pane: None,
+            snippets_pane: None,
+            logs_pane: None,
             sidebar_collapsed: false,
             add_host_open: false,
             sftp_attached: None,
@@ -581,7 +594,7 @@ impl SshDeck {
         if let Ok(value) = std::env::var("SSHDECK_START_PANE") {
             cx.defer_in(window, move |this, window, cx| {
                 match parse_start_pane(&value) {
-                    Some(StartPane::Nav(nav)) => this.select_left_nav(nav, cx),
+                    Some(StartPane::Nav(nav)) => this.select_left_nav(nav, window, cx),
                     Some(StartPane::Sftp) => this.select_tab(MainTab::Sftp, window, cx),
                     None => window.push_notification(
                         Notification::warning(format!(
@@ -768,6 +781,7 @@ impl SshDeck {
             // A session that just authenticated is what the SFTP pane attaches
             // to; a session that ended is what it detaches from.
             this.reconcile_sftp(window, cx);
+            this.reconcile_forward(cx);
             cx.notify();
         });
         self._subscriptions.push(subscription);
@@ -790,6 +804,7 @@ impl SshDeck {
         // The new tab is active now; the SFTP pane must follow it even before the
         // session reaches `Connected` (it detaches until then).
         self.reconcile_sftp(window, cx);
+        self.reconcile_forward(cx);
 
         if let Some(message) = failed {
             window.push_notification(
@@ -852,9 +867,91 @@ impl SshDeck {
     /// Selects a left-rail pane. The single path both the rail buttons and
     /// `SSHDECK_START_PANE` go through, so the startup affordance cannot drift
     /// from a real click.
-    fn select_left_nav(&mut self, nav: LeftNav, cx: &mut Context<Self>) {
+    fn select_left_nav(&mut self, nav: LeftNav, window: &mut Window, cx: &mut Context<Self>) {
         self.left_nav = nav;
+        match nav {
+            LeftNav::Keychain | LeftNav::KnownHosts => {
+                self.ensure_keys_pane(window, cx);
+            }
+            LeftNav::PortForwarding => {
+                self.ensure_forward_pane(window, cx);
+                self.reconcile_forward(cx);
+            }
+            LeftNav::Snippets => {
+                self.ensure_snippets_pane(window, cx);
+            }
+            LeftNav::Logs => {
+                self.ensure_logs_pane(window, cx);
+            }
+            LeftNav::Hosts => {}
+        }
         cx.notify();
+    }
+
+    fn ensure_keys_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<KeysPane> {
+        if let Some(pane) = self.keys_pane.clone() {
+            return pane;
+        }
+        let pane = cx.new(|cx| KeysPane::new(window, cx));
+        self.keys_pane = Some(pane.clone());
+        pane
+    }
+
+    fn ensure_forward_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ForwardPane> {
+        if let Some(pane) = self.forward_pane.clone() {
+            return pane;
+        }
+        let pane = cx.new(|cx| ForwardPane::new(window, cx));
+        self.forward_pane = Some(pane.clone());
+        pane
+    }
+
+    fn ensure_snippets_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<SnippetsPane> {
+        if let Some(pane) = self.snippets_pane.clone() {
+            return pane;
+        }
+        let pane = cx.new(|cx| SnippetsPane::new(window, cx));
+        self.snippets_pane = Some(pane.clone());
+        pane
+    }
+
+    fn ensure_logs_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<LogsPane> {
+        if let Some(pane) = self.logs_pane.clone() {
+            return pane;
+        }
+        let pane = cx.new(|cx| LogsPane::new(window, cx));
+        self.logs_pane = Some(pane.clone());
+        pane
+    }
+
+    /// Keeps the port-forwarding pane attached to the focused session, like the
+    /// SFTP pane. Called on session connected/closed/tab switched.
+    fn reconcile_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self.forward_pane.clone() else {
+            return;
+        };
+        let session = self
+            .active
+            .and_then(|index| self.sessions.get(index))
+            .filter(|session| matches!(session.status.state, SessionState::Connected))
+            .and_then(|session| session.pane.read(cx).session());
+        pane.update(cx, |pane, cx| pane.set_session(session, cx));
     }
 
     /// Switches the main region to `tab`, creating the SFTP pane on first use.
@@ -872,6 +969,7 @@ impl SshDeck {
             }
         }
         self.reconcile_sftp(window, cx);
+        self.reconcile_forward(cx);
         cx.notify();
     }
 
@@ -888,6 +986,7 @@ impl SshDeck {
             other => other,
         };
         self.reconcile_sftp(window, cx);
+        self.reconcile_forward(cx);
         cx.notify();
     }
 
@@ -1331,8 +1430,8 @@ impl SshDeck {
                     LeftNav::Hosts,
                     hosts_active,
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.select_left_nav(LeftNav::Hosts, cx);
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.select_left_nav(LeftNav::Hosts, window, cx);
                 })),
             )
             .child(
@@ -1342,8 +1441,8 @@ impl SshDeck {
                     LeftNav::Keychain,
                     keychain_active,
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.select_left_nav(LeftNav::Keychain, cx);
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.select_left_nav(LeftNav::Keychain, window, cx);
                 })),
             )
             .child(
@@ -1353,8 +1452,8 @@ impl SshDeck {
                     LeftNav::PortForwarding,
                     pf_active,
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.select_left_nav(LeftNav::PortForwarding, cx);
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.select_left_nav(LeftNav::PortForwarding, window, cx);
                 })),
             )
             .child(
@@ -1364,8 +1463,8 @@ impl SshDeck {
                     LeftNav::Snippets,
                     snippets_active,
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.select_left_nav(LeftNav::Snippets, cx);
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.select_left_nav(LeftNav::Snippets, window, cx);
                 })),
             )
             .child(
@@ -1375,14 +1474,14 @@ impl SshDeck {
                     LeftNav::KnownHosts,
                     known_active,
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.select_left_nav(LeftNav::KnownHosts, cx);
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.select_left_nav(LeftNav::KnownHosts, window, cx);
                 })),
             )
             .child(
                 nav_item("Logs", IconName::Inbox, LeftNav::Logs, logs_active).on_click(
-                    cx.listener(|this, _, _, cx| {
-                        this.select_left_nav(LeftNav::Logs, cx);
+                    cx.listener(|this, _, window, cx| {
+                        this.select_left_nav(LeftNav::Logs, window, cx);
                     }),
                 ),
             )
@@ -1829,7 +1928,7 @@ impl SshDeck {
         )
     }
 
-    fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.overlay.is_some() {
             return self.render_overlay(cx);
         }
@@ -1838,19 +1937,55 @@ impl SshDeck {
                 match self.left_nav {
                     LeftNav::Hosts => self.render_vault(cx),
                     LeftNav::Keychain | LeftNav::KnownHosts => {
-                        // KeysPane is reachable via the header Keys button and palette;
-                        // render an honest placeholder that names it (no fake list).
-                        self.render_empty_state(
-                            "Keychain / Known Hosts — open via header Keys or palette (KeysPane)",
-                            cx,
-                        )
+                        // KeysPane covers both SSH keys and known hosts. Section is
+                        // private with no public setter, so the same pane is rendered
+                        // for both nav entries and the user switches inside the pane.
+                        let pane = self.ensure_keys_pane(window, cx);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .size_full()
+                            .overflow_hidden()
+                            .child(pane)
+                            .into_any_element()
                     }
-                    LeftNav::PortForwarding => self.render_empty_state(
-                        "Port Forwarding — open via palette or header (ForwardPane)",
-                        cx,
-                    ),
-                    LeftNav::Snippets => self.render_empty_state("Snippets — no snippets yet", cx),
-                    LeftNav::Logs => self.render_empty_state("Logs — no logs yet", cx),
+                    LeftNav::PortForwarding => {
+                        let pane = self.ensure_forward_pane(window, cx);
+                        // Ensure session is reconciled even if pane was just created
+                        // outside the nav selection path (e.g., via render).
+                        self.reconcile_forward(cx);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .size_full()
+                            .overflow_hidden()
+                            .child(pane)
+                            .into_any_element()
+                    }
+                    LeftNav::Snippets => {
+                        let pane = self.ensure_snippets_pane(window, cx);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .size_full()
+                            .overflow_hidden()
+                            .child(pane)
+                            .into_any_element()
+                    }
+                    LeftNav::Logs => {
+                        let pane = self.ensure_logs_pane(window, cx);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .size_full()
+                            .overflow_hidden()
+                            .child(pane)
+                            .into_any_element()
+                    }
                 }
             }
             MainTab::Sftp => self.render_sftp(cx),
@@ -2456,7 +2591,7 @@ impl Render for SshDeck {
         let header = self.render_header(cx);
         let sidebar = self.render_sidebar(cx);
         let pane_tabs = self.render_pane_tabs(cx);
-        let main = self.render_main(cx);
+        let main = self.render_main(window, cx);
         let add_host_sheet = self.render_add_host_sheet(cx);
         let palette = self.palette.clone();
 
