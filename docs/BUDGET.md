@@ -101,9 +101,55 @@ Procedure for a claim to count:
 
 ## Recorded results
 
-| Date | Commit | Build | Idle RSS | Idle CPU | 1 session | Processes |
-| --- | --- | --- | --- | --- | --- | --- |
-| — | — | — | not yet measured | — | — | — |
+### 2026-09-17 — first measurement
 
-Empty on purpose. The first row lands when P1 produces a real session; until
-then there is nothing honest to put here.
+Binary: release `--release`, thin LTO, stripped, built by CI (run `35187264491`,
+commit `98b16c2`), macOS arm64, launched from a shell with a normal window
+session. Procedure: launch, settle 60 s, then sample. Machine: M1, 8 GB,
+macOS 26.4.1, with normal desktop load.
+
+| Metric | Target | Hard cap | Measured | Verdict |
+| --- | --- | --- | --- | --- |
+| Processes | 1 | 2 | **1** | ✅ pass |
+| Threads | — | — | 5 | — |
+| Binary size (release, stripped) | ≤ 25 MB | 40 MB | **19.2 MB** | ✅ pass |
+| Idle RSS | ≤ 60 MB | 100 MB | **60–64 MB** | ⚠️ at target |
+| Idle CPU | ≤ 0.2 % | 1 % | **0.8–0.9 %** | ❌ misses target |
+| 8 h idle RSS growth | < 2 MB | 10 MB | not measured | — |
+| Time to first frame | ≤ 300 ms | 700 ms | not measured | — |
+| 1 idle session | ≤ 120 MB | 180 MB | not measured | no test host |
+| 10 sessions | ≤ 250 MB | 400 MB | not measured | no test host |
+| Marginal cost per session | ≤ 15 MB | 25 MB | not measured | no test host |
+
+Versus the Termius baseline on the same machine: **RSS 410 MB → 60–64 MB
+(≈ 6.7× less)** and **CPU 134.5 % → 0.9 % (≈ 150× less)**.
+
+Two notes on method, so the numbers are not over-read:
+
+- `ps` reports RSS ≈ 60–64 MB while `top`'s `mem` column reports **40–42 MB** for
+  the same process. The conservative `ps` figure is recorded above. The gap is a
+  difference in how the two tools count shared pages.
+- Idle CPU was confirmed with **instantaneous `top` samples** (6 samples, 2 s
+  apart) rather than `ps`, whose `%cpu` is a lifetime average that startup
+  inflates. So 0.8–0.9 % is a real steady-state figure, not a startup artifact.
+
+### Open issue: idle CPU misses its target
+
+0.9 % of one core is ~9 ms of CPU per second, which is consistent with waking
+around 60×/s to do almost nothing — i.e. a **continuous render loop while the
+window is visible**. That contradicts the "no idle work" premise in the
+"Known tensions" section above, even though the application code itself has no
+polling loop.
+
+It is still ~150× below the baseline, and comfortably inside the 1 % hard cap,
+so it is not blocking. But the 0.2 % target exists precisely to make the battery
+claim defensible, and it is not met. Next diagnostic: measure CPU with the
+window fully occluded or minimised. If CPU drops to ~0, the cost is the visible
+window's draw loop rather than application work, which tells us exactly where to
+look.
+
+### Not yet measured
+
+The per-session rows need a reachable SSH host. Until one is available the
+per-session budget is unproven — the idle figure says nothing about whether a
+session costs 5 MB or 40 MB.
