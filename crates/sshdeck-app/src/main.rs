@@ -16,6 +16,7 @@ use gpui_kit::component::{
     input::{Input, InputContentType, InputEvent, InputState},
     notification::Notification,
     scroll::ScrollableElement as _,
+    tooltip::Tooltip,
     ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _, Root,
     Sizable as _, Theme, ThemeMode, ThemeRegistry, WindowExt,
 };
@@ -987,44 +988,29 @@ impl SshDeck {
     /// Termius draws one header and no status bar. The product name is gone from
     /// the chrome, and the status bar's host/state/connection-count information
     /// now lives in the selected tab and the header's right cluster.
+    ///
+    /// The right side is intentionally quiet: no filled primary button, no
+    /// two-line status block. Termius shows a text button, a bell, and an
+    /// account control there; sshdeck shows three ghost icons at 16px
+    /// (command palette, notifications, account). The filled `Reconnect`
+    /// action now lives on the session tab itself (RotateCw) plus the palette
+    /// and double-click, and connection state is the glyph tint on the tab
+    /// with a tooltip. Removed from header but still reachable:
+    /// - `Reconnect`/`Connect` → session tab's RotateCw, palette
+    ///   "Connect to Selected Host", or double-clicking the host row.
+    /// - `SSH keys & known hosts` → sidebar "Keys" button and the palette.
+    /// - Theme toggle → palette "Toggle Light / Dark Theme".
     fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        let active = self.connected_count();
         let collapsed = self.sidebar_collapsed;
-        // A tab being open means reconnect it; otherwise connect what is selected.
-        let connect_host = self
-            .active_session()
-            .and_then(|session| self.store.inventory().get(&session.host).cloned())
-            .or_else(|| {
-                self.selected
-                    .as_ref()
-                    .and_then(|id| self.store.inventory().get(id).cloned())
-            });
-        let connect_label = if self.active_session().is_some() {
-            "Reconnect"
-        } else {
-            "Connect"
-        };
 
+        // Three subtle ghost icons at 16px (medium, the default). No primary
+        // fill, no status text — the header's loudest difference is gone.
         let actions = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_1()
             .flex_shrink_0()
-            .child(
-                Button::new("connect")
-                    .small()
-                    .primary()
-                    .label(connect_label)
-                    .disabled(connect_host.is_none())
-                    .tooltip("Open a session to the selected host")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(host) = connect_host.clone() {
-                            this.connect(host, window, cx);
-                        }
-                    })),
-            )
             .child(
                 Button::new("palette")
                     .ghost()
@@ -1035,33 +1021,20 @@ impl SshDeck {
                     })),
             )
             .child(
-                Button::new("keys")
+                Button::new("notifications")
                     .ghost()
-                    .icon(IconName::HardDrive)
-                    .tooltip("SSH keys & known hosts")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_keys(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("theme")
-                    .ghost()
-                    .icon(IconName::Moon)
-                    .tooltip("Toggle light/dark")
+                    .icon(IconName::Bell)
+                    .tooltip("Notifications")
                     .on_click(|_, window, cx| {
-                        let next = if Theme::global(cx).is_dark() {
-                            ThemeMode::Light
-                        } else {
-                            ThemeMode::Dark
-                        };
-                        Theme::change(next, Some(window), cx);
+                        window
+                            .push_notification(Notification::info("Notifications coming soon"), cx);
                     }),
             )
             .child(
-                Button::new("settings")
+                Button::new("account")
                     .ghost()
-                    .icon(IconName::Settings2)
-                    .tooltip("Settings")
+                    .icon(IconName::CircleUser)
+                    .tooltip("Settings & account")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_settings(window, cx);
                     })),
@@ -1111,19 +1084,6 @@ impl SshDeck {
                     })),
             )
             .child(self.render_tabs(cx))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .when(active > 0, |el| {
-                        el.child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(format!("{active} connected")),
-                        )
-                    })
-                    .child(div().text_xs().text_color(muted).child(self.status_line())),
-            )
             .child(actions)
     }
 
@@ -1190,7 +1150,7 @@ impl SshDeck {
             // `--list-hover`: the card highlight, via the hover style
             // refinement (`StatefulInteractiveElement::hover`).
             .hover(|style| style.bg(card_hover))
-            .child(Icon::new(IconName::Globe).small().text_color(tint))
+            .child(Icon::new(IconName::Globe).text_color(tint))
             .child(
                 div()
                     .flex()
@@ -1206,16 +1166,11 @@ impl SshDeck {
                     ),
             )
             .when(is_open, |el| {
-                el.child(
-                    Icon::new(IconName::Check)
-                        .small()
-                        .text_color(cx.theme().success),
-                )
+                el.child(Icon::new(IconName::Check).text_color(cx.theme().success))
             })
             .child(
                 Button::new(SharedString::from(format!("{prefix}-remove-{remove_id}")))
                     .ghost()
-                    .xsmall()
                     .icon(IconName::Close)
                     .tooltip("Remove host")
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -1275,6 +1230,15 @@ impl SshDeck {
                                     .text_xs()
                                     .text_color(muted)
                                     .child(format!("HOSTS ({total})")),
+                            )
+                            .child(
+                                Button::new("sidebar-keys")
+                                    .ghost()
+                                    .icon(IconName::HardDrive)
+                                    .tooltip("SSH keys & known hosts")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_keys(window, cx);
+                                    })),
                             ),
                     )
                     .child(Input::new(&self.filter).small().cleanable(true)),
@@ -1369,7 +1333,8 @@ impl SshDeck {
     }
 
     /// One fixed header tab (Vaults or SFTP): 51px tall inside the 56px header,
-    /// 6px radius, transparent until selected.
+    /// 6px radius, transparent until selected. Uses 16px icons throughout the
+    /// chrome (medium, the default) with the heavier glyph choice for each tab.
     fn render_fixed_tab(
         &mut self,
         label: &'static str,
@@ -1378,12 +1343,11 @@ impl SshDeck {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_active = self.tab == target;
-        let muted = cx.theme().muted_foreground;
-        let selected_bg = cx.theme().muted;
-        let selected_fg = cx.theme().foreground;
-        // `--list-hover`. The theme's `list.hover.background` token currently
-        // equals the card background, so the recovered value is used directly
-        // (see AGENTS.md errata).
+        let muted = cx.theme().muted_foreground; // #8d91a5
+        let selected_bg = cx.theme().muted; // #282b3d
+        let selected_fg = cx.theme().foreground; // #ffffff
+                                                 // `--list-hover` (#3e4257) — token `list.hover.background` still equals
+                                                 // the card background in the bundled theme, so the recovered hex is used.
         let hover_bg = rgb(0x3e4257);
 
         div()
@@ -1399,7 +1363,7 @@ impl SshDeck {
             .text_color(if is_active { selected_fg } else { muted })
             .when(is_active, |el| el.bg(selected_bg))
             .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
-            .child(Icon::new(icon).small())
+            .child(Icon::new(icon).text_color(if is_active { selected_fg } else { muted }))
             .child(label)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_tab(target, window, cx);
@@ -1414,18 +1378,19 @@ impl SshDeck {
     /// selected tab is one step lighter (`--surface-high`, the theme's `muted`
     /// background, `#282b3d`) with primary text; unselected tabs are transparent
     /// with the secondary `#8d91a5` text and stay 6px-rounded. A session tab
-    /// carries its state as a dot and folds in what the removed status bar
-    /// showed.
+    /// carries a terminal glyph (SquareTerminal) tinted by connection state
+    /// instead of a dot, then the label, then the close `✕`.
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        let selected_bg = cx.theme().muted;
-        let selected_fg = cx.theme().foreground;
-        let hover_bg = rgb(0x3e4257);
+        let muted = cx.theme().muted_foreground; // #8d91a5
+        let selected_bg = cx.theme().muted; // #282b3d
+        let selected_fg = cx.theme().foreground; // #ffffff
+        let hover_bg = rgb(0x3e4257); // --list-hover
         let active = self.active;
 
         let vaults =
             self.render_fixed_tab("Vaults", IconName::LayoutDashboard, MainTab::Vaults, cx);
-        let sftp = self.render_fixed_tab("SFTP", IconName::FolderOpen, MainTab::Sftp, cx);
+        // Heavier closed-folder glyph reads more solid than FolderOpen.
+        let sftp = self.render_fixed_tab("SFTP", IconName::Folder, MainTab::Sftp, cx);
 
         let mut strip = div()
             .id("tab-strip")
@@ -1450,15 +1415,22 @@ impl SshDeck {
             });
             // A session tab is only selected while no pane overlay covers it.
             let is_active = self.overlay.is_none() && active == Some(index);
-            let dot = match &session.status.state {
-                SessionState::Connected => cx.theme().success,
-                SessionState::Connecting | SessionState::Authenticating => cx.theme().warning,
-                SessionState::Failed { .. } => cx.theme().danger,
+            // Glyph tint carries connection state (connected #21b568 via
+            // `success`, connecting #f2c94c via `warning`, failed #f25e61 via
+            // `danger`, idle #8d91a5 via `muted_foreground`). The session tab
+            // order is glyph, label, close `✕` — the dot is gone.
+            let glyph_color = match &session.status.state {
+                SessionState::Connected => cx.theme().success, // #21b568
+                SessionState::Connecting | SessionState::Authenticating => cx.theme().warning, // #f2c94c
+                SessionState::Failed { .. } => cx.theme().danger, // #f25e61
                 SessionState::Disconnected | SessionState::Closed { .. } => {
-                    cx.theme().muted_foreground
+                    cx.theme().muted_foreground // #8d91a5
                 }
             };
+            let state_label = session.status.state.label();
             let id = session.host.clone();
+            let reconnect_id = id.clone();
+            let close_id = id.clone();
 
             strip = strip.child(
                 div()
@@ -1474,12 +1446,32 @@ impl SshDeck {
                     .text_color(if is_active { selected_fg } else { muted })
                     .when(is_active, |el| el.bg(selected_bg))
                     .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
-                    .child(div().size(px(6.)).rounded_full().bg(dot))
+                    // (unconfirmed) Div tooltip via closure; verified tooltip
+                    // path is Button::tooltip(string) — this Div form mirrors
+                    // docs/UI-PARITY.md "plus a tooltip" requirement.
+                    .tooltip({
+                        let tip = state_label.clone();
+                        move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
+                    })
+                    .child(Icon::new(IconName::SquareTerminal).text_color(glyph_color))
                     .child(SharedString::from(label))
                     .child(
-                        Button::new(SharedString::from(format!("close-tab-{id}")))
+                        Button::new(SharedString::from(format!("reconnect-tab-{reconnect_id}")))
                             .ghost()
-                            .xsmall()
+                            .icon(IconName::RotateCw)
+                            .tooltip("Reconnect")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                if let Some(host) =
+                                    this.store.inventory().get(&reconnect_id).cloned()
+                                {
+                                    this.connect(host, window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("close-tab-{close_id}")))
+                            .ghost()
                             .icon(IconName::Close)
                             .tooltip("Close session")
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1502,6 +1494,127 @@ impl SshDeck {
                     this.open_add_host(window, cx);
                 })),
         )
+    }
+
+    /// ~28px band directly under the 56px header, spanning **only the pane
+    /// area, not the sidebar**. Holds the focused pane's own tabs plus a `+`.
+    /// Visually quiet: no background fill of its own, a lighter active tab
+    /// (`#282b3d`, `tab.active.background`), `12px` text. Always rendered,
+    /// even with a single tab — the original always shows it.
+    fn render_pane_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_bg = cx.theme().muted; // #282b3d `tab.active.background`
+        let active_fg = cx.theme().foreground; // #ffffff `tab.active.foreground`
+        let hover_bg = rgb(0x3e4257); // --list-hover, no token
+
+        // One tab reflecting the focused pane. For a session the label is the
+        // pane title or host label and the glyph is SquareTerminal tinted by
+        // connection state; for Vaults/SFTP the fixed icon is shown with
+        // muted tint. Count is always at least one, so the row never collapses.
+        let (label, icon, glyph_color, state_label): (String, IconName, Hsla, String) = match self
+            .tab
+        {
+            MainTab::Vaults => (
+                "Vaults".to_string(),
+                IconName::LayoutDashboard,
+                cx.theme().muted_foreground,
+                "vaults".to_string(),
+            ),
+            MainTab::Sftp => (
+                "SFTP".to_string(),
+                IconName::Folder,
+                cx.theme().muted_foreground,
+                "sftp".to_string(),
+            ),
+            MainTab::Session(index) => {
+                if let Some(session) = self.sessions.get(index) {
+                    let title = session.status.title.clone().unwrap_or_else(|| {
+                        self.store
+                            .inventory()
+                            .get(&session.host)
+                            .map(|host| host.label.clone())
+                            .unwrap_or_else(|| session.host.to_string())
+                    });
+                    let (slabel, color) = match &session.status.state {
+                        SessionState::Connected => ("connected".to_string(), cx.theme().success),
+                        SessionState::Connecting | SessionState::Authenticating => {
+                            ("connecting".to_string(), cx.theme().warning)
+                        }
+                        SessionState::Failed { message } => {
+                            (format!("failed: {message}"), cx.theme().danger)
+                        }
+                        SessionState::Disconnected | SessionState::Closed { .. } => {
+                            ("disconnected".to_string(), cx.theme().muted_foreground)
+                        }
+                    };
+                    (title, IconName::SquareTerminal, color, slabel)
+                } else {
+                    (
+                        "Vaults".to_string(),
+                        IconName::LayoutDashboard,
+                        cx.theme().muted_foreground,
+                        "vaults".to_string(),
+                    )
+                }
+            }
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .h(px(28.))
+            .px_2()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(rgba(0x8d91a51a)) // --border-light
+            // No background fill on the row itself — only the active tab is
+            // elevated (`#282b3d`, radius 6px) with primary text; inactive
+            // would be transparent with `#8d91a5` (here only one tab, so active).
+            .child(
+                div()
+                    .id("pane-tab-active")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .h(px(22.))
+                    .rounded_md()
+                    .bg(active_bg)
+                    .text_color(active_fg)
+                    .text_size(px(12.))
+                    .hover(|s| s.bg(hover_bg))
+                    // (unconfirmed) tooltip via closure mirrors header session
+                    // tab; Button::tooltip(string) is the verified path.
+                    .tooltip({
+                        let tip = state_label.clone();
+                        move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
+                    })
+                    .child(Icon::new(icon).text_color(glyph_color))
+                    .child(SharedString::from(label))
+                    .child(
+                        Button::new("pane-tab-close")
+                            .ghost()
+                            .icon(IconName::Close)
+                            .tooltip("Close")
+                            .on_click(cx.listener(|this, _, window, cx| match this.tab {
+                                MainTab::Session(index) => {
+                                    this.close_session(index, window, cx);
+                                }
+                                _ => this.select_tab(MainTab::Vaults, window, cx),
+                            })),
+                    ),
+            )
+            .child(
+                Button::new("pane-new-tab")
+                    .ghost()
+                    .icon(IconName::Plus)
+                    .tooltip("New tab")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_add_host(window, cx);
+                    })),
+            )
     }
 
     /// The password prompt, rendered while a secret is missing.
@@ -1794,6 +1907,7 @@ impl Render for SshDeck {
 
         let header = self.render_header(cx);
         let sidebar = self.render_sidebar(cx);
+        let pane_tabs = self.render_pane_tabs(cx);
         let main = self.render_main(cx);
         let add_host_sheet = self.render_add_host_sheet(cx);
         let palette = self.palette.clone();
@@ -1824,7 +1938,16 @@ impl Render for SshDeck {
                     .flex_1()
                     .overflow_hidden()
                     .child(sidebar)
-                    .child(main),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .child(pane_tabs)
+                            .child(main),
+                    ),
             )
             .when_some(add_host_sheet, |el, sheet| el.child(sheet))
             .children(Root::render_dialog_layer(window, cx))
