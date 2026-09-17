@@ -21,9 +21,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, px, AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
-    WindowOptions,
+    div, px, AnyElement, App, AppContext as _, Context, Entity, Focusable as _,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    Subscription, Window, WindowOptions,
 };
 use keys_pane::KeysPane;
 use palette::PaletteView;
@@ -325,6 +325,11 @@ struct SshDeck {
     palette: Option<Entity<PaletteView>>,
     /// The settings, keys or SFTP pane showing over the session, if at all.
     overlay: Option<Overlay>,
+    /// Whether the host sidebar is collapsed to its narrow rail.
+    sidebar_collapsed: bool,
+    /// Whether the add-host sheet is open. Host creation lives behind the
+    /// header's `+` control rather than an always-visible form.
+    add_host_open: bool,
     /// Index of the session the SFTP pane is attached to, if any.
     sftp_attached: Option<usize>,
     /// Bumped per attach attempt so a superseded SFTP connect is ignored.
@@ -375,6 +380,8 @@ impl SshDeck {
             secret: None,
             palette: None,
             overlay: None,
+            sidebar_collapsed: false,
+            add_host_open: false,
             sftp_attached: None,
             sftp_generation: 0,
             _subscriptions: subscriptions,
@@ -825,85 +832,126 @@ impl SshDeck {
         }
     }
 
-    fn render_top_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
+    /// The single 56px app header: sidebar toggle, the session tabs, the add
+    /// control, then the right-aligned pane actions.
+    ///
+    /// This replaces the old three bands (title bar + tab strip + status bar);
+    /// Termius draws one header and no status bar. The product name is gone from
+    /// the chrome, and the status bar's host/state/connection-count information
+    /// now lives in the selected tab and the header's right cluster.
+    fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let active = self.connected_count();
+        let collapsed = self.sidebar_collapsed;
+
+        let actions = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("palette")
+                    .ghost()
+                    .icon(IconName::Search)
+                    .tooltip("Command palette")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_palette(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("keys")
+                    .ghost()
+                    .icon(IconName::HardDrive)
+                    .tooltip("SSH keys & known hosts")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_keys(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("sftp")
+                    .ghost()
+                    .icon(IconName::Folder)
+                    .tooltip("SFTP browser")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_sftp(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("theme")
+                    .ghost()
+                    .icon(IconName::Moon)
+                    .tooltip("Toggle light/dark")
+                    .on_click(|_, window, cx| {
+                        let next = if Theme::global(cx).is_dark() {
+                            ThemeMode::Light
+                        } else {
+                            ThemeMode::Dark
+                        };
+                        Theme::change(next, Some(window), cx);
+                    }),
+            )
+            .child(
+                Button::new("settings")
+                    .ghost()
+                    .icon(IconName::Settings2)
+                    .tooltip("Settings")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_settings(window, cx);
+                    })),
+            );
 
         div()
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
+            .gap_2()
             .flex_shrink_0()
-            .h(px(44.))
+            // `--header-height` from the recovered stylesheet.
+            .h(px(56.))
             .px_3()
             .border_b_1()
-            .border_color(border)
+            .border_color(cx.theme().border)
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(Icon::new(IconName::Frame).text_color(cx.theme().primary))
-                    .child("sshdeck"),
+                Button::new("sidebar-toggle")
+                    .ghost()
+                    .icon(IconName::Frame)
+                    .tooltip(if collapsed {
+                        "Show sidebar"
+                    } else {
+                        "Hide sidebar"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_collapsed = !this.sidebar_collapsed;
+                        cx.notify();
+                    })),
             )
+            .child(self.render_tabs(cx))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        Button::new("theme")
-                            .ghost()
-                            .icon(IconName::Moon)
-                            .tooltip("Toggle light/dark")
-                            .on_click(|_, window, cx| {
-                                let next = if Theme::global(cx).is_dark() {
-                                    ThemeMode::Light
-                                } else {
-                                    ThemeMode::Dark
-                                };
-                                Theme::change(next, Some(window), cx);
-                            }),
-                    )
-                    .child(
-                        Button::new("palette")
-                            .ghost()
-                            .icon(IconName::Search)
-                            .tooltip("Command palette")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_palette(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("keys")
-                            .ghost()
-                            .icon(IconName::HardDrive)
-                            .tooltip("SSH keys & known hosts")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_keys(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("sftp")
-                            .ghost()
-                            .icon(IconName::Folder)
-                            .tooltip("SFTP browser")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_sftp(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("settings")
-                            .ghost()
-                            .icon(IconName::Settings2)
-                            .tooltip("Settings")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_settings(window, cx);
-                            })),
-                    ),
+                Button::new("add-host")
+                    .ghost()
+                    .icon(IconName::Plus)
+                    .tooltip("Add host")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_add_host(window, cx);
+                    })),
             )
+            .child(div().text_xs().text_color(muted).child(self.status_line()))
+            .when(active > 0, |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("{active} connected")),
+                )
+            })
+            .child(actions)
+    }
+
+    /// Opens host creation. Until the form moves into a sheet this is the
+    /// always-visible form's first field, so the header `+` is a real control.
+    fn open_add_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.draft_label.read(cx).focus_handle(cx);
+        handle.focus(window, cx);
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -989,7 +1037,12 @@ impl SshDeck {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .w(px(280.))
+            // Collapsed rail vs expanded panel. Termius: 180px / 240px.
+            .w(if self.sidebar_collapsed {
+                px(180.)
+            } else {
+                px(240.)
+            })
             .h_full()
             .border_r_1()
             .border_color(border)
@@ -1051,10 +1104,17 @@ impl SshDeck {
             )
     }
 
-    /// The tab strip: one tab per open session, with its state.
+    /// The session tabs, drawn as 6px cards inside the 56px header.
+    ///
+    /// `--horizontal-tabs-height` is 51px; the selected tab uses the
+    /// `--surface-high` accent surface (`#282b3d`, the theme's `muted`
+    /// background) with primary text, while unselected tabs are transparent
+    /// with the secondary `#8d91a5` text. The tab carries the session state
+    /// that the removed status bar used to show.
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
+        let selected_bg = cx.theme().muted;
+        let selected_fg = cx.theme().foreground;
         let active = self.active;
 
         let tabs = self.sessions.iter().enumerate().map(|(index, session)| {
@@ -1075,11 +1135,11 @@ impl SshDeck {
                 .items_center()
                 .gap_2()
                 .px_3()
-                .h_full()
+                .h(px(36.))
+                .rounded_sm()
                 .cursor_pointer()
-                .border_r_1()
-                .border_color(border)
-                .when(is_active, |el| el.bg(cx.theme().muted))
+                .text_color(if is_active { selected_fg } else { muted })
+                .when(is_active, |el| el.bg(selected_bg))
                 .child(
                     div()
                         .text_xs()
@@ -1096,24 +1156,15 @@ impl SshDeck {
         });
 
         div()
+            .id("tab-strip")
             .flex()
             .flex_row()
             .items_center()
-            .flex_shrink_0()
-            .h(px(32.))
-            .border_b_1()
-            .border_color(border)
-            .child(
-                div()
-                    .id("tab-strip")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h_full()
-                    .flex_1()
-                    .overflow_x_scrollbar()
-                    .children(tabs),
-            )
+            .gap_1()
+            .h(px(51.))
+            .flex_1()
+            .overflow_x_scrollbar()
+            .children(tabs)
     }
 
     /// The password prompt, rendered while a secret is missing.
@@ -1359,43 +1410,29 @@ impl SshDeck {
             .into_any_element()
     }
 
-    fn render_status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
-        let muted = cx.theme().muted_foreground;
-        let active = self.connected_count();
-
-        let host_label = self
+    /// The host, auth method and connection state the removed status bar used
+    /// to show, folded into the header's right cluster: the active session's
+    /// endpoint and state, or the selected host when no session is open.
+    fn status_line(&self) -> String {
+        let host = self
             .active_session()
             .and_then(|session| self.store.inventory().get(&session.host))
-            .map(|host| format!("{} · {}", host.endpoint(), host.auth.label()))
             .or_else(|| {
                 self.selected
                     .as_ref()
                     .and_then(|id| self.store.inventory().get(id))
-                    .map(|host| format!("{} · {}", host.endpoint(), host.auth.label()))
             })
-            .unwrap_or_else(|| "no host selected".to_string());
+            .map(|host| format!("{} · {}", host.endpoint(), host.auth.label()));
 
-        let state_label = match self.active_session() {
+        let state = match self.active_session() {
             Some(session) => session.status.state.label(),
             None => "no session".to_string(),
         };
 
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .flex_shrink_0()
-            .h(px(26.))
-            .px_3()
-            .border_t_1()
-            .border_color(border)
-            .text_xs()
-            .text_color(muted)
-            .child(host_label)
-            .child(SharedString::from(state_label))
-            .child(format!("{active} connected"))
+        match host {
+            Some(host) => format!("{host} · {state}"),
+            None => state,
+        }
     }
 }
 
@@ -1404,10 +1441,9 @@ impl Render for SshDeck {
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
 
-        let top_bar = self.render_top_bar(cx);
+        let header = self.render_header(cx);
         let sidebar = self.render_sidebar(cx);
         let main = self.render_main(cx);
-        let status = self.render_status_bar(cx);
         let palette = self.palette.clone();
 
         let mut root = div()
@@ -1423,7 +1459,7 @@ impl Render for SshDeck {
             .on_action(cx.listener(Self::on_palette_up))
             .on_action(cx.listener(Self::on_palette_down))
             .on_action(cx.listener(Self::on_palette_cancel))
-            .child(top_bar)
+            .child(header)
             .child(
                 div()
                     .flex()
@@ -1433,7 +1469,6 @@ impl Render for SshDeck {
                     .child(sidebar)
                     .child(main),
             )
-            .child(status)
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
             .children(Root::render_notification_layer(window, cx));
