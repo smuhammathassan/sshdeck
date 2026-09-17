@@ -283,10 +283,11 @@ impl HostChain {
     /// The hop's dial config by dial-order index. Used to attach per-hop
     /// secrets (a jump host may use a different key or password than the target).
     pub fn hop_mut(&mut self, index: usize) -> Option<&mut SessionConfig> {
-        if let Some(hop) = self.jumps.get_mut(index) {
-            return Some(&mut hop.config);
+        let jumps = self.jumps.len();
+        if index < jumps {
+            return self.jumps.get_mut(index).map(|hop| &mut hop.config);
         }
-        if index == self.jumps.len() {
+        if index == jumps {
             return Some(&mut self.target.config);
         }
         None
