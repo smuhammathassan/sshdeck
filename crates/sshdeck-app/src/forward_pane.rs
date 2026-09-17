@@ -56,8 +56,8 @@ use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, Context, Div, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Styled as _, Window,
+    div, px, AnyElement, AppContext as _, Context, Div, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Window,
 };
 use sshdeck_core::forward::{Forward, ForwardConfig, ForwardError, ForwardEvent};
 use sshdeck_core::session::Session;
@@ -509,16 +509,19 @@ impl ForwardPane {
                 );
         }
 
-        let rows: Vec<Div> = self
+        let rows: Vec<AnyElement> = self
             .forwards
             .iter()
-            .map(|row| self.render_row(row, cx))
+            .map(|row| self.render_row(row, cx).into_any_element())
             .collect();
         body.children(rows)
     }
 
     /// One forward: kind, endpoints, live status and its one action.
-    fn render_row(&self, row: &ForwardRow, cx: &mut Context<Self>) -> Div {
+    ///
+    /// Returns `impl IntoElement` rather than `Div`: `.id(..)` wraps the div in a
+    /// `Stateful<Div>`, so naming the return type would leak that wrapper here.
+    fn render_row(&self, row: &ForwardRow, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
         let id = row.id;
