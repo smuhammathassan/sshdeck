@@ -67,9 +67,9 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rgb, App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable as _, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
-    Subscription, Window,
+    div, px, rgb, AnyElement, App, AppContext as _, Context, Div, Entity, FocusHandle,
+    Focusable as _, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, Styled as _, Subscription, Window,
 };
 
 /// Cap for the in-memory ring buffer. `docs/BUDGET.md` treats unbounded growth as
@@ -587,9 +587,9 @@ impl LogsPane {
         entries.reverse();
 
         let header = self.render_table_header(cx);
-        let rows: Vec<Div> = entries
+        let rows: Vec<gpui_kit::AnyElement> = entries
             .iter()
-            .map(|entry| self.render_row(entry, cx))
+            .map(|entry| self.render_row(entry, cx).into_any_element())
             .collect();
 
         div()
