@@ -11,6 +11,11 @@ path = "src/main.rs"
 [dependencies]
 gpui-kit = "0.6"
 sshdeck-core = { path = "../sshdeck-core" }
+sshdeck-terminal = { path = "../sshdeck-terminal" }
+# `Session::events` hands back an `async_channel::Receiver`; the pane has to name
+# that type to poll it. Same version sshdeck-core already pins, so Cargo unifies
+# them and no extra code is compiled in.
+async-channel = "2"
 
 [features]
 default = []

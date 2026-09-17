@@ -1,22 +1,27 @@
 //! sshdeck — a GPUI desktop SSH client.
 //!
-//! Milestone 1 is the shell: host inventory, filtering, selection, persistence,
-//! theming. Transport (russh) replaces the placeholder pane next.
+//! The shell (host inventory, filtering, selection, persistence, theming) is
+//! milestone 1. This is milestone 2: the pane next to it is a real terminal
+//! backed by the `sshdeck-core` transport and the `sshdeck-terminal` grid.
+
+mod terminal;
 
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputContentType, InputEvent, InputState},
     notification::Notification,
     scroll::ScrollableElement as _,
-    ActiveTheme as _, Disableable as _, Icon, IconName, Root, Sizable as _, Theme, ThemeMode,
-    WindowExt,
+    ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _, Root,
+    Sizable as _, Theme, ThemeMode, WindowExt,
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
     div, px, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, WindowOptions,
 };
+use sshdeck_core::session::SessionConfig;
 use sshdeck_core::{Host, HostId, HostStore, SessionState};
+use terminal::{PaneStatus, TerminalPane};
 
 fn main() {
     gpui_kit::application()
@@ -34,19 +39,26 @@ fn main() {
         });
 }
 
-/// One open session, mirroring an entry in the tab strip.
+/// One open tab: the host it points at and the pane rendering it.
 struct Session {
     host: HostId,
-    state: SessionState,
+    pane: Entity<TerminalPane>,
+    /// Mirrors the pane's state so the tab strip and status bar can render it
+    /// without reaching into the pane every frame.
+    status: PaneStatus,
 }
 
 struct SshDeck {
     store: HostStore,
     selected: Option<HostId>,
+    /// The tab the terminal pane is showing.
+    active: Option<usize>,
     sessions: Vec<Session>,
     filter: Entity<InputState>,
     draft_label: Entity<InputState>,
     draft_address: Entity<InputState>,
+    /// The in-flight secret prompt, when a host needs a password we do not have.
+    secret: Option<(HostId, Entity<InputState>)>,
     /// Subscription handles must outlive construction, so they are owned here.
     _subscriptions: Vec<Subscription>,
 }
@@ -80,10 +92,12 @@ impl SshDeck {
         Self {
             store,
             selected: None,
+            active: None,
             sessions: Vec::new(),
             filter,
             draft_label,
             draft_address,
+            secret: None,
             _subscriptions: subscriptions,
         }
     }
@@ -129,8 +143,114 @@ impl SshDeck {
         cx.notify();
     }
 
+    /// Opens a session for `host`, prompting for a password first when the host
+    /// authenticates with one and no secret is available yet.
+    fn connect(&mut self, host: Host, window: &mut Window, cx: &mut Context<Self>) {
+        // An existing tab for this host is focused instead of opening a second
+        // connection to the same place.
+        if let Some(index) = self.sessions.iter().position(|s| s.host == host.id) {
+            self.active = Some(index);
+            let pane = self.sessions[index].pane.clone();
+            pane.update(cx, |pane, cx| pane.focus(window, cx));
+            cx.notify();
+            return;
+        }
+
+        let config = match &host.auth {
+            // The password lives in the OS keychain, which the vault crate owns.
+            // Until that is wired into this view, ask for it once and use it for
+            // this connection only: it is never written to the inventory.
+            sshdeck_core::AuthMethod::Password { .. } => {
+                self.prompt_for_secret(&host, window, cx);
+                return;
+            }
+            _ => SessionConfig::from_host(&host),
+        };
+
+        self.open_pane(&host, config, window, cx);
+    }
+
+    /// Asks for the host's password before connecting.
+    ///
+    /// The password is used for this connection only and never reaches the
+    /// inventory. The keychain-backed vault owns persistent secrets; until it is
+    /// wired into this view, this is the honest way to connect at all.
+    fn prompt_for_secret(&mut self, host: &Host, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = cx.new(|cx| InputState::new(window, cx).placeholder("Password"));
+        let label = host.label.clone();
+        self.secret = Some((host.id.clone(), prompt));
+        window.push_notification(Notification::info(format!("{label} needs a password")), cx);
+        cx.notify();
+    }
+
+    /// Connects the host whose password was just entered, then clears the prompt.
+    fn submit_secret(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((host_id, input)) = self.secret.take() else {
+            return;
+        };
+        let Some(host) = self.store.inventory().get(&host_id).cloned() else {
+            return;
+        };
+        // A password is not persisted; it exists for this connection only.
+        let password = input.read(cx).value().to_string();
+        let config = SessionConfig::from_host(&host).with_password(password);
+        self.open_pane(&host, config, window, cx);
+    }
+
+    /// Creates the pane and appends it as a tab.
+    fn open_pane(
+        &mut self,
+        host: &Host,
+        config: SessionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pane = TerminalPane::new(config, window, cx);
+        // Re-render the chrome whenever the pane's status changes. The pane is
+        // the only thing that reads the event channel; the shell just mirrors.
+        let subscription = cx.observe_in(&pane, window, |this, pane, _window, cx| {
+            let status = pane.read(cx).status();
+            // Match by handle rather than trusting the active index: the pane can
+            // notify before the tab is registered.
+            if let Some(session) = this.sessions.iter_mut().find(|s| s.pane == pane) {
+                session.status = status;
+            }
+            cx.notify();
+        });
+        self._subscriptions.push(subscription);
+
+        let status = pane.read(cx).status();
+        let failed = match &status.state {
+            SessionState::Failed { message } => Some(message.clone()),
+            _ => None,
+        };
+        self.sessions.push(Session {
+            host: host.id.clone(),
+            pane: pane.clone(),
+            status,
+        });
+        self.active = Some(self.sessions.len() - 1);
+        pane.update(cx, |pane, cx| pane.focus(window, cx));
+
+        if let Some(message) = failed {
+            window.push_notification(
+                Notification::error(format!("{} could not connect: {message}", host.label)),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// The tab the pane is showing, if any.
+    fn active_session(&self) -> Option<&Session> {
+        self.active.and_then(|index| self.sessions.get(index))
+    }
+
     fn connected_count(&self) -> usize {
-        self.sessions.iter().filter(|s| s.state.is_active()).count()
+        self.sessions
+            .iter()
+            .filter(|s| s.status.state.is_active())
+            .count()
     }
 
     fn render_top_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -202,13 +322,18 @@ impl SshDeck {
         let rows = visible.into_iter().map(|host| {
             let id = host.id.clone();
             let is_selected = self.selected.as_ref() == Some(&id);
+            let is_open = self.sessions.iter().any(|s| s.host == id);
             let remove_id = id.clone();
+            let connect_host = host.clone();
 
             div()
                 .id(SharedString::from(format!("host-{}", id)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.selected = Some(id.clone());
                     cx.notify();
+                }))
+                .on_double_click(cx.listener(move |this, _, window, cx| {
+                    this.connect(connect_host.clone(), window, cx);
                 }))
                 .flex()
                 .flex_row()
@@ -239,6 +364,13 @@ impl SshDeck {
                                 .child(SharedString::from(host.endpoint())),
                         ),
                 )
+                .when(is_open, |el| {
+                    el.child(
+                        Icon::new(IconName::Check)
+                            .small()
+                            .text_color(cx.theme().success),
+                    )
+                })
                 .child(
                     Button::new(SharedString::from(format!("remove-{}", remove_id)))
                         .ghost()
@@ -315,55 +447,210 @@ impl SshDeck {
             )
     }
 
+    /// The tab strip: one tab per open session, with its state.
+    fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let active = self.active;
+
+        let tabs = self.sessions.iter().enumerate().map(|(index, session)| {
+            let label = session.status.title.clone().unwrap_or_else(|| {
+                self.store
+                    .inventory()
+                    .get(&session.host)
+                    .map(|host| host.label.clone())
+                    .unwrap_or_else(|| session.host.to_string())
+            });
+            let state = session.status.state.label();
+            let is_active = active == Some(index);
+
+            div()
+                .id(SharedString::from(format!("tab-{}", session.host)))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .h_full()
+                .cursor_pointer()
+                .border_r_1()
+                .border_color(border)
+                .when(is_active, |el| el.bg(cx.theme().muted))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(SharedString::from(state)),
+                )
+                .child(SharedString::from(label))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.active = Some(index);
+                    cx.notify();
+                }))
+        });
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_shrink_0()
+            .h(px(32.))
+            .border_b_1()
+            .border_color(border)
+            .child(
+                div()
+                    .id("tab-strip")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h_full()
+                    .flex_1()
+                    .overflow_x_scrollbar()
+                    .children(tabs),
+            )
+    }
+
+    /// The password prompt, rendered while a secret is missing.
+    fn render_secret_prompt(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        // Clone the handle so no borrow of `self` outlives this method.
+        let (host_id, input) = self.secret.clone()?;
+        let label = self
+            .store
+            .inventory()
+            .get(&host_id)
+            .map(|host| host.endpoint())
+            .unwrap_or_default();
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .flex_shrink_0()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(SharedString::from(format!("{label} · password"))),
+                )
+                .child(
+                    div().flex_1().child(
+                        Input::new(&input)
+                            .small()
+                            .content_type(InputContentType::Password),
+                    ),
+                )
+                .child(
+                    Button::new("secret-connect")
+                        .small()
+                        .primary()
+                        .label("Connect")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.submit_secret(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("secret-cancel")
+                        .small()
+                        .ghost()
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.secret = None;
+                            cx.notify();
+                        })),
+                ),
+        )
+    }
+
     fn render_main(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
 
-        let selected = self
-            .selected
-            .as_ref()
-            .and_then(|id| self.store.inventory().get(id))
-            .cloned();
+        // Bring the focused pane's status onto the tab before rendering chrome.
+        if let Some(session) = self.active.and_then(|index| self.sessions.get_mut(index)) {
+            session.status = session.pane.read(cx).status();
+        }
 
-        let content = match selected {
-            None => div()
+        let connect_label = if self.active_session().is_some() {
+            "Reconnect"
+        } else {
+            "Connect"
+        };
+        // A tab being open means reconnect it; otherwise connect what is selected.
+        let connect_host = self
+            .active_session()
+            .and_then(|session| self.store.inventory().get(&session.host).cloned())
+            .or_else(|| {
+                self.selected
+                    .as_ref()
+                    .and_then(|id| self.store.inventory().get(id).cloned())
+            });
+
+        let content = match self.active_session().map(|session| session.pane.clone()) {
+            Some(pane) => div()
                 .flex()
                 .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_2()
+                .flex_1()
                 .size_full()
-                .child(Icon::new(IconName::Inbox).large().text_color(muted))
-                .child(div().text_color(muted).child("Select a host to begin"))
+                .overflow_hidden()
+                .child(pane)
                 .into_any_element(),
-            Some(host) => div()
-                .flex()
-                .flex_col()
-                .size_full()
-                .child(
-                    // Terminal surface placeholder. The real grid lands with the
-                    // russh transport; this reserves the layout and type.
-                    div()
+            None => {
+                let selected = self
+                    .selected
+                    .as_ref()
+                    .and_then(|id| self.store.inventory().get(id))
+                    .cloned();
+                match selected {
+                    None => div()
                         .flex()
                         .flex_col()
-                        .flex_1()
-                        .p_3()
-                        .gap_1()
-                        .font_family("Menlo")
-                        .text_sm()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .size_full()
+                        .child(Icon::new(IconName::Inbox).large().text_color(muted))
+                        .child(div().text_color(muted).child("Select a host to begin"))
+                        .into_any_element(),
+                    Some(host) => div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .size_full()
+                        .child(Icon::new(IconName::Globe).large().text_color(muted))
+                        .child(div().text_color(muted).child("Not connected"))
                         .child(
                             div()
+                                .text_xs()
                                 .text_color(muted)
                                 .child(SharedString::from(format!("$ ssh {}", host.endpoint()))),
                         )
-                        .child(
-                            div()
-                                .text_color(muted)
-                                .child("transport not wired up yet — see docs/re/"),
-                        ),
-                )
-                .into_any_element(),
+                        .into_any_element(),
+                }
+            }
         };
+
+        let header = match self.active_session() {
+            Some(session) => {
+                let label = self
+                    .store
+                    .inventory()
+                    .get(&session.host)
+                    .map(|host| format!("{} · {}", host.label, host.endpoint()))
+                    .unwrap_or_else(|| session.host.to_string());
+                format!("{} · {}", label, session.status.state.label())
+            }
+            None => "no session".to_string(),
+        };
+
+        let tabs = self.render_tabs(cx);
+        let secret = self.render_secret_prompt(cx);
 
         div()
             .flex()
@@ -371,6 +658,8 @@ impl SshDeck {
             .flex_1()
             .h_full()
             .overflow_hidden()
+            .child(tabs)
+            .when_some(secret, |el, prompt| el.child(prompt))
             .child(
                 div()
                     .flex()
@@ -382,16 +671,19 @@ impl SshDeck {
                     .px_3()
                     .border_b_1()
                     .border_color(border)
-                    .child(match &self.selected {
-                        Some(id) => SharedString::from(format!("session · {id}")),
-                        None => SharedString::from("no session"),
-                    })
+                    .child(SharedString::from(header))
                     .child(
                         Button::new("connect")
                             .small()
-                            .label("Connect")
-                            .disabled(true)
-                            .tooltip("Transport lands next milestone"),
+                            .primary()
+                            .label(connect_label)
+                            .disabled(connect_host.is_none())
+                            .tooltip("Open a session to the selected host")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(host) = connect_host.clone() {
+                                    this.connect(host, window, cx);
+                                }
+                            })),
                     ),
             )
             .child(content)
@@ -403,11 +695,21 @@ impl SshDeck {
         let active = self.connected_count();
 
         let host_label = self
-            .selected
-            .as_ref()
-            .and_then(|id| self.store.inventory().get(id))
+            .active_session()
+            .and_then(|session| self.store.inventory().get(&session.host))
             .map(|host| format!("{} · {}", host.endpoint(), host.auth.label()))
+            .or_else(|| {
+                self.selected
+                    .as_ref()
+                    .and_then(|id| self.store.inventory().get(id))
+                    .map(|host| format!("{} · {}", host.endpoint(), host.auth.label()))
+            })
             .unwrap_or_else(|| "no host selected".to_string());
+
+        let state_label = match self.active_session() {
+            Some(session) => session.status.state.label(),
+            None => "no session".to_string(),
+        };
 
         div()
             .flex()
@@ -422,6 +724,7 @@ impl SshDeck {
             .text_xs()
             .text_color(muted)
             .child(host_label)
+            .child(SharedString::from(state_label))
             .child(format!("{active} connected"))
     }
 }
