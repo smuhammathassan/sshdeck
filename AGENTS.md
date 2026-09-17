@@ -89,8 +89,21 @@ not the prose.
 | The `IconName` catalog in `icons.md` lists the available icons | The documented list is aspirational and includes names with no variant. `IconName::Server` does not exist in 0.6.1; use a variant already proven in compiled code (`Globe`, `Folder`, `File`, `Check`, `Close`, …) or read the icon enum in the source. |
 | Mouse/wheel handlers (`on_mouse_down`/`on_mouse_up`/`on_mouse_move`/`on_scroll_wheel`) need `Stateful`/`id()` | They are provided by gpui-pre's `InteractiveElement`, which `Div` implements directly. A `Div` gets a hitbox whenever `should_insert_hitbox` is true — any `track_focus`, listener, or cursor counts — so a plain `div().track_focus(..)` handles them with only `InteractiveElement as _` in scope. Do **not** add a fixed `.id(..)` just for this: several instances of the same view in one window then share one `ElementId`. Listeners take `impl Fn(&Event, &mut Window, &mut App)`; `Context::listener` supplies that shape with `(this, &event, window, cx)`. |
 | theme.md's only theme-registration route is `ThemeRegistry::watch_dir(PathBuf, ..)` with an `on_load` callback | `ThemeRegistry::load_themes_from_str(&str)` is public and parses a `ThemeSet` from memory (`theme/registry.rs`), so a bundled app can `include_str!` its theme and never depend on the working directory. Applying that `Rc<ThemeConfig>` via `Theme::global_mut(cx).apply_config(..)` sets the fonts/colors but does **not** project to the Base layer (scrollbars, resize handles) or refresh windows; follow it with `Theme::change(mode, ..)` (or `Theme::sync_base`). |
+| A rounded frameless window can be requested through `WindowOptions` | No corner-radius field exists. `WindowOptions { titlebar: Some(TitlebarOptions { appears_transparent: true, traffic_light_position: None, title: None }), ..WindowOptions::default() }` hides the system title bar and draws content under it while keeping the native traffic lights (the closable/minimizable/resizable style masks are only set when `titlebar` is `Some`), so the close button works. There is no titlebar-height option, so the lights keep their position in the native ~28px titlebar band and cannot be centred on a taller custom header; reserve a left inset instead. The native macOS corner radius stands. Verified in `gpui-0.2.2/src/platform.rs` (the version `gpui-base` resolves to). |
 
 `gpui-kit = "0.6"` resolves to `gpui-pre 0.3.5` — read that version's source.
+
+### Known core errata
+
+`docs/ROADMAP.md` §"Protocol compatibility target" says to support both host
+chains and `ProxyJump` but does not say how the two share a field. The source
+(verified against `Host` in `lib.rs` and `sshdeck_core::jump`):
+
+| Documented / assumed | Reality in the source |
+| --- | --- |
+| `Host::proxy_jump` is a jump-host label | It is **either** an inventory label/address (native chain) **or** a verbatim `ProxyJump` spec from `sshdeck-import`. Resolution prefers an inventory match (label, then address), then parses a spec; `none` means no jump. |
+| `ProxyCommand` is honour-able | `Host` has **no** `ProxyCommand` field. `sshdeck-import` reports and drops it, and `sshdeck_core::jump` refuses a command-like `proxy_jump` value (whitespace or `%`) with `ChainError::ProxyCommandSkipped` rather than shell-interpolating it. |
+| Jump depth is unbounded | Chains are capped at `sshdeck_core::jump::MAX_JUMP_DEPTH` (4) jumps; cycles are rejected by `HostId`. Dialling verifies each hop's key against `known_hosts` separately. |
 
 ## Rust rules
 

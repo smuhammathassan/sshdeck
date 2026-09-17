@@ -23,7 +23,7 @@ use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
     div, px, rgb, rgba, AnyElement, App, AppContext as _, Context, Entity, Focusable as _, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, Rgba, SharedString,
-    Styled as _, Subscription, Window, WindowOptions,
+    Styled as _, Subscription, TitlebarOptions, Window, WindowOptions,
 };
 use keys_pane::KeysPane;
 use palette::PaletteView;
@@ -54,7 +54,7 @@ fn main() {
             gpui_kit::init(cx);
             init_theme(cx);
             cx.spawn(async move |cx| {
-                cx.open_window(WindowOptions::default(), |window, cx| {
+                cx.open_window(window_options(), |window, cx| {
                     let view = cx.new(|cx| SshDeck::new(window, cx));
                     cx.new(|cx| Root::new(view, window, cx))
                 })
@@ -62,6 +62,29 @@ fn main() {
             })
             .detach();
         });
+}
+
+/// The window shape: frameless, with the native traffic lights still present.
+///
+/// Termius is a 10px-rounded frameless window. `WindowOptions` has **no**
+/// corner-radius field, so that exact radius cannot be expressed and the native
+/// macOS window radius stands. `appears_transparent` is the part GPUI does
+/// express: it hides the system title bar and draws the content under it, while
+/// the window is still created with the closable / minimizable / resizable
+/// style masks (because `titlebar` is `Some`), so the traffic lights and the
+/// close button stay. There is no titlebar-height option either, so the lights
+/// keep their native position near the top; [`render_header`] reserves the left
+/// inset for them. `traffic_light_position: None` means "GPUI's default", not
+/// "hide them".
+fn window_options() -> WindowOptions {
+    WindowOptions {
+        titlebar: Some(TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            traffic_light_position: None,
+        }),
+        ..WindowOptions::default()
+    }
 }
 
 /// The command-line forms the binary understands.
@@ -962,7 +985,12 @@ impl SshDeck {
             .flex_shrink_0()
             // `--header-height` from the recovered stylesheet.
             .h(px(56.))
-            .px_3()
+            // Traffic-light inset: the native window buttons overlay the top
+            // left of the content now that the title bar is transparent, so the
+            // sidebar toggle starts clear of them. Termius keeps the lights
+            // level with the tab row, which this 56px header contains.
+            .pl(px(80.))
+            .pr_3()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
