@@ -21,9 +21,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, px, AnyElement, App, AppContext as _, Context, Entity, Focusable as _,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
-    Subscription, Window, WindowOptions,
+    div, px, rgb, rgba, AnyElement, App, AppContext as _, Context, Entity, Focusable as _, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Rgba, SharedString,
+    Styled as _, Subscription, Window, WindowOptions,
 };
 use keys_pane::KeysPane;
 use palette::PaletteView;
@@ -204,6 +204,56 @@ fn parse_port(raw: &str) -> Result<u16, String> {
             "Port must be a number between 1 and 65535, got \"{raw}\""
         )),
     }
+}
+
+/// The OS brand colour for a host icon, from the 25 values recovered in
+/// `docs/UI-PARITY.md` ("Host OS brand colours").
+///
+/// `alpine` has no recovered value on purpose: a brand colour is a fact about
+/// the platform, not something to invent, so it returns `None` and the caller
+/// falls back to the muted foreground.
+fn os_brand_color(name: &str) -> Option<Rgba> {
+    let hex = match name.trim().to_lowercase().as_str() {
+        "ubuntu" => 0xe95420,
+        "debian" => 0xce0056,
+        "arch" => 0x1793d1,
+        "fedora" => 0x3c6eb4,
+        "centos" => 0xefa720,
+        "redhat" => 0xee0000,
+        "rockylinux" => 0x34d399,
+        "suse" => 0x30ba78,
+        "mageia" => 0x2397d4,
+        "gentoo" => 0x54487a,
+        "freebsd" => 0xf60006,
+        "openbsd" => 0xf2ca30,
+        "netbsd" => 0xf26711,
+        "routeros" => 0x164aaa,
+        "linux" => 0xffcc33,
+        "macos" => 0x49a3f2,
+        "windows" => 0x00a1f1,
+        "android" => 0x3ddc84,
+        "apple" => 0x171719,
+        "aws" => 0xff9900,
+        "digitalocean" => 0x0080ff,
+        "cisco" => 0x00bceb,
+        "pi" | "raspbian" => 0xbe3956,
+        "gloria" => 0x16b8f0,
+        _ => return None,
+    };
+    Some(rgb(hex))
+}
+
+/// Tints a host icon with its platform's brand colour.
+///
+/// [`Host`] has no OS field yet (ROADMAP P5), so the platform name is read from
+/// the host's group or tags if one is present. When nothing names a known
+/// platform the icon keeps `fallback` (`#8d91a5`); the OS is never guessed.
+fn host_os_tint(host: &Host, fallback: Hsla) -> Hsla {
+    host.group
+        .iter()
+        .chain(host.tags.iter())
+        .find_map(|name| os_brand_color(name).map(Hsla::from))
+        .unwrap_or(fallback)
 }
 
 /// Runs one command over SSH with no window, no gpui, and no async runtime.
@@ -432,7 +482,8 @@ impl SshDeck {
     /// Username and port are both optional in the form, but a port that is
     /// present must parse: a non-numeric or out-of-range value is a message,
     /// never a silent fall back to 22 (which would misroute the connection).
-    fn add_draft_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Returns whether a host was added, so the sheet only closes on success.
+    fn add_draft_host(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let label = self.draft_label.read(cx).value().trim().to_string();
         let address = self.draft_address.read(cx).value().trim().to_string();
         let username = self.draft_username.read(cx).value().trim().to_string();
@@ -441,7 +492,7 @@ impl SshDeck {
             Ok(port) => port,
             Err(message) => {
                 window.push_notification(Notification::warning(message), cx);
-                return;
+                return false;
             }
         };
 
@@ -450,7 +501,7 @@ impl SshDeck {
                 Notification::warning("A label and an address are both required"),
                 cx,
             );
-            return;
+            return false;
         }
 
         let mut host = Host::new(&label, &address);
@@ -472,6 +523,7 @@ impl SshDeck {
         self.draft_port
             .update(cx, |state, cx| state.set_value("", window, cx));
         cx.notify();
+        true
     }
 
     fn remove_host(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) {
@@ -766,7 +818,9 @@ impl SshDeck {
         // Choosing a command closes the palette, whatever its outcome.
         self.palette = None;
         match command {
-            palette::CommandId::AddHost => self.add_draft_host(window, cx),
+            palette::CommandId::AddHost => {
+                let _ = self.add_draft_host(window, cx);
+            }
             palette::CommandId::ConnectSelectedHost => match self.selected.clone() {
                 Some(id) => {
                     if let Some(host) = self.store.inventory().get(&id).cloned() {
@@ -947,17 +1001,35 @@ impl SshDeck {
             .child(actions)
     }
 
-    /// Opens host creation. Until the form moves into a sheet this is the
-    /// always-visible form's first field, so the header `+` is a real control.
+    /// Opens the add-host sheet. Host creation lives behind the header's `+`
+    /// control instead of an always-visible form in the sidebar.
     fn open_add_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let handle = self.draft_label.read(cx).focus_handle(cx);
-        handle.focus(window, cx);
+        self.add_host_open = true;
+        // The label field owns no focus itself until the sheet has rendered, so
+        // queue the focus for after this frame.
+        cx.defer_in(window, |this, window, cx| {
+            let handle = this.draft_label.read(cx).focus_handle(cx);
+            handle.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn close_add_host(&mut self, cx: &mut Context<Self>) {
+        self.add_host_open = false;
+        cx.notify();
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
         let surface = cx.theme().sidebar;
         let muted = cx.theme().muted_foreground;
+        // Host cards: `--entity-item-background` default, `--list-hover` on
+        // hover, `--list-select` when selected. Only the default maps to a
+        // gpui-kit token (`muted.background`); the other two are the recovered
+        // hex values, since the theme exposes no token for them.
+        let card = cx.theme().muted;
+        let card_selected = rgb(0x32364a);
+        let card_hover = rgb(0x3e4257);
 
         let query = self.filter.read(cx).value().to_string();
         let visible: Vec<Host> = self
@@ -975,6 +1047,7 @@ impl SshDeck {
             let is_open = self.sessions.iter().any(|s| s.host == id);
             let remove_id = id.clone();
             let connect_host = host.clone();
+            let tint = host_os_tint(&host, muted);
 
             div()
                 .id(SharedString::from(format!("host-{}", id)))
@@ -991,15 +1064,14 @@ impl SshDeck {
                 .gap_2()
                 .w_full()
                 .px_2()
-                .py_1()
+                .py_2()
                 .rounded_sm()
                 .cursor_pointer()
-                .bg(if is_selected {
-                    cx.theme().muted
-                } else {
-                    surface
-                })
-                .child(Icon::new(IconName::Globe).small().text_color(muted))
+                .bg(if is_selected { card_selected } else { card })
+                // `--list-hover`: the card highlight, via the hover style
+                // refinement (`StatefulInteractiveElement::hover`).
+                .hover(|style| style.bg(card_hover))
+                .child(Icon::new(IconName::Globe).small().text_color(tint))
                 .child(
                     div()
                         .flex()
@@ -1079,29 +1151,80 @@ impl SshDeck {
                     .overflow_y_scrollbar()
                     .children(rows),
             )
+    }
+
+    /// The add-host sheet: a right-hand panel over a scrim, carrying the same
+    /// four fields and the same validation the always-visible sidebar form had.
+    /// Opening and closing is the header `+` and the sheet's close control.
+    fn render_add_host_sheet(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.add_host_open {
+            return None;
+        }
+
+        let panel = div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .h_full()
+            .w(px(360.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .p_2()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(Input::new(&self.draft_label).small())
-                    .child(Input::new(&self.draft_address).small())
-                    .child(Input::new(&self.draft_username).small())
-                    .child(Input::new(&self.draft_port).small())
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_color(cx.theme().foreground).child("Add host"))
                     .child(
-                        Button::new("add-host")
-                            .small()
-                            .primary()
-                            .label("Add host")
-                            .icon(IconName::Plus)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.add_draft_host(window, cx);
-                            })),
+                        Button::new("add-host-close")
+                            .ghost()
+                            .icon(IconName::Close)
+                            .tooltip("Close")
+                            .on_click(cx.listener(|this, _, _, cx| this.close_add_host(cx))),
                     ),
             )
+            .child(Input::new(&self.draft_label).small())
+            .child(Input::new(&self.draft_address).small())
+            .child(Input::new(&self.draft_username).small())
+            .child(Input::new(&self.draft_port).small())
+            .child(
+                Button::new("add-host-submit")
+                    .small()
+                    .primary()
+                    .label("Add host")
+                    .icon(IconName::Plus)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if this.add_draft_host(window, cx) {
+                            this.close_add_host(cx);
+                        }
+                    })),
+            );
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                // The scrim is a sibling under the panel, so a click on the
+                // panel never reaches it; a click on the scrim dismisses.
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(rgba(0x00000080))
+                        .on_click(cx.listener(|this, _, _, cx| this.close_add_host(cx))),
+                )
+                .child(panel),
+        )
     }
 
     /// The session tabs, drawn as 6px cards inside the 56px header.
@@ -1444,6 +1567,7 @@ impl Render for SshDeck {
         let header = self.render_header(cx);
         let sidebar = self.render_sidebar(cx);
         let main = self.render_main(cx);
+        let add_host_sheet = self.render_add_host_sheet(cx);
         let palette = self.palette.clone();
 
         let mut root = div()
@@ -1469,6 +1593,7 @@ impl Render for SshDeck {
                     .child(sidebar)
                     .child(main),
             )
+            .when_some(add_host_sheet, |el, sheet| el.child(sheet))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
             .children(Root::render_notification_layer(window, cx));
@@ -1557,5 +1682,22 @@ mod tests {
         );
         assert!(autoconnect_targets("").is_empty());
         assert!(autoconnect_targets(" , ").is_empty());
+    }
+
+    #[test]
+    fn os_brand_colours_are_known_or_absent() {
+        assert_eq!(os_brand_color("ubuntu"), Some(rgb(0xe95420)));
+        assert_eq!(os_brand_color(" Ubuntu "), Some(rgb(0xe95420)));
+        assert_eq!(os_brand_color("raspbian"), os_brand_color("pi"));
+        // No recovered value: the tint must stay unknown, not invented.
+        assert_eq!(os_brand_color("alpine"), None);
+        assert_eq!(os_brand_color("plan9"), None);
+
+        let fallback: Hsla = rgb(0x8d91a5).into();
+        let mut host = Host::new("box", "10.0.0.1");
+        assert_eq!(Rgba::from(host_os_tint(&host, fallback)), rgb(0x8d91a5));
+
+        host.tags.push("debian".into());
+        assert_eq!(Rgba::from(host_os_tint(&host, fallback)), rgb(0xce0056));
     }
 }
