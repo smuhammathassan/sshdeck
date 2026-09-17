@@ -17,8 +17,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  core:
-    name: core (fmt, clippy, test)
+  pure-rust:
+    name: pure rust (fmt, clippy, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,8 +29,9 @@ jobs:
         with:
           key: core
       - run: cargo fmt --all --check
-      - run: cargo clippy -p sshdeck-core --all-targets -- -D warnings
-      - run: cargo test -p sshdeck-core
+      # Everything except the GPUI binary, which needs a macOS GUI stack.
+      - run: cargo clippy --workspace --exclude sshdeck-app --all-targets -- -D warnings
+      - run: cargo test --workspace --exclude sshdeck-app
 
   app:
     name: app (macOS arm64)

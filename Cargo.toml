@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/sshdeck-core", "crates/sshdeck-app"]
+members = [
+    "crates/sshdeck-core",
+    "crates/sshdeck-terminal",
+    "crates/sshdeck-vault",
+    "crates/sshdeck-app",
+]
 
 [workspace.package]
 version = "0.1.0"
