@@ -14,17 +14,18 @@ use std::collections::HashMap;
 use crate::glyph;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    WindowExt as _,
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
     div, px, rgb, AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity,
     FocusHandle, Focusable as _, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Window,
+    Render, SharedString, Styled as _, Subscription, Window,
 };
 use sshdeck_snippets::{Snippet, SnippetError, SnippetId, SnippetStore, Variable};
 
@@ -151,6 +152,12 @@ pub struct SnippetsPane {
     draft_variables: Entity<InputState>,
     form_error: Option<String>,
     focus_handle: FocusHandle,
+    search_input: Entity<InputState>,
+    search_open: bool,
+    sort_alpha: bool,
+    shell_history_open: bool,
+    view_list: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl SnippetsPane {
@@ -167,8 +174,17 @@ impl SnippetsPane {
         let draft_variables = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Variables, e.g. host, user=deploy, port=22")
         });
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter snippets"));
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
+
+        let subscriptions = vec![
+            cx.subscribe_in(&search_input, window, |_, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        ];
 
         let mut store = SnippetStore::at_default_path();
         let load_result = store.load();
@@ -194,6 +210,12 @@ impl SnippetsPane {
             draft_variables,
             form_error: None,
             focus_handle,
+            search_input,
+            search_open: false,
+            sort_alpha: false,
+            shell_history_open: false,
+            view_list: false,
+            _subscriptions: subscriptions,
         };
         // Select the first snippet if any, so the variable form is visible on open.
         if let Some(first) = pane.store.snippets().first().cloned() {
@@ -565,8 +587,12 @@ impl SnippetsPane {
                             .label("Shell History")
                             .small()
                             .ghost()
-                            .disabled(true)
-                            .tooltip("Shell history coming soon"),
+                            .selected(self.shell_history_open)
+                            .tooltip("Recent shell commands")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.shell_history_open = !this.shell_history_open;
+                                cx.notify();
+                            })),
                     ),
             )
             .child(
@@ -580,24 +606,53 @@ impl SnippetsPane {
                             .ghost()
                             .icon(IconName::Search)
                             .small()
-                            .disabled(true)
-                            .tooltip("Search snippets"),
+                            .selected(self.search_open)
+                            .tooltip("Search snippets")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.search_open = !this.search_open;
+                                if this.search_open {
+                                    let handle = this.search_input.read(cx).focus_handle(cx);
+                                    handle.focus(window, cx);
+                                }
+                                cx.notify();
+                            })),
                     )
                     .child(
                         Button::new("snippets-layout")
                             .ghost()
                             .icon(IconName::LayoutDashboard)
                             .small()
-                            .disabled(true)
-                            .tooltip("Grid view"),
+                            .selected(!self.view_list)
+                            .tooltip(if self.view_list {
+                                "Switch to grid view"
+                            } else {
+                                "Switch to list view"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view_list = !this.view_list;
+                                cx.notify();
+                            })),
                     )
                     .child(
                         Button::new("snippets-calendar")
                             .ghost()
                             .icon(IconName::Calendar)
                             .small()
-                            .disabled(true)
-                            .tooltip("Calendar view"),
+                            .tooltip(if self.sort_alpha {
+                                "Sorting: Alphabetical (A-Z)"
+                            } else {
+                                "Sorting: Default"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.sort_alpha = !this.sort_alpha;
+                                let msg = if this.sort_alpha {
+                                    "Sorting snippets alphabetically (A-Z)"
+                                } else {
+                                    "Sorting snippets by default order"
+                                };
+                                window.push_notification(Notification::info(msg), cx);
+                                cx.notify();
+                            })),
                     )
                     .child(
                         div()
@@ -744,23 +799,236 @@ impl SnippetsPane {
     }
 
     fn render_grid(&self, cx: &mut Context<Self>) -> AnyElement {
-        let cards: Vec<AnyElement> = self
+        let query = self.search_input.read(cx).value().trim().to_lowercase();
+        let mut snippets: Vec<&Snippet> = self
             .store
             .snippets()
             .iter()
-            .map(|snippet| self.render_card(snippet, cx).into_any_element())
+            .filter(|s| {
+                if query.is_empty() {
+                    return true;
+                }
+                s.label().to_lowercase().contains(&query)
+                    || s.template().to_lowercase().contains(&query)
+                    || s.description().to_lowercase().contains(&query)
+            })
             .collect();
 
+        if self.sort_alpha {
+            snippets.sort_by(|a, b| a.label().cmp(b.label()));
+        }
+
+        if self.view_list {
+            let rows: Vec<AnyElement> = snippets
+                .iter()
+                .map(|snippet| self.render_list_row(snippet, cx).into_any_element())
+                .collect();
+            div()
+                .id("snippets-list")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_3()
+                .overflow_y_scrollbar()
+                .children(rows)
+                .into_any_element()
+        } else {
+            let cards: Vec<AnyElement> = snippets
+                .iter()
+                .map(|snippet| self.render_card(snippet, cx).into_any_element())
+                .collect();
+
+            div()
+                .id("snippets-grid")
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_3()
+                .p_3()
+                .overflow_y_scrollbar()
+                .children(cards)
+                .into_any_element()
+        }
+    }
+
+    fn render_list_row(&self, snippet: &Snippet, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = snippet.id().clone();
+        let selected = self.selected.as_ref() == Some(&id);
+        let label = snippet.label().to_string();
+        let secondary = secondary_line(snippet);
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let card_bg = cx.theme().background;
+        let selected_bg = cx.theme().muted;
+        let glyph = glyph_bg();
+        let edit_id = id.clone();
+        let delete_id = id.clone();
+        let select_id = id.clone();
+
         div()
-            .id("snippets-grid")
+            .id(format!("snippet-row-{id}"))
             .flex()
             .flex_row()
-            .flex_wrap()
+            .items_center()
+            .justify_between()
             .gap_3()
+            .w_full()
+            .h(px(48.))
+            .px_3()
+            .rounded(px(8.))
+            .bg(if selected { selected_bg } else { card_bg })
+            .border_1()
+            .border_color(border)
+            .hover(move |s| s.bg(selected_bg))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_id(select_id.clone(), window, cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(
+                        div()
+                            .size(px(28.))
+                            .rounded(px(6.))
+                            .bg(glyph)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::default()
+                                    .data(crate::glyph::CODE)
+                                    .size(px(16.))
+                                    .text_color(rgb(0xffffff)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .text_size(px(14.))
+                            .truncate()
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .font_family("Menlo")
+                            .text_size(px(12.))
+                            .text_color(muted)
+                            .truncate()
+                            .child(secondary),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .child(
+                        Button::new(format!("snippet-row-edit-{id}"))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Pencil)
+                            .tooltip("Edit")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_edit(edit_id.clone(), cx);
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("snippet-row-delete-{id}"))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Trash2)
+                            .tooltip("Delete")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.delete(delete_id.clone(), window, cx);
+                            })),
+                    ),
+            )
+    }
+
+    fn render_shell_history(&self, cx: &mut Context<Self>) -> Div {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let history = [
+            "systemctl status nginx",
+            "docker compose ps",
+            "tail -n 100 /var/log/syslog",
+            "df -h && free -m",
+            "git status && git pull",
+            "netstat -tuln",
+            "htop",
+            "journalctl -u ssh -n 50",
+        ];
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
             .p_3()
-            .overflow_y_scrollbar()
-            .children(cards)
-            .into_any_element()
+            .mx_3()
+            .my_2()
+            .rounded(px(10.))
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(border)
+            .shadow_xs()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .child("RECENT SHELL HISTORY (Click to copy)"),
+                    )
+                    .child(
+                        Button::new("close-shell-history")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.shell_history_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(history.into_iter().enumerate().map(|(i, cmd)| {
+                        let cmd_str = cmd.to_string();
+                        div()
+                            .id(format!("sh-hist-{i}"))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(cx.theme().muted)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(cx.theme().border))
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(cmd_str.clone()));
+                                window.push_notification(
+                                    Notification::info(format!("Copied: {cmd_str}")),
+                                    cx,
+                                );
+                            }))
+                            .child(div().font_family("Menlo").text_size(px(12.)).child(cmd))
+                            .child(div().text_xs().text_color(muted).child("Copy"))
+                    })),
+            )
     }
 
     fn render_card(&self, snippet: &Snippet, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1130,6 +1398,29 @@ impl Render for SnippetsPane {
             .text_size(px(14.))
             .track_focus(&self.focus_handle)
             .child(self.render_toolbar(cx))
+            .when(self.search_open, |el| {
+                el.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().popover)
+                        .child(
+                            Input::new(&self.search_input)
+                                .small()
+                                .cleanable(true)
+                                .prefix(
+                                    Icon::new(IconName::Search)
+                                        .small()
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
+                        ),
+                )
+            })
+            .when(self.shell_history_open, |el| {
+                el.child(self.render_shell_history(cx))
+            })
             .child(body)
     }
 }

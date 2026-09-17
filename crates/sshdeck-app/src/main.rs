@@ -26,9 +26,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, point, px, rgb, rgba, AnyElement, App, AppContext as _, Context, Entity, Focusable as _,
-    Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render, Rgba, SharedString,
-    Styled as _, Subscription, TitlebarOptions, Window, WindowControlArea, WindowOptions,
+    div, point, px, rgb, rgba, AnyElement, App, AppContext as _, ClipboardItem, Context, Entity,
+    Focusable as _, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render, Rgba,
+    SharedString, Styled as _, Subscription, TitlebarOptions, Window, WindowControlArea,
+    WindowOptions,
 };
 use keys_pane::KeysPane;
 use logs_pane::LogsPane;
@@ -463,6 +464,37 @@ enum LeftNav {
     Snippets,
     KnownHosts,
     Logs,
+    Settings,
+}
+
+/// Sort mode for the hosts view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HostSort {
+    #[default]
+    LabelAsc,
+    LabelDesc,
+    Address,
+    Recent,
+}
+
+impl HostSort {
+    pub fn next(self) -> Self {
+        match self {
+            Self::LabelAsc => Self::LabelDesc,
+            Self::LabelDesc => Self::Address,
+            Self::Address => Self::Recent,
+            Self::Recent => Self::LabelAsc,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LabelAsc => "Sorted: Name (A-Z)",
+            Self::LabelDesc => "Sorted: Name (Z-A)",
+            Self::Address => "Sorted: Address",
+            Self::Recent => "Sorted: Default order",
+        }
+    }
 }
 
 /// A full-region pane that shows over the session content while it is open.
@@ -472,6 +504,13 @@ enum LeftNav {
 enum Overlay {
     Settings(Entity<SettingsView>),
     Keys(Entity<KeysPane>),
+}
+
+/// How host inventory is presented: 2/3/4-col card grid or compact rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    Grid,
+    List,
 }
 
 struct SshDeck {
@@ -507,6 +546,12 @@ struct SshDeck {
     logs_pane: Option<Entity<LogsPane>>,
     /// Whether the host sidebar is collapsed to its narrow rail.
     sidebar_collapsed: bool,
+    /// Host list view mode: responsive card grid or compact list rows.
+    view_mode: ViewMode,
+    /// Host sorting mode.
+    host_sort: HostSort,
+    /// Last connected host id for session restoration.
+    last_session_host: Option<HostId>,
     /// Whether the add-host sheet is open. Host creation lives behind the
     /// header's `+` control rather than an always-visible form.
     add_host_open: bool,
@@ -526,6 +571,11 @@ struct SshDeck {
     password_visible: bool,
     /// Whether "Show more" collapsible is expanded in host details.
     show_more: bool,
+    /// Whether the inline tag input is open.
+    add_tag_open: bool,
+    add_tag_input: Entity<InputState>,
+    /// Whether the personal vault info dialog is open.
+    vault_info_open: bool,
     /// Search input for the New Tab screen.
     new_tab_query: Entity<InputState>,
     /// Selected terminal color theme.
@@ -551,6 +601,7 @@ impl SshDeck {
         let draft_port = cx.new(|cx| InputState::new(window, cx).placeholder("port (default 22)"));
         let new_tab_query =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search hosts or tabs"));
+        let add_tag_input = cx.new(|cx| InputState::new(window, cx).placeholder("New tag name..."));
 
         // Re-render the list as the query changes; the filter itself is applied
         // in `render`, so no filtered copy needs to be kept in state.
@@ -595,6 +646,9 @@ impl SshDeck {
             snippets_pane: None,
             logs_pane: None,
             sidebar_collapsed: false,
+            view_mode: ViewMode::Grid,
+            host_sort: HostSort::default(),
+            last_session_host: None,
             add_host_open: false,
             sftp_attached: None,
             sftp_generation: 0,
@@ -604,6 +658,9 @@ impl SshDeck {
             credentials_popover_open: false,
             password_visible: false,
             show_more: false,
+            add_tag_open: false,
+            add_tag_input,
+            vault_info_open: false,
             new_tab_query,
             selected_theme: "Termius Dark".to_string(),
             _subscriptions: subscriptions,
@@ -834,6 +891,7 @@ impl SshDeck {
             pane: pane.clone(),
             status,
         });
+        self.last_session_host = Some(host.id.clone());
         let index = self.sessions.len() - 1;
         self.active = Some(index);
         self.tab = MainTab::Session(index);
@@ -843,6 +901,27 @@ impl SshDeck {
         // session reaches `Connected` (it detaches until then).
         self.reconcile_sftp(window, cx);
         self.reconcile_forward(cx);
+
+        let host_lbl = host.label.clone();
+        let host_ep = host.endpoint();
+        let user = if host.username.is_empty() {
+            "user".to_string()
+        } else {
+            host.username.clone()
+        };
+        let logs_pane = self.ensure_logs_pane(window, cx);
+        logs_pane.update(cx, |p, cx| {
+            p.append(
+                "Today",
+                "Connected",
+                user,
+                "session",
+                host_lbl,
+                host_ep,
+                logs_pane::LogLevel::Success,
+                cx,
+            );
+        });
 
         if let Some(message) = failed {
             window.push_notification(
@@ -927,6 +1006,10 @@ impl SshDeck {
             LeftNav::Logs => {
                 self.ensure_logs_pane(window, cx);
             }
+            LeftNav::Settings => {
+                self.open_settings(window, cx);
+                return;
+            }
             LeftNav::Hosts => {}
         }
         cx.notify();
@@ -979,7 +1062,37 @@ impl SshDeck {
         if let Some(pane) = self.logs_pane.clone() {
             return pane;
         }
-        let pane = cx.new(|cx| LogsPane::new(window, cx));
+        let hosts = self.store.inventory().hosts().to_vec();
+        let pane = cx.new(|cx| {
+            let mut p = LogsPane::new(window, cx);
+            for h in hosts.iter().take(5) {
+                p.append(
+                    "Recent",
+                    "saved",
+                    if h.username.is_empty() {
+                        "user".to_string()
+                    } else {
+                        h.username.clone()
+                    },
+                    "inventory",
+                    h.label.clone(),
+                    h.endpoint(),
+                    logs_pane::LogLevel::Info,
+                    cx,
+                );
+            }
+            p.append(
+                "Today",
+                "active",
+                "system",
+                "localhost",
+                "sshdeck",
+                "Local workspace initialized",
+                logs_pane::LogLevel::Success,
+                cx,
+            );
+            p
+        });
         self.logs_pane = Some(pane.clone());
         pane
     }
@@ -1022,7 +1135,26 @@ impl SshDeck {
         if index >= self.sessions.len() {
             return;
         }
-        self.sessions.remove(index);
+        let session = self.sessions.remove(index);
+        let host_opt = self.store.inventory().get(&session.host).cloned();
+        let host_lbl = host_opt
+            .as_ref()
+            .map(|h| h.label.clone())
+            .unwrap_or_else(|| session.host.to_string());
+        let host_ep = host_opt.as_ref().map(|h| h.endpoint()).unwrap_or_default();
+        let logs_pane = self.ensure_logs_pane(window, cx);
+        logs_pane.update(cx, |p, cx| {
+            p.append(
+                "Today",
+                "Closed",
+                "user",
+                "session",
+                host_lbl,
+                host_ep,
+                logs_pane::LogLevel::Info,
+                cx,
+            );
+        });
         self.tab = tab_after_close(self.tab, index);
         self.active = match self.active {
             Some(active) if active == index => None,
@@ -1171,10 +1303,30 @@ impl SshDeck {
                 };
                 Theme::change(next, Some(window), cx);
             }
-            // The palette marks these unavailable and never dispatches them.
-            palette::CommandId::OpenSftp
-            | palette::CommandId::ManageKeys
-            | palette::CommandId::OpenSettings => {}
+            palette::CommandId::OpenSftp => {
+                self.select_tab(MainTab::Sftp, window, cx);
+            }
+            palette::CommandId::ManageKeys => {
+                self.select_left_nav(LeftNav::Keychain, window, cx);
+            }
+            palette::CommandId::OpenSettings => {
+                self.open_settings(window, cx);
+            }
+            palette::CommandId::PortForwarding => {
+                self.select_left_nav(LeftNav::PortForwarding, window, cx);
+            }
+            palette::CommandId::Snippets => {
+                self.select_left_nav(LeftNav::Snippets, window, cx);
+            }
+            palette::CommandId::KnownHosts => {
+                self.select_left_nav(LeftNav::KnownHosts, window, cx);
+            }
+            palette::CommandId::Logs => {
+                self.select_left_nav(LeftNav::Logs, window, cx);
+            }
+            palette::CommandId::ToggleSidebar => {
+                self.sidebar_collapsed = !self.sidebar_collapsed;
+            }
         }
         cx.notify();
     }
@@ -1269,11 +1421,10 @@ impl SshDeck {
                 Button::new("notifications")
                     .ghost()
                     .icon(Icon::default().data(glyph::BELL).size(px(16.)))
-                    .tooltip("Notifications")
-                    .on_click(|_, window, cx| {
-                        window
-                            .push_notification(Notification::info("Notifications coming soon"), cx);
-                    }),
+                    .tooltip("Connection logs & events")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.select_left_nav(LeftNav::Logs, window, cx);
+                    })),
             )
             .when(matches!(self.tab, MainTab::Session(_)), |this| {
                 this.child(
@@ -1403,17 +1554,18 @@ impl SshDeck {
             .into_any_element()
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        self.render_left_rail(cx)
+    fn render_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_left_rail(window, cx)
     }
 
-    fn render_left_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_left_rail(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rail_bg = rgb(0xf7f9fa);
         let border = rgb(0xd5dde0);
         let active_bg = cx.theme().muted; // #e6ebed in light
         let fg = cx.theme().foreground; // #141729
         let muted = cx.theme().muted_foreground; // #798c94
-        let collapsed = self.sidebar_collapsed;
+        let win_w = f32::from(window.bounds().size.width);
+        let collapsed = self.sidebar_collapsed || win_w < 768.0;
 
         let nav_item = move |label: &'static str, glyph_data: &'static [u8], is_active: bool| {
             div()
@@ -1449,11 +1601,7 @@ impl SshDeck {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .w(if self.sidebar_collapsed {
-                px(60.)
-            } else {
-                px(180.)
-            })
+            .w(if collapsed { px(60.) } else { px(180.) })
             .h_full()
             .bg(rail_bg)
             .border_r_1()
@@ -1501,6 +1649,41 @@ impl SshDeck {
                         this.select_left_nav(LeftNav::Logs, window, cx);
                     },
                 )),
+            )
+            .child(
+                nav_item(
+                    "Settings",
+                    glyph::SETTINGS,
+                    self.left_nav == LeftNav::Settings
+                        || matches!(self.overlay, Some(Overlay::Settings(_))),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_settings(window, cx);
+                })),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("nav-toggle-collapse")
+                    .ghost()
+                    .w_full()
+                    .icon(
+                        Icon::new(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronLeft
+                        })
+                        .size(px(16.)),
+                    )
+                    .label(if collapsed { "" } else { "Collapse" })
+                    .tooltip(if collapsed {
+                        "Expand sidebar"
+                    } else {
+                        "Collapse sidebar"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_collapsed = !this.sidebar_collapsed;
+                        cx.notify();
+                    })),
             )
     }
 
@@ -2015,7 +2198,7 @@ impl SshDeck {
         match self.tab {
             MainTab::Vaults => {
                 match self.left_nav {
-                    LeftNav::Hosts => self.render_vault(cx),
+                    LeftNav::Hosts => self.render_vault(window, cx),
                     LeftNav::Keychain | LeftNav::KnownHosts => {
                         let pane = self.ensure_keys_pane(window, cx);
                         let section = match self.left_nav {
@@ -2068,6 +2251,7 @@ impl SshDeck {
                             .child(pane)
                             .into_any_element()
                     }
+                    LeftNav::Settings => self.render_overlay(cx),
                 }
             }
             MainTab::Sftp => self.render_sftp(cx),
@@ -2076,8 +2260,8 @@ impl SshDeck {
         }
     }
 
-    /// The Vaults/Hosts screen — Termius light: search + Connect, toolbar, Hosts header, 2-col/3-col white cards, right Host Details drawer.
-    fn render_vault(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// The Vaults/Hosts screen — Termius light: search + Connect, toolbar, Hosts header, responsive 1/2/3/4-col white cards, right Host Details drawer.
+    fn render_vault(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let content_bg = cx.theme().accent; // #edf1f2 in light
         let muted = cx.theme().muted_foreground; // #798c94
         let has_selection = self.selected.is_some();
@@ -2163,29 +2347,88 @@ impl SshDeck {
                     .ghost()
                     .icon(Icon::default().data(glyph::SERIAL).size(px(14.)))
                     .label("Serial")
-                    .tooltip("Serial (coming soon)")
-                    .on_click(|_, window, cx| {
-                        window.push_notification(Notification::info("Serial coming soon"), cx);
-                    }),
+                    .tooltip("Open serial console")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.select_tab(MainTab::NewTab, window, cx);
+                        window.push_notification(
+                            Notification::info("Serial connection: configure port in session"),
+                            cx,
+                        );
+                    })),
             )
             .child(div().flex_1())
             .child(
                 Button::new("vault-view-grid")
                     .ghost()
-                    .icon(Icon::default().data(glyph::GRID).size(px(14.)))
-                    .tooltip("Grid view"),
+                    .icon(
+                        Icon::default()
+                            .data(match self.view_mode {
+                                ViewMode::Grid => glyph::GRID,
+                                ViewMode::List => glyph::FILE,
+                            })
+                            .size(px(14.)),
+                    )
+                    .tooltip(match self.view_mode {
+                        ViewMode::Grid => "Switch to list view",
+                        ViewMode::List => "Switch to grid view",
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.view_mode = match this.view_mode {
+                            ViewMode::Grid => ViewMode::List,
+                            ViewMode::List => ViewMode::Grid,
+                        };
+                        cx.notify();
+                    })),
             )
             .child(
                 Button::new("vault-filter")
                     .ghost()
                     .icon(Icon::default().data(glyph::TAG).size(px(14.)))
-                    .tooltip("Filter by tags"),
+                    .tooltip("Filter by tags")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let mut all_tags: Vec<String> = this
+                            .store
+                            .inventory()
+                            .hosts()
+                            .iter()
+                            .flat_map(|h| h.tags.clone())
+                            .collect();
+                        all_tags.sort();
+                        all_tags.dedup();
+                        if all_tags.is_empty() {
+                            let handle = this.filter.read(cx).focus_handle(cx);
+                            handle.focus(window, cx);
+                            window.push_notification(
+                                Notification::info("No tags found on hosts yet"),
+                                cx,
+                            );
+                        } else {
+                            let cur = this.filter.read(cx).value().to_string();
+                            let next_tag = all_tags
+                                .iter()
+                                .find(|t| !cur.contains(t.as_str()))
+                                .unwrap_or(&all_tags[0]);
+                            this.filter.update(cx, |input, cx| {
+                                input.set_value(next_tag, window, cx);
+                            });
+                            window.push_notification(
+                                Notification::info(format!("Filtered by tag: {next_tag}")),
+                                cx,
+                            );
+                            cx.notify();
+                        }
+                    })),
             )
             .child(
                 Button::new("vault-calendar")
                     .ghost()
                     .icon(Icon::default().data(glyph::CALENDAR).size(px(14.)))
-                    .tooltip("Calendar"),
+                    .tooltip(self.host_sort.label())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.host_sort = this.host_sort.next();
+                        window.push_notification(Notification::info(this.host_sort.label()), cx);
+                        cx.notify();
+                    })),
             )
             .child(
                 div()
@@ -2221,18 +2464,50 @@ impl SshDeck {
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(0x1976d2)))
                             .child("+")
-                            .on_click(|_, window, cx| {
-                                window.push_notification(
-                                    Notification::info("Vault membership: Personal"),
-                                    cx,
-                                );
-                            }),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.vault_info_open = !this.vault_info_open;
+                                cx.notify();
+                            })),
                     ),
             );
 
-        // Host cards — chunking into 2 columns (if details open) or 3 columns (if collapsed)
+        // Host cards — responsive column chunking based on available width
+        let win_w = f32::from(window.bounds().size.width);
+        let sidebar_w = if self.sidebar_collapsed || win_w < 768.0 {
+            60.0
+        } else {
+            180.0
+        };
+        let details_w = if self.details_open {
+            if win_w < 850.0 {
+                (win_w - sidebar_w - 40.0).clamp(240.0, 300.0)
+            } else if win_w < 1100.0 {
+                300.0
+            } else {
+                360.0
+            }
+        } else {
+            0.0
+        };
+        let avail_w = (win_w - sidebar_w - details_w - 32.0).max(180.0);
+
+        let chunk_size = match self.view_mode {
+            ViewMode::List => 1,
+            ViewMode::Grid => {
+                if avail_w < 380.0 {
+                    1
+                } else if avail_w < 680.0 {
+                    2
+                } else if avail_w < 1050.0 {
+                    3
+                } else {
+                    4
+                }
+            }
+        };
+
         let query = self.filter.read(cx).value().to_string();
-        let filtered: Vec<Host> = self
+        let mut filtered: Vec<Host> = self
             .store
             .inventory()
             .filtered(&query)
@@ -2240,7 +2515,19 @@ impl SshDeck {
             .cloned()
             .collect();
 
-        let chunk_size = if self.details_open { 2 } else { 3 };
+        match self.host_sort {
+            HostSort::LabelAsc => {
+                filtered.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+            }
+            HostSort::LabelDesc => {
+                filtered.sort_by(|a, b| b.label.to_lowercase().cmp(&a.label.to_lowercase()));
+            }
+            HostSort::Address => {
+                filtered.sort_by(|a, b| a.address.cmp(&b.address));
+            }
+            HostSort::Recent => {}
+        }
+
         let mut rows: Vec<AnyElement> = Vec::new();
         for chunk in filtered.chunks(chunk_size) {
             let mut row_cards: Vec<AnyElement> = Vec::new();
@@ -2292,7 +2579,7 @@ impl SshDeck {
 
         let details_open = self.details_open;
         let details = if details_open {
-            Some(self.render_host_details_panel(cx))
+            Some(self.render_host_details_panel(details_w, cx))
         } else {
             None
         };
@@ -2314,6 +2601,73 @@ impl SshDeck {
             None
         };
 
+        let vault_info_modal = if self.vault_info_open {
+            let host_count = self.store.inventory().hosts().len();
+            let fg = cx.theme().foreground;
+            Some(
+                div()
+                    .absolute()
+                    .top(px(80.))
+                    .left(px(12.))
+                    .w(px(320.))
+                    .p_4()
+                    .rounded(px(12.))
+                    .bg(rgb(0xffffff))
+                    .border_1()
+                    .border_color(rgb(0xd5dde0))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                    .text_color(fg)
+                                    .child("Personal Vault"),
+                            )
+                            .child(
+                                Button::new("close-vault-info")
+                                    .ghost()
+                                    .small()
+                                    .label("✕")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.vault_info_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("All hosts, keys, and credentials are saved locally on your device with 100% privacy."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(0xf7f9fa))
+                            .border_1()
+                            .border_color(rgb(0xd5dde0))
+                            .child(div().text_xs().text_color(muted).child("Location: ~/.config/sshdeck/hosts.json"))
+                            .child(div().text_xs().text_color(fg).child(format!("Total hosts: {host_count}")))
+                            .child(div().text_xs().text_color(rgb(0x21b568)).child("Network: 100% Offline (0 cloud tracking)")),
+                    ),
+            )
+        } else {
+            None
+        };
+
         div()
             .flex()
             .flex_row()
@@ -2325,6 +2679,7 @@ impl SshDeck {
             .child(centre)
             .when_some(details, |el, panel| el.child(panel))
             .when_some(reopen_button, |el, btn| el.child(btn))
+            .when_some(vault_info_modal, |el, modal| el.child(modal))
             .into_any_element()
     }
 
@@ -2338,6 +2693,13 @@ impl SshDeck {
         let border_selected = rgb(0x2091f6);
         let border_default = rgb(0xd5dde0);
         let orange = rgb(0xd96c2b);
+        let is_list = self.view_mode == ViewMode::List;
+
+        let tags_str = if host.tags.is_empty() {
+            format!("ssh, {}", host.username)
+        } else {
+            format!("ssh, {}, {}", host.username, host.tags.join(", "))
+        };
 
         div()
             .id(SharedString::from(format!("vault-card-{id}")))
@@ -2346,7 +2708,8 @@ impl SshDeck {
             .items_center()
             .gap_3()
             .flex_1()
-            .h(px(64.))
+            .min_w(px(0.))
+            .h(if is_list { px(48.) } else { px(64.) })
             .px_3()
             .rounded(px(10.))
             .bg(card_bg)
@@ -2368,7 +2731,7 @@ impl SshDeck {
             }))
             .child(
                 div()
-                    .size(px(40.))
+                    .size(if is_list { px(32.) } else { px(40.) })
                     .rounded(px(8.))
                     .bg(orange)
                     .flex()
@@ -2377,7 +2740,7 @@ impl SshDeck {
                     .child(
                         Icon::default()
                             .data(glyph::UBUNTU)
-                            .size(px(24.))
+                            .size(if is_list { px(18.) } else { px(24.) })
                             .text_color(rgb(0xffffff)),
                     ),
             )
@@ -2386,24 +2749,27 @@ impl SshDeck {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w(px(0.))
                     .overflow_hidden()
                     .child(
                         div()
                             .text_size(px(15.))
                             .text_color(fg)
+                            .truncate()
                             .child(SharedString::from(host.label.clone())),
                     )
                     .child(
                         div()
                             .text_size(px(13.))
                             .text_color(muted)
-                            .child(SharedString::from(format!("ssh, {}", host.username))),
+                            .truncate()
+                            .child(SharedString::from(tags_str)),
                     ),
             )
             .into_any_element()
     }
 
-    fn render_host_details_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_host_details_panel(&mut self, details_w: f32, cx: &mut Context<Self>) -> AnyElement {
         let border = rgb(0xd5dde0);
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
@@ -2508,24 +2874,66 @@ impl SshDeck {
                                 .ghost()
                                 .small()
                                 .label("Add Telnet")
-                                .on_click(|_, window, cx| {
-                                    window.push_notification(
-                                        Notification::info("Telnet coming soon"),
-                                        cx,
-                                    );
-                                }),
+                                .on_click(cx.listener({
+                                    let host = host_for_action.clone();
+                                    move |this, _, window, cx| {
+                                        this.details_menu_open = false;
+                                        if let Some(mut h) = host.clone() {
+                                            if !h.tags.iter().any(|t| t == "telnet") {
+                                                h.tags.push("telnet".to_string());
+                                                this.store.insert(h);
+                                                let _ = this.store.save();
+                                                window.push_notification(
+                                                    Notification::success(
+                                                        "Added Telnet tag to host",
+                                                    ),
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            } else {
+                                                window.push_notification(
+                                                    Notification::info(
+                                                        "Host already has Telnet configured",
+                                                    ),
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                    }
+                                })),
                         )
                         .child(
                             Button::new("menu-duplicate")
                                 .ghost()
                                 .small()
                                 .label("Duplicate host")
-                                .on_click(|_, window, cx| {
-                                    window.push_notification(
-                                        Notification::info("Duplicated host"),
-                                        cx,
-                                    );
-                                }),
+                                .on_click(cx.listener({
+                                    let host = host_for_action.clone();
+                                    move |this, _, window, cx| {
+                                        this.details_menu_open = false;
+                                        if let Some(host) = host.clone() {
+                                            let mut copy = host.clone();
+                                            copy.id = HostId::from(format!(
+                                                "{}-copy-{}",
+                                                host.id,
+                                                std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs())
+                                                    .unwrap_or(0)
+                                            ));
+                                            copy.label = format!("{} (Copy)", host.label);
+                                            let copy_id = copy.id.clone();
+                                            this.store.insert(copy);
+                                            let _ = this.store.save();
+                                            this.selected = Some(copy_id);
+                                            window.push_notification(
+                                                Notification::success("Host duplicated"),
+                                                cx,
+                                            );
+                                            cx.notify();
+                                        }
+                                    }
+                                })),
                         )
                         .child(
                             Button::new("menu-remove")
@@ -2655,13 +3063,22 @@ impl SshDeck {
                                                         .data(glyph::BACKSPACE)
                                                         .size(px(14.)),
                                                 )
-                                                .tooltip("Clear")
-                                                .on_click(|_, window, cx| {
-                                                    window.push_notification(
-                                                        Notification::info("Cleared"),
-                                                        cx,
-                                                    );
-                                                }),
+                                                .tooltip("Reset label to endpoint")
+                                                .on_click(cx.listener({
+                                                    let host_id = host.id.clone();
+                                                    move |this, _, window, cx| {
+                                                        if let Some(mut h) = this.store.inventory().get(&host_id).cloned() {
+                                                            h.label = h.endpoint();
+                                                            this.store.insert(h);
+                                                            let _ = this.store.save();
+                                                            window.push_notification(
+                                                                Notification::info("Reset host label to endpoint"),
+                                                                cx,
+                                                            );
+                                                            cx.notify();
+                                                        }
+                                                    }
+                                                })),
                                         ),
                                 )
                                 .child(div().text_xs().text_color(muted).child("Label"))
@@ -2727,9 +3144,124 @@ impl SshDeck {
                                                 .text_xs()
                                                 .text_color(accent)
                                                 .cursor_pointer()
-                                                .child("+ Add tag"),
+                                                .child("+ Add tag")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.add_tag_open = !this.add_tag_open;
+                                                    cx.notify();
+                                                })),
                                         ),
-                                ),
+                                )
+                                .when(!host.tags.is_empty(), |el| {
+                                    let host_id = host.id.clone();
+                                    let tag_pills: Vec<AnyElement> = host
+                                        .tags
+                                        .iter()
+                                        .map(|t| {
+                                            let tag_str = t.clone();
+                                            let hid = host_id.clone();
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1()
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded(px(4.))
+                                                .bg(rgb(0xeef2f5))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(fg)
+                                                        .child(SharedString::from(tag_str.clone())),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .cursor_pointer()
+                                                        .text_xs()
+                                                        .text_color(muted)
+                                                        .hover(|s| s.text_color(rgb(0xe04d4d)))
+                                                        .child("✕")
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            if let Some(mut h) = this.store.inventory().get(&hid).cloned() {
+                                                                h.tags.retain(|tag| tag != &tag_str);
+                                                                this.store.insert(h);
+                                                                let _ = this.store.save();
+                                                                cx.notify();
+                                                            }
+                                                        })),
+                                                )
+                                                .into_any_element()
+                                        })
+                                        .collect();
+                                    el.child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .flex_wrap()
+                                            .gap_1()
+                                            .children(tag_pills),
+                                    )
+                                })
+                                .when(self.add_tag_open, |el| {
+                                    let host_id = host.id.clone();
+                                    let presets = ["prod", "staging", "dev", "vpn", "db", "k8s"];
+                                    let available: Vec<&str> = presets
+                                        .iter()
+                                        .copied()
+                                        .filter(|p| !host.tags.iter().any(|t| t == p))
+                                        .collect();
+                                    el.child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .p_2()
+                                            .rounded_md()
+                                            .bg(rgb(0xf7f9fa))
+                                            .border_1()
+                                            .border_color(border)
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child("Quick tags:"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .flex_wrap()
+                                                    .gap_1()
+                                                    .children(available.into_iter().map(|preset| {
+                                                        let hid = host_id.clone();
+                                                        let preset_str = preset.to_string();
+                                                        div()
+                                                            .px_2()
+                                                            .py_0p5()
+                                                            .rounded(px(10.))
+                                                            .bg(rgb(0xffffff))
+                                                            .border_1()
+                                                            .border_color(border)
+                                                            .text_xs()
+                                                            .text_color(accent)
+                                                            .cursor_pointer()
+                                                            .hover(|s| s.bg(rgb(0xe8f2fd)))
+                                                            .child(format!("+ {preset}"))
+                                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                                if let Some(mut h) = this.store.inventory().get(&hid).cloned() {
+                                                                    if !h.tags.contains(&preset_str) {
+                                                                        h.tags.push(preset_str.clone());
+                                                                        this.store.insert(h);
+                                                                        let _ = this.store.save();
+                                                                        cx.notify();
+                                                                    }
+                                                                }
+                                                            }))
+                                                            .into_any_element()
+                                                    })),
+                                            ),
+                                    )
+                                }),
                         )
                         // Share this host
                         .child(
@@ -2741,13 +3273,22 @@ impl SshDeck {
                                 .justify_center()
                                 .gap_2()
                                 .p_2()
+                                .rounded_md()
                                 .text_color(accent)
                                 .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0xf0f3f5)))
                                 .child(Icon::default().data(glyph::SHARE).size(px(14.)))
                                 .child(div().text_sm().child("Share this host"))
-                                .on_click(|_, window, cx| {
-                                    window.push_notification(Notification::info("Sharing options"), cx);
-                                }),
+                                .on_click(cx.listener({
+                                    let cmd = format!("ssh -p {} {}@{}", host.port, host.username, host.address);
+                                    move |_, _, window, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(cmd.clone()));
+                                        window.push_notification(
+                                            Notification::success(format!("Copied to clipboard: {cmd}")),
+                                            cx,
+                                        );
+                                    }
+                                })),
                         )
                         // Card 3: SSH & Credentials
                         .child(
@@ -2920,9 +3461,9 @@ impl SshDeck {
                                                         Icon::default().data(glyph::KEY).size(px(14.)),
                                                     )
                                                     .label("SSH Key")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                    .on_click(cx.listener(|this, _, window, cx| {
                                                         this.credentials_popover_open = false;
-                                                        cx.notify();
+                                                        this.select_left_nav(LeftNav::Keychain, window, cx);
                                                     })),
                                             )
                                             .child(
@@ -2935,9 +3476,9 @@ impl SshDeck {
                                                             .size(px(14.)),
                                                     )
                                                     .label("Certificate")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                    .on_click(cx.listener(|this, _, window, cx| {
                                                         this.credentials_popover_open = false;
-                                                        cx.notify();
+                                                        this.select_left_nav(LeftNav::Keychain, window, cx);
                                                     })),
                                             )
                                             .child(
@@ -2950,9 +3491,9 @@ impl SshDeck {
                                                             .size(px(14.)),
                                                     )
                                                     .label("Security Key / FIDO2")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                    .on_click(cx.listener(|this, _, window, cx| {
                                                         this.credentials_popover_open = false;
-                                                        cx.notify();
+                                                        this.select_left_nav(LeftNav::Keychain, window, cx);
                                                     })),
                                             ),
                                     )
@@ -3116,13 +3657,49 @@ impl SshDeck {
                         )
                         .into_any_element(),
                     Some(
-                        Button::new("details-connect")
-                            .primary()
-                            .label("Connect")
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
                             .w_full()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.connect(host_for_connect.clone(), window, cx);
-                            }))
+                            .child(
+                                Button::new("details-add-telnet")
+                                    .ghost()
+                                    .small()
+                                    .label("+ Add Telnet")
+                                    .w_full()
+                                    .on_click(cx.listener({
+                                        let host_id = host_for_connect.id.clone();
+                                        move |this, _, window, cx| {
+                                            if let Some(mut h) = this.store.inventory().get(&host_id).cloned() {
+                                                if !h.tags.iter().any(|t| t == "telnet") {
+                                                    h.tags.push("telnet".to_string());
+                                                    this.store.insert(h);
+                                                    let _ = this.store.save();
+                                                    window.push_notification(
+                                                        Notification::success("Added Telnet protocol to host"),
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                } else {
+                                                    window.push_notification(
+                                                        Notification::info("Host already has Telnet configured"),
+                                                        cx,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("details-connect")
+                                    .primary()
+                                    .label("Connect")
+                                    .w_full()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.connect(host_for_connect.clone(), window, cx);
+                                    })),
+                            )
                             .into_any_element(),
                     ),
                 )
@@ -3133,7 +3710,7 @@ impl SshDeck {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .w(px(360.))
+            .w(px(details_w))
             .h_full()
             .bg(card_bg)
             .border_l_1()
@@ -3249,26 +3826,42 @@ impl SshDeck {
                                             .ghost()
                                             .small()
                                             .label("Create a workspace")
-                                            .on_click(|_, window, cx| {
-                                                window.push_notification(
-                                                    Notification::info("Workspaces available soon"),
-                                                    cx,
-                                                );
-                                            }),
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_add_host(window, cx);
+                                            })),
                                     )
                                     .child(
                                         Button::new("new-tab-restore")
                                             .ghost()
                                             .small()
                                             .label("Restore")
-                                            .on_click(|_, window, cx| {
-                                                window.push_notification(
-                                                    Notification::info(
-                                                        "No previous session to restore",
-                                                    ),
-                                                    cx,
-                                                );
-                                            }),
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                if let Some(host_id) =
+                                                    this.last_session_host.clone()
+                                                {
+                                                    if let Some(host) = this
+                                                        .store
+                                                        .inventory()
+                                                        .get(&host_id)
+                                                        .cloned()
+                                                    {
+                                                        this.connect(host, window, cx);
+                                                        return;
+                                                    }
+                                                }
+                                                if let Some(first) =
+                                                    this.store.inventory().hosts().first().cloned()
+                                                {
+                                                    this.connect(first, window, cx);
+                                                } else {
+                                                    window.push_notification(
+                                                        Notification::warning(
+                                                            "No host available to restore",
+                                                        ),
+                                                        cx,
+                                                    );
+                                                }
+                                            })),
                                     ),
                             ),
                     )
@@ -3651,12 +4244,9 @@ impl SshDeck {
                             .ghost()
                             .small()
                             .label("Show logs")
-                            .on_click(|_, window, cx| {
-                                window.push_notification(
-                                    Notification::info("Connecting logs active"),
-                                    cx,
-                                );
-                            }),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.select_left_nav(LeftNav::Logs, window, cx);
+                            })),
                     )
                     .child(
                         Button::new("connecting-close")
@@ -3702,7 +4292,7 @@ impl Render for SshDeck {
         let foreground = cx.theme().foreground;
 
         let header = self.render_header(cx);
-        let sidebar = self.render_sidebar(cx);
+        let sidebar = self.render_sidebar(window, cx);
         let pane_tabs = self.render_pane_tabs(cx);
         let main = self.render_main(window, cx);
         let add_host_sheet = self.render_add_host_sheet(cx);

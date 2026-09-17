@@ -63,8 +63,12 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    WindowExt as _,
+};
 use gpui_kit::{
     div, px, rgb, AnyElement, App, AppContext as _, Context, Div, Entity, FocusHandle,
     Focusable as _, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
@@ -175,6 +179,8 @@ pub struct LogsPane {
     next_id: u64,
     filter_input: Entity<InputState>,
     focus_handle: FocusHandle,
+    view_grid: bool,
+    sort_descending: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -196,6 +202,8 @@ impl LogsPane {
             next_id: 1,
             filter_input,
             focus_handle,
+            view_grid: false,
+            sort_descending: true,
             _subscriptions: subscriptions,
         }
     }
@@ -344,15 +352,36 @@ impl LogsPane {
                         Button::new("logs-grid")
                             .ghost()
                             .icon(IconName::LayoutDashboard)
-                            .tooltip("Grid view — not applicable to logs")
-                            .disabled(true),
+                            .selected(self.view_grid)
+                            .tooltip(if self.view_grid {
+                                "Switch to table view"
+                            } else {
+                                "Switch to card grid view"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view_grid = !this.view_grid;
+                                cx.notify();
+                            })),
                     )
                     .child(
                         Button::new("logs-calendar")
                             .ghost()
-                            .icon(IconName::Inbox)
-                            .tooltip("Calendar — not applicable to logs")
-                            .disabled(true),
+                            .icon(IconName::Calendar)
+                            .tooltip(if self.sort_descending {
+                                "Sorting: Newest first ▾"
+                            } else {
+                                "Sorting: Oldest first ▴"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.sort_descending = !this.sort_descending;
+                                let msg = if this.sort_descending {
+                                    "Sorting logs: Newest first ▾"
+                                } else {
+                                    "Sorting logs: Oldest first ▴"
+                                };
+                                window.push_notification(Notification::info(msg), cx);
+                                cx.notify();
+                            })),
                     ),
             )
     }
@@ -581,46 +610,188 @@ impl LogsPane {
                 .into_any_element();
         }
 
-        // Newest first, as in the reference (Aug 12 at top).
         let mut entries = filtered;
-        entries.reverse();
+        if self.sort_descending {
+            entries.reverse();
+        }
 
-        let header = self.render_table_header(cx);
-        let rows: Vec<gpui_kit::AnyElement> = entries
-            .iter()
-            .map(|entry| self.render_row(entry, cx).into_any_element())
-            .collect();
+        if self.view_grid {
+            let cards: Vec<gpui_kit::AnyElement> = entries
+                .iter()
+                .map(|entry| self.render_card(entry, cx).into_any_element())
+                .collect();
+            div()
+                .id("logs-grid")
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_3()
+                .p_3()
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scrollbar()
+                .children(cards)
+                .into_any_element()
+        } else {
+            let header = self.render_table_header(cx);
+            let rows: Vec<gpui_kit::AnyElement> = entries
+                .iter()
+                .map(|entry| self.render_row(entry, cx).into_any_element())
+                .collect();
+
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .p_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .bg(cx.theme().background)
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .overflow_hidden()
+                        .child(header)
+                        .child(
+                            div()
+                                .id("logs-list")
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_h(px(0.))
+                                .overflow_y_scrollbar()
+                                .children(rows),
+                        ),
+                )
+                .into_any_element()
+        }
+    }
+
+    fn render_card(&self, entry: &LogEntry, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let fg = cx.theme().foreground;
+        let marker_color = entry.level.color(&**cx);
+        let host_lower = entry.host.to_lowercase();
+        let host_bg = if host_lower.contains("horly") || host_lower.contains("local terminal") {
+            rgb(0x204b6b)
+        } else {
+            rgb(0xd96c2b)
+        };
+        let user_bg = rgb(0xf0a75a);
+        let initials = user_initials(&entry.user);
 
         div()
+            .id(SharedString::from(format!("log-card-{}", entry.id)))
             .flex()
             .flex_col()
-            .flex_1()
-            .min_h(px(0.))
+            .gap_2()
             .p_3()
+            .w(px(280.))
+            .rounded(px(10.))
+            .bg(rgb(0xffffff))
+            .border_1()
+            .border_color(border)
+            .shadow_xs()
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .bg(cx.theme().background)
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .overflow_hidden()
-                    .child(header)
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
-                            .id("logs-list")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .child(status_marker(marker_color))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family("Menlo")
+                                    .text_color(muted)
+                                    .child(SharedString::from(format!(
+                                        "{} {}",
+                                        entry.date, entry.time_range
+                                    ))),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(28.))
+                            .rounded(px(6.))
+                            .bg(host_bg)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::new(IconName::Globe).small().text_color(rgb(0xffffff))),
+                    )
+                    .child(
+                        div()
                             .flex()
                             .flex_col()
                             .flex_1()
-                            .min_h(px(0.))
-                            .overflow_y_scrollbar()
-                            .children(rows),
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .text_color(fg)
+                                    .truncate()
+                                    .child(SharedString::from(entry.host.clone())),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .truncate()
+                                    .child(SharedString::from(entry.host_detail.clone())),
+                            ),
                     ),
             )
-            .into_any_element()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .size(px(20.))
+                            .rounded_full()
+                            .bg(user_bg)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.))
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .text_color(rgb(0xffffff))
+                            .child(initials),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .truncate()
+                            .child(SharedString::from(entry.user.clone())),
+                    ),
+            )
     }
 
     fn render_upgrade_banner(&self, cx: &mut Context<Self>) -> Div {

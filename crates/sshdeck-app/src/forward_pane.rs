@@ -60,15 +60,19 @@ use crate::glyph;
 use async_channel::Receiver;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    WindowExt as _,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, AnyElement, App, AppContext as _, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
-    Window,
+    Subscription, Window,
 };
 use sshdeck_core::forward::{Forward, ForwardConfig, ForwardError, ForwardEvent};
 use sshdeck_core::session::Session;
@@ -232,6 +236,11 @@ pub struct ForwardPane {
     /// True while one start is in flight, so "Add" cannot be double-fired.
     starting: bool,
     focus_handle: FocusHandle,
+    search_input: Entity<InputState>,
+    search_open: bool,
+    is_grid: bool,
+    sort_port: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ForwardPane {
@@ -242,8 +251,19 @@ impl ForwardPane {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let spec_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("8080:db.internal:5432 or 1080"));
+        let search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter forwards by port or host"));
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
+
+        let subscriptions = vec![
+            cx.subscribe_in(&search_input, window, |_, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        ];
+
         Self {
             session: None,
             forwards: Vec::new(),
@@ -254,6 +274,11 @@ impl ForwardPane {
             error: None,
             starting: false,
             focus_handle,
+            search_input,
+            search_open: false,
+            is_grid: false,
+            sort_port: false,
+            _subscriptions: subscriptions,
         }
     }
 
@@ -471,21 +496,50 @@ impl ForwardPane {
                             .ghost()
                             .icon(IconName::Search)
                             .tooltip("Search port forwards")
-                            .disabled(true),
+                            .selected(self.search_open)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.search_open = !this.search_open;
+                                if this.search_open {
+                                    let handle = this.search_input.read(cx).focus_handle(cx);
+                                    handle.focus(window, cx);
+                                }
+                                cx.notify();
+                            })),
                     )
                     .child(
                         Button::new("forward-grid")
                             .ghost()
                             .icon(Icon::default().data(glyph::GRID))
-                            .tooltip("Grid view")
-                            .disabled(true),
+                            .tooltip(if self.is_grid {
+                                "Switch to list view"
+                            } else {
+                                "Switch to grid view"
+                            })
+                            .selected(self.is_grid)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.is_grid = !this.is_grid;
+                                cx.notify();
+                            })),
                     )
                     .child(
                         Button::new("forward-calendar")
                             .ghost()
                             .icon(Icon::default().data(glyph::CALENDAR))
-                            .tooltip("Calendar view")
-                            .disabled(true),
+                            .tooltip(if self.sort_port {
+                                "Sorting: By Port"
+                            } else {
+                                "Sorting: By Order"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.sort_port = !this.sort_port;
+                                let msg = if this.sort_port {
+                                    "Sorting forwards by port number"
+                                } else {
+                                    "Sorting forwards by creation order"
+                                };
+                                window.push_notification(Notification::info(msg), cx);
+                                cx.notify();
+                            })),
                     ),
             )
     }
@@ -494,57 +548,90 @@ impl ForwardPane {
     /// background, in the shape of the reference's add sheet.
     fn render_form(&self, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
-        let addable = !self.starting && self.session.is_some();
+        let addable = !self.starting;
 
         div().flex().flex_col().flex_shrink_0().p_3().child(
             div()
                 .flex()
                 .flex_col()
-                .gap_2()
-                .w_full()
-                .p_3()
+                .gap_3()
+                .p_4()
                 .rounded(px(10.))
-                .bg(cx.theme().background)
+                .bg(cx.theme().popover)
                 .border_1()
                 .border_color(cx.theme().border)
-                .child(
-                    div()
-                        .text_size(px(14.))
-                        .font_weight(FontWeight::BOLD)
-                        .child("New forwarding"),
-                )
-                .child(self.render_kind_tabs(cx))
+                .shadow_xs()
                 .child(
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap_2()
-                        .child(div().flex_1().child(Input::new(&self.spec_input).small()))
+                        .justify_between()
                         .child(
-                            Button::new("forward-add")
-                                .small()
-                                .primary()
-                                .label("Add")
-                                .disabled(!addable)
-                                .on_click(cx.listener(|this, _, window, cx| this.add(window, cx))),
+                            div()
+                                .text_size(px(14.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(cx.theme().foreground)
+                                .child("NEW FORWARDING"),
+                        )
+                        .child(
+                            Button::new("forward-form-close")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.form_open = false;
+                                    this.error = None;
+                                    cx.notify();
+                                })),
                         ),
                 )
+                .child(self.render_kind_tabs(cx))
+                .child(Input::new(&self.spec_input).small())
                 .child(
                     div()
                         .text_size(px(12.))
                         .text_color(muted)
                         .child(self.kind.hint()),
                 )
-                .when_some(self.error.clone(), |el, error| {
-                    el.child(Alert::error("forward-error", error).title("Forward not created"))
-                }),
+                .when_some(self.error.as_ref(), |el, err| {
+                    el.child(Alert::error(err.as_str()).small())
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap_2()
+                        .pt_1()
+                        .child(
+                            Button::new("forward-form-cancel")
+                                .ghost()
+                                .small()
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.form_open = false;
+                                    this.error = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("forward-form-add")
+                                .primary()
+                                .small()
+                                .label(if self.starting { "Starting…" } else { "Add" })
+                                .disabled(!addable)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.add(window, cx);
+                                })),
+                        ),
+                ),
         )
     }
 
-    fn render_kind_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        TabBar::new("forward-kind")
-            .segmented()
+    /// Tab bar for switching between Local, Remote and Dynamic forwards.
+    fn render_kind_tabs(&self, cx: &mut Context<Self>) -> TabBar {
+        TabBar::new("forward-kind-tabs")
             .selected_index(self.kind.index())
             .on_click(cx.listener(|this, index, _, cx| {
                 this.kind = ForwardKind::from_index(*index);
@@ -557,7 +644,7 @@ impl ForwardPane {
             .child(Tab::new().label(ForwardKind::Dynamic.label()))
     }
 
-    /// The list, or whichever state stands in for it.
+    /// The list or card grid, or whichever state stands in for it.
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.forwards.is_empty() {
             return empty_state(
@@ -568,19 +655,166 @@ impl ForwardPane {
             .into_any_element();
         }
 
-        let body = div()
-            .id("forward-list")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scrollbar();
-        let rows: Vec<AnyElement> = self
+        let query = self.search_input.read(cx).value().trim().to_lowercase();
+        let mut visible: Vec<&ForwardRow> = self
             .forwards
             .iter()
-            .map(|row| self.render_row(row, cx).into_any_element())
+            .filter(|row| {
+                if query.is_empty() {
+                    return true;
+                }
+                row.config.bind_label().to_lowercase().contains(&query)
+                    || row
+                        .config
+                        .target()
+                        .map(|(h, p)| format!("{h}:{p}").to_lowercase().contains(&query))
+                        .unwrap_or(false)
+            })
             .collect();
-        body.children(rows).into_any_element()
+
+        if self.sort_port {
+            visible.sort_by_key(|row| row.config.bind().1);
+        }
+
+        if visible.is_empty() {
+            return empty_state(
+                cx,
+                "No matching forwards",
+                "No port forwards match the current search filter.",
+            )
+            .into_any_element();
+        }
+
+        if self.is_grid {
+            let cards: Vec<AnyElement> = visible
+                .iter()
+                .map(|row| self.render_card(row, cx).into_any_element())
+                .collect();
+            div()
+                .id("forward-grid")
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_3()
+                .p_3()
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scrollbar()
+                .children(cards)
+                .into_any_element()
+        } else {
+            let rows: Vec<AnyElement> = visible
+                .iter()
+                .map(|row| self.render_row(row, cx).into_any_element())
+                .collect();
+            div()
+                .id("forward-list")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scrollbar()
+                .children(rows)
+                .into_any_element()
+        }
+    }
+
+    fn render_card(&self, row: &ForwardRow, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let card_bg = cx.theme().popover;
+        let id = row.id;
+        let active = row.status.is_active();
+
+        let endpoints = match row.config.target() {
+            Some((host, port)) => format!(
+                "{} → {}",
+                row.config.bind_label(),
+                format_endpoint(host, port)
+            ),
+            None => format!("{} → SOCKS5", row.config.bind_label()),
+        };
+        let status = row.status.label();
+        let marker = row.status.marker(cx);
+        let note = row.status.note().map(str::to_string);
+        let kind = kind_label(&row.config);
+
+        let action = if active {
+            Button::new(format!("forward-stop-{id}"))
+                .ghost()
+                .xsmall()
+                .icon(IconName::CircleX)
+                .tooltip("Stop this forward")
+                .on_click(cx.listener(move |this, _, _, cx| this.stop(id, cx)))
+        } else {
+            Button::new(format!("forward-remove-{id}"))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Close)
+                .tooltip("Remove this entry")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.forwards.retain(|row| row.id != id);
+                    cx.notify();
+                }))
+        };
+
+        div()
+            .id(format!("forward-card-{id}"))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .gap_2()
+            .w(px(280.))
+            .min_h(px(90.))
+            .p_3()
+            .rounded(px(10.))
+            .bg(card_bg)
+            .border_1()
+            .border_color(border)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .child(status_marker(marker))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded(px(4.))
+                                    .bg(cx.theme().muted)
+                                    .text_color(muted)
+                                    .child(kind),
+                            ),
+                    )
+                    .child(action),
+            )
+            .child(
+                div()
+                    .font_family("Menlo")
+                    .text_size(px(13.))
+                    .truncate()
+                    .child(endpoints),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_size(px(11.)).text_color(marker).child(status))
+                    .when_some(note, |el, note| {
+                        el.child(div().text_size(px(11.)).text_color(muted).child(note))
+                    }),
+            )
     }
 
     /// One forward: a status marker, the endpoints, the kind, its one action and
@@ -683,11 +917,8 @@ impl ForwardPane {
 
 impl Render for ForwardPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // `sidebar` is the light content surface (#edf1f2); the toolbar above it
-        // is the white `background` (#ffffff) in light mode.
         let background = cx.theme().sidebar;
         let foreground = cx.theme().foreground;
-        let connected = self.session.is_some();
         let form_open = self.form_open;
 
         div()
@@ -699,7 +930,27 @@ impl Render for ForwardPane {
             .text_color(foreground)
             .track_focus(&self.focus_handle)
             .child(self.render_toolbar(cx))
-            .when(connected && form_open, |el| el.child(self.render_form(cx)))
+            .when(self.search_open, |el| {
+                el.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().popover)
+                        .child(
+                            Input::new(&self.search_input)
+                                .small()
+                                .cleanable(true)
+                                .prefix(
+                                    Icon::new(IconName::Search)
+                                        .small()
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
+                        ),
+                )
+            })
+            .when(form_open, |el| el.child(self.render_form(cx)))
             .child(self.render_body(cx))
     }
 }

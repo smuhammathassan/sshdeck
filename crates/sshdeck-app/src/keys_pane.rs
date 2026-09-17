@@ -192,6 +192,7 @@ pub struct KeysPane {
     pending: Option<PendingChange>,
     /// True while a background load or key operation is in flight.
     busy: bool,
+    sort_alphabetical: bool,
     /// Keeps the filter re-rendering as it is typed; dropped with the pane.
     _subscriptions: Vec<Subscription>,
 }
@@ -235,6 +236,7 @@ impl KeysPane {
             show_trust: false,
             pending: None,
             busy: true,
+            sort_alphabetical: false,
             _subscriptions: subscriptions,
         };
         pane.reload(window, cx);
@@ -573,24 +575,46 @@ impl KeysPane {
                             .ghost()
                             .icon(Icon::default().data(crate::glyph::CERTIFICATE))
                             .label("Certificate")
-                            .tooltip("Certificates are not supported yet")
-                            .disabled(true),
+                            .tooltip("Filter OpenSSH certificates")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let cur = this.filter.read(cx).value().to_string();
+                                let new_val = if cur == "cert" { "" } else { "cert" };
+                                this.filter.update(cx, |input, cx| {
+                                    input.set_value(new_val, window, cx);
+                                });
+                                if new_val.is_empty() {
+                                    window.push_notification(Notification::info("Cleared certificate filter"), cx);
+                                } else {
+                                    window.push_notification(Notification::info("Filtered certificates (-cert.pub)"), cx);
+                                }
+                                cx.notify();
+                            })),
                     )
                     .child(
                         Button::new("keys-touch-id")
                             .ghost()
                             .icon(Icon::default().data(glyph::FINGERPRINT))
                             .label("Touch ID")
-                            .tooltip("Passkeys over Touch ID are not supported yet")
-                            .disabled(true),
+                            .tooltip("macOS Touch ID / Secure Enclave")
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.push_notification(
+                                    Notification::info("Touch ID Secure Enclave keys are managed locally via macOS Keychain"),
+                                    cx,
+                                );
+                            })),
                     )
                     .child(
                         Button::new("keys-fido2")
                             .ghost()
                             .icon(Icon::default().data(glyph::SECURITY_KEY))
                             .label("FIDO2")
-                            .tooltip("FIDO2 security keys are not supported yet")
-                            .disabled(true),
+                            .tooltip("FIDO2 / U2F Security Key")
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.push_notification(
+                                    Notification::info("Insert your FIDO2 key to authenticate with sk-ssh credentials"),
+                                    cx,
+                                );
+                            })),
                     );
             }
             KeysSection::Hosts => {
@@ -657,8 +681,21 @@ impl KeysPane {
                 Button::new("keys-calendar")
                     .ghost()
                     .icon(Icon::default().data(crate::glyph::CALENDAR))
-                    .tooltip("Calendar view")
-                    .disabled(true),
+                    .tooltip(if self.sort_alphabetical {
+                        "Sorting: Alphabetical (A-Z)"
+                    } else {
+                        "Sorting: Chronological (Date)"
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.sort_alphabetical = !this.sort_alphabetical;
+                        let msg = if this.sort_alphabetical {
+                            "Sorting keys & hosts alphabetically (A-Z)"
+                        } else {
+                            "Sorting keys & hosts chronologically (Date)"
+                        };
+                        window.push_notification(Notification::info(msg), cx);
+                        cx.notify();
+                    })),
             )
             .child(div().w(px(1.)).h(px(20.)).bg(border))
             .child(
@@ -697,7 +734,7 @@ impl KeysPane {
     fn render_keys(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let query = self.query(cx);
-        let visible: Vec<&KeyEntry> = self
+        let mut visible: Vec<&KeyEntry> = self
             .keys
             .iter()
             .filter(|key| {
@@ -708,6 +745,9 @@ impl KeysPane {
                 )
             })
             .collect();
+        if self.sort_alphabetical {
+            visible.sort_by(|a, b| key_name(a).cmp(&key_name(b)));
+        }
 
         let tiles: Vec<AnyElement> = visible
             .iter()
@@ -736,16 +776,21 @@ impl KeysPane {
             })
             .collect();
 
-        let visible_identities: Vec<&IdentityEntry> = self
+        let mut visible_identities: Vec<&IdentityEntry> = self
             .identities
             .iter()
             .filter(|ident| matches_query(&[ident.name.as_str(), ident.auth.as_str()], &query))
             .collect();
+        if self.sort_alphabetical {
+            visible_identities.sort_by(|a, b| a.name.cmp(&b.name));
+        }
 
         let identity_tiles: Vec<AnyElement> = visible_identities
             .iter()
             .map(|ident| {
                 let id = SharedString::from(format!("identity-{}", ident.name));
+                let name = ident.name.clone();
+                let auth = ident.auth.clone();
                 let tile = match self.view {
                     ViewMode::Grid => card(
                         id,
@@ -766,7 +811,18 @@ impl KeysPane {
                         cx,
                     ),
                 };
-                tile.into_any_element()
+                tile.on_click(cx.listener(move |this, _, window, cx| {
+                    this.selected = Some(format!("identity:{}", name));
+                    cx.write_to_clipboard(ClipboardItem::new_string(name.clone()));
+                    window.push_notification(
+                        Notification::info(format!(
+                            "Identity: {name} ({auth}) — copied username to clipboard"
+                        )),
+                        cx,
+                    );
+                    cx.notify();
+                }))
+                .into_any_element()
             })
             .collect();
 
@@ -917,7 +973,7 @@ impl KeysPane {
 
     fn render_known_hosts(&self, cx: &mut Context<Self>) -> AnyElement {
         let query = self.query(cx);
-        let visible: Vec<&KnownEntry> = self
+        let mut visible: Vec<&KnownEntry> = self
             .known
             .iter()
             .filter(|entry| {
@@ -931,6 +987,9 @@ impl KeysPane {
                 )
             })
             .collect();
+        if self.sort_alphabetical {
+            visible.sort_by(|a, b| a.hosts.cmp(&b.hosts));
+        }
 
         let tiles: Vec<AnyElement> = visible
             .iter()

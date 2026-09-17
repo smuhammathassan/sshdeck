@@ -62,6 +62,11 @@ pub enum CommandId {
     OpenSftp,
     ManageKeys,
     OpenSettings,
+    PortForwarding,
+    Snippets,
+    KnownHosts,
+    Logs,
+    ToggleSidebar,
 }
 
 impl CommandId {
@@ -75,6 +80,11 @@ impl CommandId {
             CommandId::OpenSftp => "open-sftp",
             CommandId::ManageKeys => "manage-keys",
             CommandId::OpenSettings => "open-settings",
+            CommandId::PortForwarding => "port-forwarding",
+            CommandId::Snippets => "snippets",
+            CommandId::KnownHosts => "known-hosts",
+            CommandId::Logs => "logs",
+            CommandId::ToggleSidebar => "toggle-sidebar",
         }
     }
 }
@@ -243,18 +253,14 @@ fn registry() -> Vec<Command> {
             "Open SFTP Browser",
             &["files", "sftp", "browse", "transfer"],
         )
-        .kind(Kind::Unavailable(
-            "SFTP pane is not wired into the shell yet",
-        )),
+        .kind(Kind::Host),
         Command::new(
             CommandId::ManageKeys,
             Category::Panes,
-            "Manage SSH Keys",
-            &["keys", "identity", "known hosts", "security"],
+            "Manage SSH Keys (Keychain)",
+            &["keys", "identity", "known hosts", "security", "keychain"],
         )
-        .kind(Kind::Unavailable(
-            "Keys pane is not wired into the shell yet",
-        )),
+        .kind(Kind::Host),
         Command::new(
             CommandId::OpenSettings,
             Category::Panes,
@@ -262,9 +268,42 @@ fn registry() -> Vec<Command> {
             &["preferences", "config"],
         )
         .with_shortcut("cmd-,")
-        .kind(Kind::Unavailable(
-            "Settings screen is not wired into the shell yet",
-        )),
+        .kind(Kind::Host),
+        Command::new(
+            CommandId::PortForwarding,
+            Category::Panes,
+            "Port Forwarding",
+            &["tunnel", "port", "forward", "forwarding"],
+        )
+        .kind(Kind::Host),
+        Command::new(
+            CommandId::Snippets,
+            Category::Panes,
+            "Snippets",
+            &["scripts", "snippets", "commands"],
+        )
+        .kind(Kind::Host),
+        Command::new(
+            CommandId::KnownHosts,
+            Category::Panes,
+            "Known Hosts",
+            &["fingerprint", "known hosts", "hosts"],
+        )
+        .kind(Kind::Host),
+        Command::new(
+            CommandId::Logs,
+            Category::Panes,
+            "Connection Logs",
+            &["logs", "history", "connection"],
+        )
+        .kind(Kind::Host),
+        Command::new(
+            CommandId::ToggleSidebar,
+            Category::Appearance,
+            "Toggle Left Sidebar",
+            &["sidebar", "collapse", "expand", "rail"],
+        )
+        .kind(Kind::Host),
     ]
 }
 
