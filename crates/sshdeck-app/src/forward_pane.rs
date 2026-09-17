@@ -1,10 +1,16 @@
 //! Port forwarding pane: create, watch and stop SSH tunnels on one session.
 //!
-//! A self-contained gpui-kit view over [`Session::forward`]. It lists every
-//! forward created here with its kind (local/remote/dynamic), bind address and
-//! target, folds the [`ForwardEvent`] stream into a per-row status, and offers
-//! one action per row: **stop** while the forward is live, **remove** once it
-//! has stopped or failed.
+//! A self-contained gpui-kit view over [`Session::forward`]. The layout follows
+//! the Termius "Port Forwarding" surface: a white toolbar carrying the
+//! `New forwarding` control and a live/known count, an empty state when nothing
+//! is configured, and a hairline-separated list of forwards below it. Each row
+//! carries its kind (local/remote/dynamic), the bind address and port, the
+//! target, a status marker for a live vs stopped forward, and one action:
+//! **stop** while the forward is live, **remove** once it has stopped or failed.
+//!
+//! The add form (kind selector, spec field, `Add`) sits behind the toolbar's
+//! `New forwarding` button rather than being always visible, the way the
+//! reference reveals creation from its toolbar.
 //!
 //! # Wiring contract
 //!
@@ -30,11 +36,14 @@
 //!
 //! * Dynamic forwards are SOCKS5 only: the crate speaks `CONNECT` with no
 //!   authentication and does not implement `BIND` or `UDP ASSOCIATE`. The form
-//!   says so next to the dynamic option, so nobody expects a transparent proxy.
+//!   says so next to the dynamic option (and the row says `SOCKS5`, nothing
+//!   stronger), so nobody expects a transparent proxy.
 //! * Specs are the OpenSSH grammar, parsed by `sshdeck_core::forward` — this
 //!   pane never re-implements the parser, and a rejected spec is shown with the
 //!   crate's own message (which names the broken rule) rather than a generic
 //!   "invalid input".
+//! * It does not persist forwards: the empty state says "add", not "save", so
+//!   the copy cannot promise a store that does not exist.
 //!
 //! # Threading and bounds
 //!
@@ -54,10 +63,11 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _};
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, px, AnyElement, AppContext as _, Context, Div, Entity, FocusHandle,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Window,
+    div, px, AnyElement, App, AppContext as _, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    Window,
 };
 use sshdeck_core::forward::{Forward, ForwardConfig, ForwardError, ForwardEvent};
 use sshdeck_core::session::Session;
@@ -157,6 +167,16 @@ impl ForwardStatus {
             _ => None,
         }
     }
+
+    /// The marker colour for the row: green while it is up, red after a
+    /// failure, muted once it is over (or still coming up).
+    fn marker(&self, cx: &App) -> Hsla {
+        match self {
+            Self::Listening { .. } => cx.theme().success,
+            Self::Failed(_) => cx.theme().danger,
+            Self::Starting | Self::Stopped => cx.theme().muted_foreground,
+        }
+    }
 }
 
 /// One forward the pane owns, as last observed.
@@ -204,6 +224,8 @@ pub struct ForwardPane {
     /// The pending form's kind.
     kind: ForwardKind,
     spec_input: Entity<InputState>,
+    /// Whether the add form is revealed under the toolbar.
+    form_open: bool,
     /// A rejected spec or a failed start, shown next to the form.
     error: Option<String>,
     /// True while one start is in flight, so "Add" cannot be double-fired.
@@ -227,6 +249,7 @@ impl ForwardPane {
             next_id: 1,
             kind: ForwardKind::Local,
             spec_input,
+            form_open: false,
             error: None,
             starting: false,
             focus_handle,
@@ -260,6 +283,7 @@ impl ForwardPane {
         self.session = session;
         self.forwards.clear();
         self.error = None;
+        self.form_open = false;
         self.starting = false;
         cx.notify();
     }
@@ -386,67 +410,102 @@ impl ForwardPane {
         .detach();
     }
 
-    /// The title bar, with a live/known count.
-    fn render_header(&self, cx: &mut Context<Self>) -> Div {
+    /// The white toolbar strip: the add control on the left, the count on the
+    /// right. `New forwarding` is disabled without a session, because a forward
+    /// cannot exist off one.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let connected = self.session.is_some();
         let active = self
             .forwards
             .iter()
             .filter(|row| row.status.is_active())
             .count();
+
         div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
-            .h(px(36.))
+            .h(px(44.))
             .px_3()
             .flex_shrink_0()
+            .bg(cx.theme().background)
             .border_b_1()
-            .border_color(cx.theme().border)
-            .child(div().text_sm().child("Port forwarding"))
+            .border_color(border)
+            .child(
+                Button::new("forward-new")
+                    .icon(IconName::Plus)
+                    .label("New forwarding")
+                    .disabled(!connected)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.form_open = !this.form_open;
+                        // A message about a form that just closed no longer applies.
+                        if !this.form_open {
+                            this.error = None;
+                        }
+                        cx.notify();
+                    })),
+            )
             .child(
                 div()
-                    .text_xs()
+                    .text_size(px(12.))
                     .text_color(muted)
                     .child(format!("{active} active of {}", self.forwards.len())),
             )
     }
 
-    /// The kind selector plus the spec field, only shown when a session exists.
+    /// The add form, revealed by `New forwarding`: a white card over the content
+    /// background, in the shape of the reference's add sheet.
     fn render_form(&self, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
-        let border = cx.theme().border;
         let addable = !self.starting && self.session.is_some();
 
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .flex_shrink_0()
-            .border_b_1()
-            .border_color(border)
-            .child(self.render_kind_tabs(cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(div().flex_1().child(Input::new(&self.spec_input).small()))
-                    .child(
-                        Button::new("forward-add")
-                            .small()
-                            .label("Add")
-                            .disabled(!addable)
-                            .on_click(cx.listener(|this, _, window, cx| this.add(window, cx))),
-                    ),
-            )
-            .child(div().text_xs().text_color(muted).child(self.kind.hint()))
-            .when_some(self.error.clone(), |el, error| {
-                el.child(Alert::error("forward-error", error).title("Forward not created"))
-            })
+        div().flex().flex_col().flex_shrink_0().p_3().child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .w_full()
+                .p_3()
+                .rounded(px(10.))
+                .bg(cx.theme().background)
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::BOLD)
+                        .child("New forwarding"),
+                )
+                .child(self.render_kind_tabs(cx))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().child(Input::new(&self.spec_input).small()))
+                        .child(
+                            Button::new("forward-add")
+                                .small()
+                                .primary()
+                                .label("Add")
+                                .disabled(!addable)
+                                .on_click(cx.listener(|this, _, window, cx| this.add(window, cx))),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .child(self.kind.hint()),
+                )
+                .when_some(self.error.clone(), |el, error| {
+                    el.child(Alert::error("forward-error", error).title("Forward not created"))
+                }),
+        )
     }
 
     fn render_kind_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -465,8 +524,26 @@ impl ForwardPane {
     }
 
     /// The list, or whichever state stands in for it.
-    fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
+    fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        // No session: say so rather than show an empty tunnels list.
+        if self.session.is_none() {
+            return empty_state(
+                cx,
+                "No session",
+                "Open an SSH session to forward ports through it.",
+            )
+            .into_any_element();
+        }
+
+        if self.forwards.is_empty() {
+            return empty_state(
+                cx,
+                "Set up port forwarding",
+                "Add a port forward to reach databases, web apps, and other services \
+                 through the session.",
+            )
+            .into_any_element();
+        }
 
         let body = div()
             .id("forward-list")
@@ -475,55 +552,23 @@ impl ForwardPane {
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scrollbar();
-
-        // No session: say so rather than show an empty tunnels list.
-        if self.session.is_none() {
-            return body
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .p_6()
-                .child(Icon::new(IconName::Globe).large().text_color(muted))
-                .child(div().text_sm().child("No session"))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("Open an SSH session to forward ports through it"),
-                );
-        }
-
-        if self.forwards.is_empty() {
-            return body
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .p_6()
-                .child(Icon::new(IconName::Globe).large().text_color(muted))
-                .child(div().text_sm().child("No forwards yet"))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("Pick a kind and add a spec above"),
-                );
-        }
-
         let rows: Vec<AnyElement> = self
             .forwards
             .iter()
             .map(|row| self.render_row(row, cx).into_any_element())
             .collect();
-        body.children(rows)
+        body.children(rows).into_any_element()
     }
 
-    /// One forward: kind, endpoints, live status and its one action.
+    /// One forward: a status marker, the endpoints, the kind, its one action and
+    /// the live status line beneath.
     ///
     /// Returns `impl IntoElement` rather than `Div`: `.id(..)` wraps the div in a
     /// `Stateful<Div>`, so naming the return type would leak that wrapper here.
     fn render_row(&self, row: &ForwardRow, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
+        let hover = cx.theme().muted;
         let id = row.id;
         let active = row.status.is_active();
 
@@ -538,18 +583,15 @@ impl ForwardPane {
             None => format!("{} → SOCKS5", row.config.bind_label()),
         };
         let status = row.status.label();
-        let status_color = match &row.status {
-            ForwardStatus::Listening { .. } => cx.theme().success,
-            ForwardStatus::Failed(_) => cx.theme().danger,
-            ForwardStatus::Starting | ForwardStatus::Stopped => muted,
-        };
+        let marker = row.status.marker(cx);
         let note = row.status.note().map(str::to_string);
+        let kind = kind_label(&row.config);
 
         let action = if active {
             Button::new(format!("forward-stop-{id}"))
                 .ghost()
                 .xsmall()
-                .icon(IconName::Close)
+                .icon(IconName::CircleX)
                 .tooltip("Stop this forward")
                 .on_click(cx.listener(move |this, _, _, cx| this.stop(id, cx)))
         } else {
@@ -569,47 +611,61 @@ impl ForwardPane {
             .flex()
             .flex_col()
             .gap_1()
+            .min_h(px(44.))
             .px_3()
             .py_2()
             .border_b_1()
             .border_color(border)
+            .hover(move |style| style.bg(hover))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .px_1()
-                            .rounded_sm()
-                            .bg(cx.theme().muted)
-                            .text_color(muted)
-                            .child(row.config.kind()),
-                    )
+                    .child(status_marker(marker))
                     .child(
                         div()
                             .flex_1()
                             .overflow_hidden()
+                            .truncate()
                             .font_family("Menlo")
-                            .text_sm()
+                            .text_size(px(14.))
                             .child(endpoints),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .px_1()
+                            .rounded(px(4.))
+                            .bg(cx.theme().muted)
+                            .text_color(muted)
+                            .child(kind),
                     )
                     .child(action),
             )
-            .child(div().text_xs().text_color(status_color).child(status))
-            .when_some(note, |el, note| {
-                el.child(div().text_xs().text_color(muted).child(note))
-            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_size(px(12.)).text_color(marker).child(status))
+                    .when_some(note, |el, note| {
+                        el.child(div().text_size(px(12.)).text_color(muted).child(note))
+                    }),
+            )
     }
 }
 
 impl Render for ForwardPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let background = cx.theme().background;
+        // `sidebar` is the light content surface (#edf1f2); the toolbar above it
+        // is the white `background` (#ffffff) in light mode.
+        let background = cx.theme().sidebar;
         let foreground = cx.theme().foreground;
         let connected = self.session.is_some();
+        let form_open = self.form_open;
 
         div()
             .flex()
@@ -619,9 +675,71 @@ impl Render for ForwardPane {
             .bg(background)
             .text_color(foreground)
             .track_focus(&self.focus_handle)
-            .child(self.render_header(cx))
-            .when(connected, |el| el.child(self.render_form(cx)))
+            .child(self.render_toolbar(cx))
+            .when(connected && form_open, |el| el.child(self.render_form(cx)))
             .child(self.render_body(cx))
+    }
+}
+
+/// The centred empty state: a rounded tile with the forward glyph, a heading and
+/// one line of explanation. Used for both "no session" and "nothing yet".
+fn empty_state(cx: &App, title: &str, detail: &str) -> Div {
+    let muted = cx.theme().muted_foreground;
+    let foreground = cx.theme().foreground;
+
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .flex_1()
+        .min_h(px(0.))
+        .p_6()
+        .child(
+            div()
+                .size(px(72.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(16.))
+                .bg(cx.theme().muted)
+                .child(
+                    Icon::new(IconName::ExternalLink)
+                        .large()
+                        .text_color(foreground),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(20.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(foreground)
+                .child(SharedString::from(title.to_string())),
+        )
+        .child(
+            div()
+                .max_w(px(420.))
+                .text_center()
+                .text_size(px(14.))
+                .text_color(muted)
+                .child(SharedString::from(detail.to_string())),
+        )
+}
+
+/// The 6px status dot. A dot plus the status text reads as live vs stopped at a
+/// glance, without relying on colour alone (the text carries the same meaning).
+fn status_marker(color: Hsla) -> Div {
+    div().size(px(6.)).rounded(px(3.)).flex_shrink_0().bg(color)
+}
+
+/// A row's kind, capitalised for display. The stored kind stays the crate's
+/// lower-case label.
+fn kind_label(config: &ForwardConfig) -> &'static str {
+    match config {
+        ForwardConfig::Local { .. } => "Local",
+        ForwardConfig::Remote { .. } => "Remote",
+        ForwardConfig::Dynamic { .. } => "Dynamic",
     }
 }
 
@@ -718,5 +836,26 @@ mod tests {
     fn endpoints_bracket_ipv6_literals() {
         assert_eq!(format_endpoint("localhost", 8080), "localhost:8080");
         assert_eq!(format_endpoint("::1", 1080), "[::1]:1080");
+    }
+
+    #[test]
+    fn kind_labels_cover_every_config() {
+        assert_eq!(kind_label(&local()), "Local");
+        assert_eq!(
+            kind_label(&ForwardConfig::Remote {
+                bind_address: "localhost".into(),
+                bind_port: 8080,
+                target_host: "db.internal".into(),
+                target_port: 5432,
+            }),
+            "Remote"
+        );
+        assert_eq!(
+            kind_label(&ForwardConfig::Dynamic {
+                bind_address: "localhost".into(),
+                bind_port: 1080,
+            }),
+            "Dynamic"
+        );
     }
 }
