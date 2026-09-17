@@ -4,6 +4,10 @@
 //! milestone 1. This is milestone 2: the pane next to it is a real terminal
 //! backed by the `sshdeck-core` transport and the `sshdeck-terminal` grid.
 
+mod keys_pane;
+mod palette;
+mod settings;
+mod sftp_pane;
 mod terminal;
 
 use gpui_kit::component::{

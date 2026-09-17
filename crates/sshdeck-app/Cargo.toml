@@ -12,6 +12,12 @@ path = "src/main.rs"
 gpui-kit = "0.6"
 sshdeck-core = { path = "../sshdeck-core" }
 sshdeck-terminal = { path = "../sshdeck-terminal" }
+# Declared up front so that parallel workstreams can add UI modules without
+# racing on this manifest. An unused path dependency costs nothing.
+sshdeck-autocomplete = { path = "../sshdeck-autocomplete" }
+sshdeck-import = { path = "../sshdeck-import" }
+sshdeck-sftp = { path = "../sshdeck-sftp" }
+sshdeck-vault = { path = "../sshdeck-vault" }
 # `Session::events` hands back an `async_channel::Receiver`; the pane has to name
 # that type to poll it. Same version sshdeck-core already pins, so Cargo unifies
 # them and no extra code is compiled in.

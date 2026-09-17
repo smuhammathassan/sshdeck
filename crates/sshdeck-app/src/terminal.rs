@@ -12,8 +12,8 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, font, px, AppContext as _, Bounds, Context, Div, FocusHandle, FontWeight, KeyDownEvent,
-    ParentElement as _, Render, Rgba, SharedString, Styled as _, Window,
+    div, font, px, Bounds, Context, Div, FocusHandle, FontWeight, KeyDownEvent, ParentElement as _,
+    Render, Rgba, SharedString, Styled as _, Window,
 };
 use gpui_kit::{InteractiveElement as _, IntoElement};
 use sshdeck_core::session::{Session, SessionConfig, SessionEvent};
@@ -451,7 +451,7 @@ impl TerminalPane {
                     .whitespace_nowrap()
                     .font_family("Menlo")
                     .text_size(px(FONT_SIZE))
-                    .line_height(px(cell_h).into())
+                    .line_height(px(cell_h))
                     .text_color(fg)
                     .when(run.style.bold, |el| el.font_weight(FontWeight::BOLD))
                     .when(run.style.italic, |el| el.italic())
