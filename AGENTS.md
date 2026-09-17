@@ -72,6 +72,7 @@ not the prose.
 | --- | --- |
 | `cx.theme().surface` | No such field — `Theme` derefs to `ThemeColor`, which has no `surface`. Use `cx.theme().sidebar` for panel/sidebar backgrounds. |
 | Accent colours listed as flat fields | Not all documented names exist; check `theme/theme_color.rs` before using one. |
+| `cx.theme().destructive` (usage.md "Theming") | No such field. `ThemeColor` has `danger` / `danger_foreground` instead; verified in `theme/theme_color.rs` (gpui-component 0.6.1). |
 | `gpui_kit::component::ButtonVariants` | Not re-exported at the component root. Import from `gpui_kit::component::button::{Button, ButtonVariants as _}`. |
 | `Styled::overflow_y_scroll` | Removed. Use `ScrollableElement::overflow_y_scrollbar`. |
 | `Theme::toggle_mode(cx)` | Does not exist. Use `Theme::change(mode, Some(window), cx)`. |
