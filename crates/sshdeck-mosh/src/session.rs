@@ -471,14 +471,14 @@ mod tests {
 
     #[test]
     fn a_program_that_cannot_be_executed_is_a_spawn_error() {
-        let err = MoshSession::spawn_argv(
+        let Err(err) = MoshSession::spawn_argv(
             Path::new("/nonexistent/definitely-not-mosh"),
             &[],
             &no_env(),
             MoshTerminalSize::default(),
-        )
-        .err()
-        .expect("must not spawn a missing program");
+        ) else {
+            panic!("must not spawn a missing program");
+        };
         assert!(matches!(err, MoshError::Spawn(_)), "got {err:?}");
     }
 
@@ -486,9 +486,9 @@ mod tests {
     fn spawn_rejects_an_invalid_invocation_before_any_pty_is_open() {
         let binary = MoshBinary::detect(Some(Path::new("/bin/echo"))).expect("echo is executable");
         let invocation = MoshInvocation::new("   ");
-        let err = MoshSession::spawn(&binary, &invocation, MoshTerminalSize::default())
-            .err()
-            .expect("an empty host must not be spawned");
+        let Err(err) = MoshSession::spawn(&binary, &invocation, MoshTerminalSize::default()) else {
+            panic!("an empty host must not be spawned");
+        };
         assert!(matches!(err, MoshError::Invalid(_)), "got {err:?}");
     }
 

@@ -178,8 +178,7 @@ mod tests {
     fn a_path_without_mosh_is_a_typed_error() {
         let empty = empty_dir("missing");
         let err = MoshBinary::detect_in(None, Some(empty.as_os_str()))
-            .err()
-            .expect("an empty directory on PATH must not find mosh");
+            .expect_err("an empty directory on PATH must not find mosh");
         assert!(matches!(err, MoshError::NotFound(_)), "got {err:?}");
         let message = err.to_string();
         assert!(message.contains("mosh"), "must name the program: {message}");
@@ -191,9 +190,7 @@ mod tests {
 
     #[test]
     fn an_unset_path_is_a_typed_error() {
-        let err = MoshBinary::detect_in(None, None)
-            .err()
-            .expect("no PATH must not find mosh");
+        let err = MoshBinary::detect_in(None, None).expect_err("no PATH must not find mosh");
         assert!(matches!(err, MoshError::NotFound(_)), "got {err:?}");
     }
 
@@ -201,8 +198,7 @@ mod tests {
     fn a_named_path_that_is_not_a_file_is_a_typed_error() {
         let missing = empty_dir("named").join("nope");
         let err = MoshBinary::detect_in(Some(&missing), None)
-            .err()
-            .expect("a nonexistent override must not be accepted");
+            .expect_err("a nonexistent override must not be accepted");
         assert!(matches!(err, MoshError::NotFound(_)), "got {err:?}");
         assert!(err.to_string().contains("nope"), "got {err}");
     }
@@ -221,8 +217,7 @@ mod tests {
         std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").expect("writes the fake mosh");
 
         let err = MoshBinary::detect_in(None, Some(dir.as_os_str()))
-            .err()
-            .expect("a non-executable file is not a mosh");
+            .expect_err("a non-executable file is not a mosh");
         assert!(matches!(err, MoshError::NotFound(_)), "got {err:?}");
 
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
