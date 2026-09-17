@@ -25,9 +25,20 @@ jobs:
       - run: cargo build -p sshdeck-app --release
       - name: Package
         run: |
-          tar -czf sshdeck-macos-arm64.tar.gz -C target/release sshdeck
-          ls -lh sshdeck-macos-arm64.tar.gz
-          du -h target/release/sshdeck
+          set -euo pipefail
+          # A bare Mach-O is not a macOS app: it gets no proper window-server
+          # identity, no Dock entry, and automation cannot resolve its window.
+          # Ship a real .app bundle.
+          VERSION=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+          APP=target/release/sshdeck.app
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/sshdeck "$APP/Contents/MacOS/sshdeck"
+          sed "s/__VERSION__/$VERSION/" packaging/Info.plist > "$APP/Contents/Info.plist"
+          plutil -lint "$APP/Contents/Info.plist"
+          tar -czf sshdeck-macos-arm64.tar.gz -C target/release sshdeck.app
+          echo "--- bundle ---"; find "$APP" -type f
+          echo "--- sizes ---"; du -h target/release/sshdeck; ls -lh sshdeck-macos-arm64.tar.gz
       # Always upload as a workflow artifact so a manual dispatch (which has no
       # tag) still produces something downloadable via `gh run download`.
       - uses: actions/upload-artifact@v4
