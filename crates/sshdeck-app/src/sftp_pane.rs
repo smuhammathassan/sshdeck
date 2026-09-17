@@ -28,7 +28,7 @@
 //! process without bound (docs/BUDGET.md).
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::progress::Progress;
@@ -38,8 +38,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, px, Context, Div, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, Styled as _, Window,
+    div, px, AnyElement, Context, Div, FocusHandle, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, Styled as _, Window,
 };
 use sshdeck_sftp::{
     DirEntry, FileKind, SftpClient, SftpError, TransferEvent, TransferId, TransferState,
@@ -297,10 +297,53 @@ impl SftpPane {
         .detach();
     }
 
-    /// The header: parent/refresh actions and the breadcrumb trail.
+    /// The pane's title bar: the remote half of the SFTP screen.
+    ///
+    /// The reference labels each half with its host; this pane is remote-only,
+    /// so it says "Remote" and carries the count of the listing it is showing.
+    fn render_header(&self, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let connected = self.client.is_some();
+        let counting = connected && !self.loading && self.error.is_none();
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(40.))
+            .px_3()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::new(IconName::Globe).small().text_color(if connected {
+                        cx.theme().primary
+                    } else {
+                        muted
+                    }))
+                    .child(div().text_sm().child("Remote")),
+            )
+            .when(counting, |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("{} items", self.entries.len())),
+                )
+            })
+    }
+
+    /// The navigation toolbar: parent/refresh actions and the breadcrumb trail.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
+        let folder_tint = cx.theme().primary;
         let has_parent = parent_path(&self.cwd).is_some();
         let connected = self.client.is_some();
 
@@ -320,27 +363,43 @@ impl SftpPane {
             .disabled(!connected)
             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)));
 
-        let crumbs: Vec<Button> = breadcrumbs(&self.cwd)
-            .into_iter()
-            .map(|(label, path)| {
-                let crumb_label = label.clone();
-                let crumb_path = path.clone();
+        // Each crumb is a folder glyph plus its name, separated by a chevron;
+        // like the reference, the trail starts at the first real segment.
+        let mut trail: Vec<AnyElement> = Vec::new();
+        for (index, (label, path)) in breadcrumb_crumbs(&self.cwd).into_iter().enumerate() {
+            if index > 0 {
+                trail.push(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("›")
+                        .into_any_element(),
+                );
+            }
+            trail.push(
+                Icon::new(IconName::Folder)
+                    .small()
+                    .text_color(folder_tint)
+                    .into_any_element(),
+            );
+            trail.push(
                 Button::new(format!("sftp-crumb-{path}"))
                     .ghost()
                     .xsmall()
-                    .label(crumb_label)
+                    .label(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.navigate(crumb_path.clone(), cx);
+                        this.navigate(path.clone(), cx);
                     }))
-            })
-            .collect();
+                    .into_any_element(),
+            );
+        }
 
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap_1()
-            .h(px(36.))
+            .h(px(40.))
             .px_2()
             .flex_shrink_0()
             .border_b_1()
@@ -349,23 +408,22 @@ impl SftpPane {
             .child(refresh)
             .child(
                 div()
-                    .id("sftp-breadcrumbs")
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_1()
                     .flex_1()
                     .overflow_x_scrollbar()
-                    .children(crumbs)
                     .when(self.cwd.is_empty(), |el| {
                         el.child(
                             div()
                                 .px_1()
                                 .text_xs()
                                 .text_color(muted)
-                                .child("Not connected"),
+                                .child(if connected { "…" } else { "Not connected" }),
                         )
-                    }),
+                    })
+                    .children(trail),
             )
     }
 
@@ -450,32 +508,30 @@ impl SftpPane {
             .flex_row()
             .items_center()
             .gap_2()
-            .px_2()
+            .px_3()
             .py_1()
             .flex_shrink_0()
             .text_xs()
             .text_color(muted)
             .border_b_1()
             .border_color(border)
-            .child(div().flex_1().child("NAME"))
-            .child(div().w(px(80.)).child("KIND"))
-            .child(div().w(px(80.)).child("SIZE"))
-            .child(div().w(px(110.)).child("PERMISSIONS"))
-            .child(div().w(px(110.)).child("MODIFIED"));
+            .child(div().flex_1().child("Name"))
+            .child(div().w(px(170.)).child("Date Modified"))
+            .child(div().w(px(90.)).child("Size"))
+            .child(div().w(px(80.)).child("Kind"));
 
-        let now = SystemTime::now();
         let rows: Vec<_> = self
             .entries
             .iter()
             .enumerate()
-            .map(|(index, entry)| self.render_entry(index, entry, now, cx))
+            .map(|(index, entry)| self.render_entry(index, entry, cx))
             .collect();
 
         let mut container = body.child(header).children(rows);
         if self.truncated {
             container = container.child(
                 div()
-                    .px_2()
+                    .px_3()
                     .py_1()
                     .text_xs()
                     .text_color(muted)
@@ -485,7 +541,8 @@ impl SftpPane {
         container
     }
 
-    /// One directory row.
+    /// One directory row: a category-tinted kind icon, the name over its mode
+    /// string, then the date, size and kind columns.
     ///
     /// Returns `impl IntoElement` because `.id(..)` wraps the div in a
     /// `Stateful<Div>`; naming that wrapper would leak the gpui-kit type here.
@@ -493,27 +550,32 @@ impl SftpPane {
         &self,
         index: usize,
         entry: &DirEntry,
-        now: SystemTime,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
-        let foreground = cx.theme().foreground;
         let border = cx.theme().border;
+        let hover_bg = cx.theme().accent;
         let selected_bg = cx.theme().muted;
 
         let name = entry.name().to_string();
         let is_dir = entry.is_dir();
         let icon = kind_icon(entry.kind());
+        let icon_tint = match entry.kind() {
+            FileKind::Dir => cx.theme().primary,
+            FileKind::Symlink => cx.theme().success,
+            FileKind::File | FileKind::Other => muted,
+        };
         let kind = kind_label(entry.kind());
         let mode = entry.mode_string();
+        // The reference leaves folder sizes blank as `--`.
         let size = if is_dir {
-            "—".to_string()
+            "--".to_string()
         } else {
             human_size(entry.size())
         };
         let modified = entry
             .modified()
-            .map(|time| relative_age(time, now))
+            .map(format_modified)
             .unwrap_or_else(|| "—".to_string());
         let activate = name.clone();
         let selected = self.selected == Some(index);
@@ -525,12 +587,13 @@ impl SftpPane {
             .items_center()
             .gap_2()
             .w_full()
-            .px_2()
-            .py_1()
+            .px_3()
+            .py_2()
             .cursor_pointer()
             .border_b_1()
             .border_color(border)
             .when(selected, |el| el.bg(selected_bg))
+            .hover(move |el| el.bg(hover_bg))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected = Some(index);
                 cx.notify();
@@ -540,28 +603,40 @@ impl SftpPane {
                     this.activate(&activate, cx);
                 }
             }))
-            .child(
-                Icon::new(icon)
-                    .small()
-                    .text_color(if is_dir { foreground } else { muted }),
-            )
+            .child(Icon::new(icon).small().text_color(icon_tint))
             .child(
                 div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
+                    .min_w(px(0.))
                     .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(name),
+                    .child(div().overflow_hidden().whitespace_nowrap().child(name))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .font_family("Menlo")
+                            .child(mode),
+                    ),
             )
-            .child(div().w(px(80.)).text_xs().text_color(muted).child(kind))
-            .child(div().w(px(80.)).text_xs().text_color(muted).child(size))
-            .child(div().w(px(110.)).text_xs().text_color(muted).child(mode))
             .child(
                 div()
-                    .w(px(110.))
+                    .w(px(170.))
                     .text_xs()
                     .text_color(muted)
+                    .font_family("Menlo")
                     .child(modified),
             )
+            .child(
+                div()
+                    .w(px(90.))
+                    .text_xs()
+                    .text_color(muted)
+                    .font_family("Menlo")
+                    .child(size),
+            )
+            .child(div().w(px(80.)).text_xs().text_color(muted).child(kind))
     }
 
     /// The transfer queue at the foot of the pane.
@@ -708,6 +783,7 @@ impl Render for SftpPane {
             .bg(background)
             .text_color(foreground)
             .track_focus(&self.focus_handle)
+            .child(self.render_header(cx))
             .child(self.render_toolbar(cx))
             .child(self.render_body(cx))
             .child(self.render_transfers(cx))
@@ -755,18 +831,71 @@ fn breadcrumbs(path: &str) -> Vec<(String, String)> {
     crumbs
 }
 
-/// A short "how long ago" label for the modified column.
-fn relative_age(modified: SystemTime, now: SystemTime) -> String {
-    let seconds = now
-        .duration_since(modified)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
-    match seconds {
-        0..=59 => "just now".to_string(),
-        60..=3_599 => format!("{}m ago", seconds / 60),
-        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
-        _ => format!("{}d ago", seconds / 86_400),
+/// The trail the pane renders: the crate-style breadcrumbs with the bare root
+/// crumb dropped, so it starts at the first real segment like the reference.
+///
+/// At the root (only the `/` crumb) the trail is kept, so the user still has a
+/// link back to `/`.
+fn breadcrumb_crumbs(path: &str) -> Vec<(String, String)> {
+    let crumbs = breadcrumbs(path);
+    if crumbs.len() > 1 {
+        crumbs
+            .into_iter()
+            .filter(|(label, _)| label != "/")
+            .collect()
+    } else {
+        crumbs
     }
+}
+
+/// `M/D/YYYY, h:MM AM/PM` for the Date Modified column.
+///
+/// ponytail: `std` has no local time zone, so this renders UTC. The value is
+/// still the server's UNIX mtime, just not shifted; upgrade to local time when a
+/// calendar crate is already in the tree.
+fn format_modified(modified: SystemTime) -> String {
+    let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) else {
+        return "—".to_string();
+    };
+    let seconds = since.as_secs();
+    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
+    let day_seconds = seconds % 86_400;
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let (hour12, meridiem) = match hour {
+        0 => (12, "AM"),
+        1..=11 => (hour, "AM"),
+        12 => (12, "PM"),
+        _ => (hour - 12, "PM"),
+    };
+    format!("{month}/{day}/{year}, {hour12}:{minute:02} {meridiem}")
+}
+
+/// Days since the UNIX epoch to a proleptic-Gregorian `(year, month, day)`.
+///
+/// Howard Hinnant's `civil_from_days`, exact for every `i64` day count; `std`
+/// has no calendar, and this is the small checkable core of [`format_modified`].
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = (shifted - era * 146_097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 {
+        (month_prime + 3) as u32
+    } else {
+        (month_prime - 9) as u32
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
 }
 
 /// A one-word kind for the kind column.
@@ -803,7 +932,7 @@ fn describe_failure(path: &str, error: &SftpError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::UNIX_EPOCH;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn human_size_uses_binary_units() {
@@ -839,20 +968,28 @@ mod tests {
     }
 
     #[test]
-    fn relative_age_buckets_into_minutes_hours_days() {
-        let now = UNIX_EPOCH + Duration::from_secs(10 * 86_400);
-        assert_eq!(relative_age(now, now), "just now");
+    fn breadcrumb_crumbs_drop_the_bare_root() {
         assert_eq!(
-            relative_age(now - Duration::from_secs(5 * 60), now),
-            "5m ago"
+            breadcrumb_crumbs("/home/user"),
+            vec![
+                ("home".to_string(), "/home".to_string()),
+                ("user".to_string(), "/home/user".to_string()),
+            ]
         );
+        // At the root the single crumb is kept so `/` stays reachable.
         assert_eq!(
-            relative_age(now - Duration::from_secs(3 * 3_600), now),
-            "3h ago"
+            breadcrumb_crumbs("/"),
+            vec![("/".to_string(), "/".to_string())]
         );
-        assert_eq!(
-            relative_age(now - Duration::from_secs(2 * 86_400), now),
-            "2d ago"
-        );
+        assert!(breadcrumb_crumbs("").is_empty());
+    }
+
+    #[test]
+    fn format_modified_renders_utc_calendar_time() {
+        let at = |seconds| format_modified(UNIX_EPOCH + Duration::from_secs(seconds));
+        assert_eq!(at(0), "1/1/1970, 12:00 AM");
+        assert_eq!(at(43_200), "1/1/1970, 12:00 PM");
+        // The reference's own date column, e.g. `9/17/2026, 9:03 AM`.
+        assert_eq!(at(1_789_635_780), "9/17/2026, 9:03 AM");
     }
 }
