@@ -25,13 +25,16 @@
 //!     settings_view.read(cx).font_size(),
 //!     settings_view.read(cx).scrollback_lines(),
 //!     settings_view.read(cx).cursor_blink(),
-//! );
+//! )
+//! .with_scheme(settings_view.read(cx).scheme());
 //! let pane = cx.new(|cx| TerminalPane::new_with_options(config, options, window, cx));
 //! ```
 //!
 //! The scrollback cap is fixed when the grid is created, so changing it later
 //! requires rebuilding the pane; `TerminalOptions` never raises it above
-//! [`SCROLLBACK_LINES`].
+//! [`SCROLLBACK_LINES`]. The colour scheme ([`TerminalScheme`], one of
+//! [`SCHEMES`]) supplies the grid, background and cursor colours, so a dark
+//! scheme stays dark even when the app theme is light.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,7 +80,9 @@ const MAX_IDX: u8 = 255;
 /// Levels of the 6x6x6 colour cube used by xterm-256 palette entries 16-231.
 const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
-/// The conventional xterm/ANSI palette for indices 0-15.
+/// The conventional xterm/ANSI palette for indices 0-15. It is the ANSI table of
+/// the default scheme, so a pane with no explicit scheme keeps drawing exactly
+/// the colours it always has.
 const BASIC_COLORS: [[u8; 3]; 16] = [
     [0, 0, 0],
     [205, 0, 0],
@@ -97,31 +102,267 @@ const BASIC_COLORS: [[u8; 3]; 16] = [
     [255, 255, 255],
 ];
 
-/// Renders a `vt100::Color` as RGB.
-///
-/// `Default` is reported as `None` so the caller can substitute the theme
-/// foreground or background; a hardcoded black would be invisible on a dark
-/// theme.
-///
-/// Indexed colours follow the standard xterm-256 rule: 0-15 are the basic ANSI
-/// palette, 16-231 index the 6x6x6 cube above, and 232-255 are the 24-step grey
-/// ramp from 8 to 238.
-#[must_use]
-pub fn color_to_rgb(color: Color) -> Option<Rgba> {
-    let rgba = |[r, g, b]: [u8; 3]| Rgba {
+/// Packs 8-bit sRGB channels into the `Rgba` the renderer paints.
+fn rgb([r, g, b]: [u8; 3]) -> Rgba {
+    Rgba {
         r: f32::from(r) / 255.0,
         g: f32::from(g) / 255.0,
         b: f32::from(b) / 255.0,
         a: 1.0,
-    };
+    }
+}
+
+/// The same colour at `alpha` opacity. `Rgba` has no `opacity` method (only
+/// `Hsla` does), so the alpha channel is set directly.
+fn translucent(color: Rgba, alpha: f32) -> Rgba {
+    Rgba { a: alpha, ..color }
+}
+
+/// One named terminal colour scheme: the 16 ANSI colours a remote program can
+/// select, plus the colours a cell uses when it asks for `Default`.
+///
+/// A `Default` cell is *not* folded into an index — [`color_to_rgb`] reports it
+/// as `None` so the renderer can substitute the scheme's
+/// [`foreground`](Self::foreground) or [`background`](Self::background). Those
+/// two are the only way to keep a default foreground and a default background
+/// distinct, since the engine reports both as `Color::Default`.
+///
+/// Colours are stored as 8-bit sRGB and converted on read, so a scheme is a
+/// small `Copy` value: no allocation, and nothing that can grow at runtime.
+///
+/// # Provenance
+///
+/// - `sshdeck Dark` reproduces the historical behaviour: the conventional
+///   xterm/ANSI 16, with the app's dark terminal colours behind it.
+/// - `Termius Dark` / `Termius Light` are built only from the exact tokens in
+///   `docs/UI-PARITY.md` (recovered from Termius's own stylesheet). No value is
+///   invented. Termius ships a single teal token, so `bright_cyan` reuses it.
+/// - `Solarized Dark` is Ethan Schoonover's Solarized 16-colour terminal
+///   mapping (<https://ethanschoonover.com/solarized/>).
+/// - `Dracula` is the Dracula theme's terminal palette
+///   (<https://draculatheme.com/terminal>).
+/// - `Nord` is the Nord theme's terminal palette
+///   (<https://www.nordtheme.com/docs/colors-and-palettes>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalScheme {
+    foreground: [u8; 3],
+    background: [u8; 3],
+    cursor: [u8; 3],
+    ansi: [[u8; 3]; 16],
+}
+
+impl TerminalScheme {
+    /// Colour a `Default` foreground resolves to.
+    #[must_use]
+    pub fn foreground(&self) -> Rgba {
+        rgb(self.foreground)
+    }
+
+    /// Colour a `Default` background resolves to, and the pane's own fill.
+    #[must_use]
+    pub fn background(&self) -> Rgba {
+        rgb(self.background)
+    }
+
+    /// Block-cursor colour. The renderer paints it translucent so the glyph
+    /// underneath stays readable.
+    #[must_use]
+    pub fn cursor(&self) -> Rgba {
+        rgb(self.cursor)
+    }
+
+    /// ANSI colour `index` (0-15), or `None` outside that range. The engine
+    /// reports indices as `u8`, so an out-of-range value is rejected rather
+    /// than silently wrapped into the table.
+    #[must_use]
+    pub fn ansi(&self, index: u8) -> Option<Rgba> {
+        self.ansi.get(usize::from(index)).copied().map(rgb)
+    }
+
+    /// Looks a scheme up by the name in [`SCHEMES`]; `None` when unknown.
+    ///
+    /// The registry is a fixed array, so a lookup is a linear scan over six
+    /// entries with no allocation and no unbounded state.
+    #[allow(dead_code)] // Read by the settings/picker surface, not by the pane.
+    #[must_use]
+    pub fn by_name(name: &str) -> Option<Self> {
+        SCHEMES
+            .iter()
+            .find(|entry| entry.0 == name)
+            .map(|entry| entry.1)
+    }
+}
+
+/// The selectable schemes, each paired with its display name. The first entry is
+/// the [`Default`] scheme.
+pub const SCHEMES: [(&'static str, TerminalScheme); 6] = [
+    (
+        "sshdeck Dark",
+        TerminalScheme {
+            foreground: [247, 249, 250], // #f7f9fa
+            background: [20, 23, 41],    // #141729
+            cursor: [32, 145, 246],      // #2091f6
+            ansi: BASIC_COLORS,
+        },
+    ),
+    (
+        "Termius Dark",
+        TerminalScheme {
+            foreground: [255, 255, 255], // --text-primary (white)
+            background: [20, 23, 41],    // --cf-main-background / grey-1
+            cursor: [32, 145, 246],      // blue accent
+            ansi: [
+                [29, 32, 51],    // grey-2  #1d2033  (surface / black)
+                [242, 94, 97],   // red     #f25e61
+                [33, 181, 104],  // green   #21b568
+                [242, 201, 76],  // yellow  #f2c94c
+                [24, 108, 181],  // blue-dark #186cb5
+                [175, 95, 255],  // purple  #af5fff
+                [84, 210, 210],  // teal    #54d2d2
+                [213, 221, 224], // grey-4 #d5dde0
+                [90, 94, 115],   // grey-6  #5a5e73  (bright black)
+                [255, 115, 117], // red-light #ff7375
+                [0, 214, 122],   // green-light #00d67a
+                [255, 203, 0],   // bright-yellow #ffcb00
+                [32, 145, 246],  // blue accent  #2091f6  (bright blue)
+                [160, 66, 255],  // vivid-purple #a042ff
+                [84, 210, 210],  // teal (only teal token)
+                [247, 249, 250], // grey-7 #f7f9fa
+            ],
+        },
+    ),
+    (
+        "Termius Light",
+        TerminalScheme {
+            foreground: [20, 23, 41],    // #141729
+            background: [247, 249, 250], // grey-7 #f7f9fa
+            cursor: [32, 145, 246],      // blue accent
+            ansi: [
+                [20, 23, 41],    // #141729
+                [242, 94, 97],   // red #f25e61
+                [33, 181, 104],  // green #21b568
+                [242, 201, 76],  // yellow #f2c94c
+                [32, 145, 246],  // blue #2091f6
+                [175, 95, 255],  // purple #af5fff
+                [84, 210, 210],  // teal #54d2d2
+                [164, 179, 186], // grey-3 light #a4b3ba
+                [90, 94, 115],   // grey-6 #5a5e73
+                [255, 115, 117], // red-light #ff7375
+                [0, 214, 122],   // green-light #00d67a
+                [255, 203, 0],   // bright-yellow #ffcb00
+                [24, 108, 181],  // blue-dark #186cb5
+                [160, 66, 255],  // vivid-purple #a042ff
+                [84, 210, 210],  // teal #54d2d2
+                [247, 249, 250], // grey-7 #f7f9fa
+            ],
+        },
+    ),
+    (
+        "Solarized Dark",
+        TerminalScheme {
+            foreground: [131, 148, 150], // base0 #839496
+            background: [0, 43, 54],     // base03 #002b36
+            cursor: [131, 148, 150],     // base0
+            ansi: [
+                [7, 54, 66],     // base02  #073642
+                [220, 50, 47],   // red     #dc322f
+                [133, 153, 0],   // green   #859900
+                [181, 137, 0],   // yellow  #b58900
+                [38, 139, 210],  // blue    #268bd2
+                [211, 54, 130],  // magenta #d33682
+                [42, 161, 152],  // cyan    #2aa198
+                [238, 232, 213], // base2   #eee8d5
+                [0, 43, 54],     // base03  #002b36
+                [203, 75, 22],   // orange  #cb4b16
+                [88, 110, 117],  // base01  #586e75
+                [101, 123, 131], // base00  #657b83
+                [131, 148, 150], // base0   #839496
+                [108, 113, 196], // violet  #6c71c4
+                [147, 161, 161], // base1   #93a1a1
+                [253, 246, 227], // base3   #fdf6e3
+            ],
+        },
+    ),
+    (
+        "Dracula",
+        TerminalScheme {
+            foreground: [248, 248, 242], // #f8f8f2
+            background: [40, 42, 54],    // #282a36
+            cursor: [248, 248, 242],
+            ansi: [
+                [33, 34, 44],    // #21222c
+                [255, 85, 85],   // #ff5555
+                [80, 250, 123],  // #50fa7b
+                [241, 250, 140], // #f1fa8c
+                [189, 147, 249], // #bd93f9
+                [255, 121, 198], // #ff79c6
+                [139, 233, 253], // #8be9fd
+                [248, 248, 242], // #f8f8f2
+                [98, 114, 164],  // #6272a4
+                [255, 110, 110], // #ff6e6e
+                [105, 255, 148], // #69ff94
+                [255, 255, 165], // #ffffa5
+                [214, 172, 255], // #d6acff
+                [255, 146, 223], // #ff92df
+                [164, 255, 255], // #a4ffff
+                [255, 255, 255], // #ffffff
+            ],
+        },
+    ),
+    (
+        "Nord",
+        TerminalScheme {
+            foreground: [216, 222, 233], // nord4 #d8dee9
+            background: [46, 52, 64],    // nord0 #2e3440
+            cursor: [216, 222, 233],     // nord4
+            ansi: [
+                [46, 52, 64],    // nord0 #2e3440
+                [191, 97, 106],  // nord11 #bf616a
+                [163, 190, 140], // nord14 #a3be8c
+                [235, 203, 139], // nord13 #ebcb8b
+                [129, 161, 193], // nord9 #81a1c1
+                [180, 142, 173], // nord15 #b48ead
+                [136, 192, 208], // nord8 #88c0d0
+                [216, 222, 233], // nord4 #d8dee9
+                [76, 86, 106],   // nord3 #4c566a
+                [191, 97, 106],  // nord11
+                [163, 190, 140], // nord14
+                [235, 203, 139], // nord13
+                [94, 129, 172],  // nord10 #5e81ac
+                [180, 142, 173], // nord15
+                [143, 188, 187], // nord7 #8fbcbb
+                [236, 239, 244], // nord6 #eceff4
+            ],
+        },
+    ),
+];
+
+impl Default for TerminalScheme {
+    fn default() -> Self {
+        // `SCHEMES` is a fixed six-entry array, so index 0 is always in bounds.
+        SCHEMES[0].1
+    }
+}
+
+/// Renders a `vt100::Color` as RGB under the given scheme.
+///
+/// `Default` is reported as `None` so the caller can substitute the scheme's
+/// foreground or background; a hardcoded black would be invisible on a dark
+/// scheme.
+///
+/// Indexed colours follow the standard xterm-256 rule: 0-15 come from the
+/// scheme's ANSI table, 16-231 index the 6x6x6 cube above, and 232-255 are the
+/// 24-step grey ramp from 8 to 238.
+#[must_use]
+pub fn color_to_rgb(color: Color, scheme: &TerminalScheme) -> Option<Rgba> {
     match color {
         Color::Default => None,
-        Color::Rgb(r, g, b) => Some(rgba([r, g, b])),
+        Color::Rgb(r, g, b) => Some(rgb([r, g, b])),
         Color::Idx(index) => match index {
-            0..=15 => Some(rgba(BASIC_COLORS[usize::from(index)])),
+            0..=15 => scheme.ansi(index),
             16..=231 => {
                 let n = usize::from(index) - 16;
-                Some(rgba([
+                Some(rgb([
                     CUBE_LEVELS[(n / 36) % 6],
                     CUBE_LEVELS[(n / 6) % 6],
                     CUBE_LEVELS[n % 6],
@@ -131,7 +372,7 @@ pub fn color_to_rgb(color: Color) -> Option<Rgba> {
             _ => {
                 debug_assert!(index <= MAX_IDX, "vt100 colour indices are u8");
                 let grey = 8 + 10 * (index - 232);
-                Some(rgba([grey, grey, grey]))
+                Some(rgb([grey, grey, grey]))
             }
         },
     }
@@ -164,7 +405,7 @@ struct Run {
 ///
 /// A cell with no contents still joins a run, so runs keep their width in
 /// columns; dropping blanks would slide the characters after them leftwards.
-fn coalesce_row<'a>(cells: impl Iterator<Item = Cell<'a>>) -> Vec<Run> {
+fn coalesce_row<'a>(cells: impl Iterator<Item = Cell<'a>>, scheme: &TerminalScheme) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
     for (col, cell) in cells.enumerate() {
         let style = CellStyle {
@@ -172,8 +413,8 @@ fn coalesce_row<'a>(cells: impl Iterator<Item = Cell<'a>>) -> Vec<Run> {
             italic: cell.italic(),
             underline: cell.underline(),
             inverse: cell.inverse(),
-            fg: color_to_rgb(cell.fg()),
-            bg: color_to_rgb(cell.bg()),
+            fg: color_to_rgb(cell.fg(), scheme),
+            bg: color_to_rgb(cell.bg(), scheme),
         };
         if let Some(run) = runs.last_mut() {
             // `col` is a running index into one row, so it cannot overflow u16
@@ -204,12 +445,16 @@ pub struct TerminalOptions {
     font_size: f32,
     scrollback_lines: usize,
     cursor_blink: bool,
+    scheme: TerminalScheme,
 }
 
 impl TerminalOptions {
     /// Clamps `font_size` into `MIN_FONT_SIZE..=MAX_FONT_SIZE` (a non-finite
     /// size falls back to [`FONT_SIZE`]) and `scrollback_lines` into
     /// `1..=SCROLLBACK_LINES`. There is deliberately no unbounded value.
+    ///
+    /// The colour scheme defaults to [`TerminalScheme::default`]; chain
+    /// [`with_scheme`](Self::with_scheme) to select another named scheme.
     #[must_use]
     pub fn new(font_size: f32, scrollback_lines: usize, cursor_blink: bool) -> Self {
         let font_size = if font_size.is_finite() {
@@ -221,6 +466,7 @@ impl TerminalOptions {
             font_size,
             scrollback_lines: scrollback_lines.clamp(1, SCROLLBACK_LINES),
             cursor_blink,
+            scheme: TerminalScheme::default(),
         }
     }
 
@@ -241,6 +487,22 @@ impl TerminalOptions {
     pub const fn cursor_blink(self) -> bool {
         self.cursor_blink
     }
+
+    /// The active colour scheme. The terminal grid, its background, and the
+    /// cursor all read their colours from this rather than the app theme.
+    #[must_use]
+    pub const fn scheme(self) -> TerminalScheme {
+        self.scheme
+    }
+
+    /// Selects a colour scheme. A scheme is a small `Copy` value, so this
+    /// cannot introduce unbounded state.
+    #[allow(dead_code)] // Read by the settings surface, not by the pane itself.
+    #[must_use]
+    pub const fn with_scheme(mut self, scheme: TerminalScheme) -> Self {
+        self.scheme = scheme;
+        self
+    }
 }
 
 impl Default for TerminalOptions {
@@ -249,6 +511,7 @@ impl Default for TerminalOptions {
             font_size: FONT_SIZE,
             scrollback_lines: SCROLLBACK_LINES,
             cursor_blink: true,
+            scheme: TerminalScheme::default(),
         }
     }
 }
@@ -850,30 +1113,17 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> Div {
         let (cell_w, cell_h) = self.cell;
-        let theme_fg = cx.theme().foreground;
-        let theme_bg = cx.theme().background;
+        let scheme = self.options.scheme();
         let selection_color = cx.theme().primary.opacity(0.30);
         let match_color = cx.theme().danger.opacity(0.28);
         let active_match_color = cx.theme().danger.opacity(0.55);
 
         // Inverse video swaps the two colours, which is how a terminal draws a
         // selection or a highlighted menu row. A `Default` slot resolves to the
-        // theme colour it is standing in for, so the swap stays legible on
-        // either theme. Theme slots are `Hsla`; a cell colour is `Rgba`, so
-        // convert the theme default to keep both arms the same type.
-        let colors = |run: &Run| -> (Rgba, Rgba) {
-            if run.style.inverse {
-                (
-                    run.style.bg.unwrap_or(theme_bg.into()),
-                    run.style.fg.unwrap_or(theme_fg.into()),
-                )
-            } else {
-                (
-                    run.style.fg.unwrap_or(theme_fg.into()),
-                    run.style.bg.unwrap_or(theme_bg.into()),
-                )
-            }
-        };
+        // scheme colour it is standing in for, so the swap stays legible on any
+        // scheme. This is also where a `Default` cell picks up the scheme's
+        // foreground or background, since `color_to_rgb` reports it as `None`.
+        let colors = |run: &Run| -> (Rgba, Rgba) { run_colors(&run.style, &scheme) };
 
         let mut line = div()
             .absolute()
@@ -969,7 +1219,9 @@ impl TerminalPane {
                     .top(px(0.0))
                     .w(px(cell_w))
                     .h(px(cell_h))
-                    .bg(theme_fg.opacity(0.4)),
+                    // The scheme's cursor colour, translucent so the glyph under
+                    // the block stays readable.
+                    .bg(translucent(scheme.cursor(), 0.4)),
             );
         }
 
@@ -1177,8 +1429,9 @@ fn measure_cell(window: &mut Window, font_size: f32) -> (f32, f32) {
 
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme_fg = cx.theme().foreground;
-        let theme_bg = cx.theme().background;
+        let scheme = self.options.scheme();
+        let scheme_fg = scheme.foreground();
+        let scheme_bg = scheme.background();
         let muted = cx.theme().muted_foreground;
         let panel_bg = cx.theme().popover;
         let panel_fg = cx.theme().popover_foreground;
@@ -1222,7 +1475,7 @@ impl Render for TerminalPane {
 
         let mut grid = div().relative().w_full().h(px(f32::from(rows) * cell_h));
         for row in 0..rows {
-            let runs = row_runs(&self.terminal, row);
+            let runs = row_runs(&self.terminal, row, &scheme);
             let selection = self
                 .selection
                 .and_then(|selection| selection_span(selection, row, cols));
@@ -1263,8 +1516,10 @@ impl Render for TerminalPane {
             .flex_1()
             .h_full()
             .overflow_hidden()
-            .bg(theme_bg)
-            .text_color(theme_fg)
+            // The pane's own fill and default text come from the scheme, not
+            // the app theme, so a dark scheme stays dark in light app mode.
+            .bg(scheme_bg)
+            .text_color(scheme_fg)
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.forward_key(event, cx);
@@ -1362,7 +1617,9 @@ impl Render for TerminalPane {
                     .left(px(12.0))
                     .bottom(px(12.0))
                     .text_xs()
-                    .text_color(muted)
+                    // Dimmed scheme foreground, so the message stays legible on
+                    // the scheme background whatever the app theme is.
+                    .text_color(translucent(scheme_fg, 0.6))
                     .child(SharedString::from(message)),
             );
         }
@@ -1373,7 +1630,7 @@ impl Render for TerminalPane {
                     .left(px(12.0))
                     .bottom(px(12.0))
                     .text_xs()
-                    .text_color(muted)
+                    .text_color(translucent(scheme_fg, 0.6))
                     .child("connecting…"),
             );
         }
@@ -1381,10 +1638,25 @@ impl Render for TerminalPane {
     }
 }
 
-/// The text runs for one visible row.
-fn row_runs(terminal: &Terminal, row: u16) -> Vec<Run> {
+/// The text runs for one visible row under `scheme`.
+fn row_runs(terminal: &Terminal, row: u16, scheme: &TerminalScheme) -> Vec<Run> {
     let cols = terminal.cols();
-    coalesce_row((0..cols).filter_map(move |col| terminal.cell(row, col)))
+    coalesce_row(
+        (0..cols).filter_map(move |col| terminal.cell(row, col)),
+        scheme,
+    )
+}
+
+/// The foreground and background a run resolves to. `Default` falls back to the
+/// scheme, and inverse video swaps the two — which is how a terminal draws a
+/// selection or a highlighted menu row.
+fn run_colors(style: &CellStyle, scheme: &TerminalScheme) -> (Rgba, Rgba) {
+    let (fg, bg) = (scheme.foreground(), scheme.background());
+    if style.inverse {
+        (style.bg.unwrap_or(bg), style.fg.unwrap_or(fg))
+    } else {
+        (style.fg.unwrap_or(fg), style.bg.unwrap_or(bg))
+    }
 }
 
 #[cfg(test)]
@@ -1402,13 +1674,24 @@ mod tests {
 
     /// Every conversion below is expected to produce a colour.
     fn bytes_of(color: Color) -> [u8; 3] {
-        let rgb = color_to_rgb(color).expect("colour has a value");
-        bytes(rgb)
+        let scheme = TerminalScheme::default();
+        bytes(color_to_rgb(color, &scheme).expect("colour has a value"))
+    }
+
+    /// The same, under an explicit scheme.
+    fn bytes_of_scheme(color: Color, scheme: &TerminalScheme) -> [u8; 3] {
+        bytes(color_to_rgb(color, scheme).expect("colour has a value"))
+    }
+
+    /// Looks a named scheme up, failing loudly if the registry lost it.
+    fn scheme(name: &str) -> TerminalScheme {
+        TerminalScheme::by_name(name).expect("scheme exists")
     }
 
     #[test]
-    fn default_color_defers_to_the_theme() {
-        assert_eq!(color_to_rgb(Color::Default), None);
+    fn default_color_defers_to_the_scheme() {
+        let scheme = TerminalScheme::default();
+        assert_eq!(color_to_rgb(Color::Default, &scheme), None);
     }
 
     #[test]
@@ -1439,12 +1722,84 @@ mod tests {
 
     #[test]
     fn every_index_resolves_to_a_color() {
+        let scheme = TerminalScheme::default();
         for index in 0..=MAX_IDX {
             assert!(
-                color_to_rgb(Color::Idx(index)).is_some(),
+                color_to_rgb(Color::Idx(index), &scheme).is_some(),
                 "index {index} has no colour"
             );
         }
+    }
+
+    /// Every scheme carries a full 16-entry ANSI table, and index 16 is
+    /// rejected rather than wrapped back to index 0.
+    #[test]
+    fn every_scheme_has_exactly_sixteen_ansi_colors() {
+        for entry in &SCHEMES {
+            let (name, scheme) = (entry.0, &entry.1);
+            for index in 0..16u8 {
+                assert!(
+                    scheme.ansi(index).is_some(),
+                    "{name} is missing ANSI colour {index}"
+                );
+            }
+            assert!(
+                scheme.ansi(16).is_none(),
+                "{name} resolved an out-of-range ANSI index"
+            );
+        }
+    }
+
+    /// Indices 0-15 come from the active scheme; the cube from 16 up does not.
+    #[test]
+    fn scheme_indices_resolve_through_the_scheme_and_the_cube_does_not() {
+        let scheme = scheme("Dracula");
+        for index in 0..16u8 {
+            assert_eq!(
+                color_to_rgb(Color::Idx(index), &scheme),
+                scheme.ansi(index),
+                "index {index} did not resolve through the scheme"
+            );
+        }
+        // 196 is the pure-red corner of the 6x6x6 cube, independent of scheme.
+        assert_eq!(bytes_of_scheme(Color::Idx(196), &scheme), [255, 0, 0]);
+    }
+
+    /// A `Default` cell is drawn with the scheme's foreground and background,
+    /// and inverse video swaps them.
+    #[test]
+    fn default_cells_use_the_scheme_foreground_and_background() {
+        let scheme = scheme("Termius Dark");
+        let plain = CellStyle {
+            bold: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+            fg: None,
+            bg: None,
+        };
+        let (fg, bg) = run_colors(&plain, &scheme);
+        assert_eq!(bytes(fg), bytes(scheme.foreground()));
+        assert_eq!(bytes(bg), bytes(scheme.background()));
+
+        let inverse = CellStyle {
+            inverse: true,
+            ..plain
+        };
+        assert_eq!(run_colors(&inverse, &scheme), (bg, fg));
+    }
+
+    /// A scheme survives the trip into `TerminalOptions` unchanged, and the
+    /// default options carry the default scheme.
+    #[test]
+    fn scheme_round_trips_through_options() {
+        let chosen = scheme("Nord");
+        let options = TerminalOptions::new(13.0, 100, true).with_scheme(chosen);
+        assert_eq!(options.scheme(), chosen);
+        assert_eq!(
+            TerminalOptions::default().scheme(),
+            TerminalScheme::default()
+        );
     }
 
     #[test]
@@ -1475,7 +1830,7 @@ mod tests {
         let mut terminal = Terminal::new(9, 1, 10);
         terminal.feed(b"hello \x1b[31mred");
 
-        let runs = row_runs(&terminal, 0);
+        let runs = row_runs(&terminal, 0, &TerminalScheme::default());
         assert_eq!(runs.len(), 2, "expected one run per style change");
         assert_eq!(runs[0].start, 0);
         assert_eq!(runs[0].len, 6);
@@ -1496,7 +1851,7 @@ mod tests {
         let mut terminal = Terminal::new(80, 1, 10);
         terminal.feed(b"hi");
 
-        let runs = row_runs(&terminal, 0);
+        let runs = row_runs(&terminal, 0, &TerminalScheme::default());
         assert_eq!(runs.len(), 1, "an all-default row is one run");
         assert_eq!(runs[0].len, 80);
         assert_eq!(runs[0].text, "hi");
