@@ -7,8 +7,11 @@ on:
   workflow_dispatch:
 
 concurrency:
+  # Never cancel a run on main: several agents push independently, and
+  # cancel-in-progress meant no run on main ever finished, so nothing was
+  # actually verified. Superseded PR runs are still cancelled.
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
