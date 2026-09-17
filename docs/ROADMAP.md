@@ -8,16 +8,24 @@ domains) and `docs/re/FEATURES-CORE.md`.
 Termius is not one product. It is four, and only the first can be "cloned" from
 the client:
 
-| Tier | Contains | Cloneable? |
-| --- | --- | --- |
-| **A. Local terminal client** | hosts, vaults, SSH, terminal, keys, forwarding, SFTP, snippets, settings | Yes — open protocols |
-| **B. Local security** | SSH Id passkeys, security keys / FIDO2, certificates, known hosts, agent | Yes — CTAP2 / SSH agent are open |
-| **C. Ecosystem data** | shell autocomplete (~600 CLI specs) | Yes — the same upstream `withfig/autocomplete` specs are MIT |
-| **D. Server-backed** | sync & backup, teams & enterprise, billing & plans, cloud integrations (AWS/DO/Azure/GCP), AI | **No.** Their backend is not in the bundle. Ours or nothing. |
+| Tier | Contains | Cloneable? | Scope |
+| --- | --- | --- | --- |
+| **A. Local terminal client** | hosts, vaults, SSH, terminal, keys, forwarding, SFTP, snippets, settings | Yes — open protocols | **In** |
+| **B. Local security** | SSH Id passkeys, security keys / FIDO2, certificates, known hosts, agent | Yes — CTAP2 / SSH agent are open | **In** |
+| **C. Ecosystem data** | shell autocomplete (~600 CLI specs) | Yes — the same upstream `withfig/autocomplete` specs are MIT | **In** |
+| **D. Server-backed** | sync & backup, billing & plans, cloud integrations (AWS/DO/Azure/GCP), AI | **No.** Their backend is not in the bundle | Undecided |
+| **X. Cut by decision** | **teams & enterprise**, **serial connections** | n/a | **Out** |
 
-Of the 169 catalogued features, roughly **110 are Tier A/B**, **~5 are Tier C**,
-and **~54 are Tier D**. Stating that up front matters more than any date: "all
-Termius features" is only achievable for A/B/C.
+Of the 169 catalogued features: **~106 are Tier A/B**, **~5 are Tier C**, **~44
+are Tier D** (still undecided), and **14 are cut by decision**.
+
+Cutting teams also makes most of **billing & plans** moot — those plans exist to
+sell team seats, so with no backend there is nothing to bill for. Billing is
+treated as cut unless something changes.
+
+Serial is dropped for a second reason beyond taste: it is the only subsystem that
+needs device-level IOKit access and per-device driver quirks, which is a large
+amount of platform-specific code for the smallest feature in the catalogue.
 
 ## Phases
 
@@ -50,7 +58,7 @@ The moment it stops being a mockup. Everything else is worthless until this work
 - Known-host management UI, host key change warnings
 
 ### P5 — Breadth
-- Snippets, serial connections, telnet, mosh (exec system `mosh-client`)
+- Snippets, telnet, mosh (exec system `mosh-client`)
 - Shell autocomplete from the MIT `withfig/autocomplete` spec set
 - OS-branded host icons (25 colours already captured in `docs/UI-PARITY.md`)
 
@@ -80,7 +88,6 @@ so it is not re-litigated.
 | OS keychain | `keyring` | Wraps Security.framework on macOS, Credential Manager on Windows. |
 | Vault crypto | `argon2` + `chacha20poly1305` | Boring, audited primitives. `age` if we want file-level sharing later. |
 | Storage | `serde_json` now, `redb` or SQLite when it outgrows | Ponytail: do not add a database before the flat file hurts. |
-| Serial | `serialport` | Same crate family the original uses. |
 | Mosh | exec system `mosh-client` | No pure-Rust mosh exists; the protocol needs the mosh client. Detect and degrade gracefully. |
 | Telnet | hand-rolled over `tokio`/`std::net` | Telnet is small; a crate would be more code than the parser. |
 | Autocomplete | `withfig/autocomplete` specs (MIT) | The same upstream data set the original bundled, under a licence we can use. |
