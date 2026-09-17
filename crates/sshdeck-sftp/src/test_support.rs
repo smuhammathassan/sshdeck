@@ -1,9 +1,18 @@
 //! Test-only helpers.
 
 use std::future::Future;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::Thread;
+
+/// A unique path under the system temp directory, for filesystem tests.
+pub(crate) fn temp_path(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("sshdeck-sftp-{tag}-{}-{n}", std::process::id()))
+}
 
 /// Drives a future to completion on the current thread. The futures under test
 /// only await `async_channel`, which needs no runtime.

@@ -40,6 +40,7 @@ pub struct Transfer {
     local_path: PathBuf,
     remote_path: String,
     total: Option<u64>,
+    recursive: bool,
 }
 
 impl Transfer {
@@ -54,6 +55,20 @@ impl Transfer {
             local_path: local_path.into(),
             remote_path: remote_path.into(),
             total,
+            recursive: false,
+        }
+    }
+
+    /// Local directory → remote directory. The total is not known up front
+    /// (that would mean walking the whole tree first), so progress is reported
+    /// in bytes with no total.
+    pub fn upload_tree(local_path: impl Into<PathBuf>, remote_path: impl Into<String>) -> Self {
+        Self {
+            direction: TransferDirection::Upload,
+            local_path: local_path.into(),
+            remote_path: remote_path.into(),
+            total: None,
+            recursive: true,
         }
     }
 
@@ -68,6 +83,19 @@ impl Transfer {
             local_path: local_path.into(),
             remote_path: remote_path.into(),
             total,
+            recursive: false,
+        }
+    }
+
+    /// Remote directory → local directory. See [`Self::upload_tree`] for why
+    /// the total is unknown.
+    pub fn download_tree(remote_path: impl Into<String>, local_path: impl Into<PathBuf>) -> Self {
+        Self {
+            direction: TransferDirection::Download,
+            local_path: local_path.into(),
+            remote_path: remote_path.into(),
+            total: None,
+            recursive: true,
         }
     }
 
@@ -87,6 +115,24 @@ impl Transfer {
     pub fn total(&self) -> Option<u64> {
         self.total
     }
+
+    /// Whether this transfer walks a whole directory tree.
+    pub fn is_recursive(&self) -> bool {
+        self.recursive
+    }
+}
+
+/// What a transfer that stopped early left on disk.
+///
+/// Downloads keep the partial file and mark it resumable (the sidecar written
+/// by [`crate::partial`]); uploads remove the remote partial. Either way the
+/// caller is told which happened instead of guessing from a bare `Cancelled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialDisposition {
+    /// A partial was written and then removed; nothing is resumable.
+    Removed,
+    /// The partial file remains, and `done` bytes of it are resumable.
+    KeptResumable { done: u64 },
 }
 
 /// Identifies one transfer for its lifetime.
@@ -114,6 +160,7 @@ pub enum TransferState {
 pub struct TransferEvent {
     id: TransferId,
     state: TransferState,
+    partial: Option<PartialDisposition>,
 }
 
 impl TransferEvent {
@@ -123,6 +170,12 @@ impl TransferEvent {
 
     pub fn state(&self) -> &TransferState {
         &self.state
+    }
+
+    /// Set on the terminal event of a transfer that stopped early: what it left
+    /// behind on disk. `None` for a completed transfer or for progress events.
+    pub fn partial(&self) -> Option<PartialDisposition> {
+        self.partial
     }
 }
 
@@ -154,18 +207,33 @@ impl CancelToken {
 #[derive(Clone)]
 pub struct ProgressSink {
     report: Arc<dyn Fn(u64) + Send + Sync>,
+    partial: Arc<Mutex<Option<PartialDisposition>>>,
 }
 
 impl ProgressSink {
     pub fn new<F: Fn(u64) + Send + Sync + 'static>(report: F) -> Self {
         Self {
             report: Arc::new(report),
+            partial: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Reports `done` bytes moved so far.
     pub fn report(&self, done: u64) {
         (self.report)(done);
+    }
+
+    /// Records what the executor left on disk when it had to stop early. The
+    /// queue reads this after `execute` returns, on both success and failure,
+    /// and forwards it on the terminal event.
+    pub fn mark_partial(&self, disposition: PartialDisposition) {
+        if let Ok(mut slot) = self.partial.lock() {
+            *slot = Some(disposition);
+        }
+    }
+
+    fn take_partial(&self) -> Option<PartialDisposition> {
+        self.partial.lock().ok().and_then(|mut slot| slot.take())
     }
 }
 
@@ -189,6 +257,10 @@ struct Entry {
     state: TransferState,
     done: u64,
     cancel: CancelToken,
+    /// The latest progress that could not be queued because the event channel
+    /// was full. Flushed reliably by [`TransferQueue::finish`], so a completed
+    /// transfer never loses its last progress tick.
+    undelivered_done: Option<u64>,
 }
 
 struct QueueState {
@@ -247,6 +319,7 @@ impl TransferQueue {
                     state: TransferState::Queued,
                     done: 0,
                     cancel: CancelToken::default(),
+                    undelivered_done: None,
                 },
             );
             id
@@ -254,6 +327,7 @@ impl TransferQueue {
         self.emit(TransferEvent {
             id,
             state: TransferState::Queued,
+            partial: None,
         })
         .await;
         // Unbounded: enqueueing never blocks a UI thread.
@@ -280,6 +354,7 @@ impl TransferQueue {
                         Some(TransferEvent {
                             id,
                             state: TransferState::Cancelled,
+                            partial: None,
                         }),
                     )
                 }
@@ -317,15 +392,21 @@ impl TransferQueue {
         };
         let queue = self.clone();
         let progress = ProgressSink::new(move |done| queue.progress(id, done));
+        // Keep a handle so the disposition is readable after `execute` returns,
+        // whether it returned an outcome or an error.
+        let disposition = progress.clone();
 
-        let state = match executor.execute(transfer, progress, cancel).await {
+        // The executor owns a clone; the local one is only a reader.
+        let outcome = executor.execute(transfer, progress, cancel).await;
+        let partial = disposition.take_partial();
+        let state = match outcome {
             Ok(TransferOutcome::Complete) => TransferState::Complete,
             Ok(TransferOutcome::Cancelled) => TransferState::Cancelled,
             Err(err) => TransferState::Failed {
                 message: err.to_string(),
             },
         };
-        self.finish(id, state).await;
+        self.finish(id, state, partial).await;
     }
 
     /// Moves a transfer from queued to running. `None` if it was cancelled (or
@@ -350,15 +431,20 @@ impl TransferQueue {
         self.emit(TransferEvent {
             id,
             state: TransferState::Running { done: 0, total },
+            partial: None,
         })
         .await;
         Some((transfer, cancel))
     }
 
     /// Records progress. Out-of-order or duplicate totals are ignored so a
-    /// consumer can render a monotonic bar. Progress is dropped rather than
-    /// blocking when the event channel is full — the completion event still
-    /// arrives from [`Self::finish`].
+    /// consumer can render a monotonic bar.
+    ///
+    /// Progress is best-effort: when the event channel is full the tick is
+    /// remembered in `undelivered_done` and flushed by [`Self::finish`] on the
+    /// blocking channel, so the final tick cannot be lost while intermediate
+    /// ticks may be. `progress` and `finish` for one id run on the same worker
+    /// task, one after the other, so the two lock windows cannot interleave.
     fn progress(&self, id: TransferId, done: u64) {
         let event = {
             let mut state = self.lock();
@@ -375,27 +461,51 @@ impl TransferQueue {
                     done,
                     total: entry.transfer.total(),
                 },
+                partial: None,
             }
         };
-        let _ = self.shared.events.try_send(event);
+        let delivered = self.shared.events.try_send(event).is_ok();
+        let mut state = self.lock();
+        if let Some(entry) = state.entries.get_mut(&id) {
+            entry.undelivered_done = if delivered { None } else { Some(done) };
+        }
     }
 
-    async fn finish(&self, id: TransferId, state: TransferState) {
-        let final_state = {
+    /// Ends a transfer. Flushes any progress tick the event channel refused
+    /// (blocking until the consumer takes it), then emits the terminal event
+    /// with the partial disposition. Terminal and flushed events use `emit`,
+    /// which awaits channel capacity, so control events are never dropped.
+    async fn finish(
+        &self,
+        id: TransferId,
+        state: TransferState,
+        partial: Option<PartialDisposition>,
+    ) {
+        let (final_state, undelivered, total) = {
             let mut state_map = self.lock();
             let Some(entry) = state_map.entries.remove(&id) else {
                 return;
             };
             // Cancellation wins over any executor outcome.
-            if entry.cancel.is_cancelled() {
+            let final_state = if entry.cancel.is_cancelled() {
                 TransferState::Cancelled
             } else {
                 state
-            }
+            };
+            (final_state, entry.undelivered_done, entry.transfer.total())
         };
+        if let Some(done) = undelivered {
+            self.emit(TransferEvent {
+                id,
+                state: TransferState::Running { done, total },
+                partial: None,
+            })
+            .await;
+        }
         self.emit(TransferEvent {
             id,
             state: final_state,
+            partial,
         })
         .await;
     }
@@ -647,6 +757,50 @@ mod tests {
             Some(TransferState::Running { done: 0, .. })
         ));
         assert_eq!(states.last(), Some(&TransferState::Cancelled));
+    }
+
+    #[test]
+    fn final_progress_is_delivered_exactly_once_under_a_full_channel() {
+        // Capacity 2: the queued + running bookends fill it, so every progress
+        // tick is refused and must be flushed reliably by `finish`.
+        let (events_tx, events_rx) = async_channel::bounded(2);
+        let queue = TransferQueue::new(events_tx);
+        let executor: Arc<dyn TransferExecutor> = Arc::new(ChunkedExecutor {
+            chunks: vec![20, 20, 20, 20, 20],
+            fail: false,
+        });
+        let transfer = Transfer::upload("/tmp/local.bin", "/remote/local.bin", Some(100));
+
+        block_on(queue.enqueue(transfer));
+        queue.close();
+
+        // Drain on another thread so `finish`'s blocking send can complete.
+        let drainer = std::thread::spawn(move || {
+            let mut states = Vec::new();
+            while let Ok(event) = events_rx.recv_blocking() {
+                let state = event.state().clone();
+                let done = matches!(state, TransferState::Complete);
+                states.push(state);
+                if done {
+                    break;
+                }
+            }
+            states
+        });
+        block_on(TransferQueue::run_worker(queue, executor));
+        let states = drainer.join().expect("drainer finishes");
+
+        let finals = states
+            .iter()
+            .filter(|state| matches!(state, TransferState::Running { done: 100, .. }))
+            .count();
+        assert_eq!(finals, 1, "final progress must appear once: {states:?}");
+        assert_eq!(states.last(), Some(&TransferState::Complete));
+        // It must not have stalled before the final tick.
+        assert!(matches!(
+            states.get(states.len() - 2),
+            Some(TransferState::Running { done: 100, .. })
+        ));
     }
 
     #[test]

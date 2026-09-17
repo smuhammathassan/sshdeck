@@ -10,18 +10,21 @@
 
 mod client;
 pub mod listing;
+mod partial;
 pub mod path;
 mod stream;
 pub mod transfer;
+mod tree;
 
 pub use client::SftpClient;
 pub use listing::{format_permissions, sort_entries, DirEntry, FileKind, FileStat};
-pub use path::{join, normalize, PathError};
+pub use path::{ancestors, join, normalize, PathError};
 pub use transfer::{
-    CancelToken, ProgressSink, Transfer, TransferDirection, TransferEvent, TransferExecutor,
-    TransferFuture, TransferId, TransferOutcome, TransferQueue, TransferState,
+    CancelToken, PartialDisposition, ProgressSink, Transfer, TransferDirection, TransferEvent,
+    TransferExecutor, TransferFuture, TransferId, TransferOutcome, TransferQueue, TransferState,
     DEFAULT_TRANSFER_CONCURRENCY,
 };
+pub use tree::{transfer_tree, TreeEntry, TreeFs, TreeFuture, TreeReport, MAX_TREE_DEPTH};
 
 /// A failure from an SFTP operation or a transfer.
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +53,9 @@ pub enum SftpError {
     /// A transfer was cancelled.
     #[error("transfer {0:?} was cancelled")]
     Cancelled(TransferId),
+    /// A recursive walk hit the depth ceiling before it could finish.
+    #[error("directory tree is deeper than the {limit}-level limit")]
+    TreeTooDeep { limit: usize },
 }
 
 #[cfg(test)]

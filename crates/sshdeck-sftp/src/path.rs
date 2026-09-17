@@ -67,6 +67,40 @@ pub fn join(base: &str, child: &str) -> Result<String, PathError> {
     }
 }
 
+/// The directory chain under `base` that must exist for `path` to exist, from
+/// the first component below `base` down to `path` itself. `base` itself is not
+/// included: `mkdir -p` semantics never create above the configured base.
+///
+/// Returns [`PathError`] when `path` escapes `base`, because the chain is built
+/// with [`join`] and therefore inherits its rejection.
+pub fn ancestors(base: &str, path: &str) -> Result<Vec<String>, PathError> {
+    let base = normalize(base);
+    let target = join(&base, path)?;
+    if target == base {
+        return Ok(Vec::new());
+    }
+
+    let mut dirs = Vec::new();
+    let mut built = String::new();
+    if target.starts_with('/') {
+        built.push('/');
+    }
+    for component in target.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        if !built.is_empty() && !built.ends_with('/') {
+            built.push('/');
+        }
+        built.push_str(component);
+        if built == base || !within(&base, &built) {
+            continue;
+        }
+        dirs.push(built.clone());
+    }
+    Ok(dirs)
+}
+
 /// Whether `path` is `base` itself or sits underneath it.
 fn within(base: &str, path: &str) -> bool {
     if path == base {
@@ -138,5 +172,41 @@ mod tests {
             join("/home/user/docs", "sub/../notes.txt").expect("joins"),
             "/home/user/docs/notes.txt"
         );
+    }
+
+    #[test]
+    fn ancestors_lists_every_directory_below_the_base() {
+        assert_eq!(
+            ancestors("/home/user", "docs/a/b").expect("stays inside"),
+            vec![
+                "/home/user/docs".to_string(),
+                "/home/user/docs/a".to_string(),
+                "/home/user/docs/a/b".to_string(),
+            ]
+        );
+        // The base itself is never in the chain.
+        assert_eq!(
+            ancestors("/home/user", "docs").expect("inside"),
+            vec!["/home/user/docs".to_string()]
+        );
+        assert!(ancestors("/home/user", ".").expect("inside").is_empty());
+        assert!(ancestors("/home/user", "docs/..")
+            .expect("inside")
+            .is_empty());
+        // An absolute base of `/` still only lists below the root.
+        assert_eq!(
+            ancestors("/", "/etc/hosts").expect("inside"),
+            vec!["/etc".to_string(), "/etc/hosts".to_string()]
+        );
+    }
+
+    #[test]
+    fn ancestors_rejects_escapes_above_the_base() {
+        for child in ["../other", "docs/../../etc", "/etc/passwd"] {
+            assert!(
+                ancestors("/home/user", child).is_err(),
+                "{child} must not escape"
+            );
+        }
     }
 }
