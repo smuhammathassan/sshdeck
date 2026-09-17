@@ -5,3 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Versions verified against crates.io on 2026-09-17: async-channel 2.5.0,
+# thiserror 2.0.20, portable-pty 0.9.0. async-channel and thiserror are already
+# used across the workspace.
+thiserror.workspace = true
+async-channel = "2"
+# `mosh-client` calls `tcgetattr( STDIN_FILENO )` and `exit(1)` when that fails
+# (upstream src/frontend/stmclient.cc), so mosh cannot be driven over pipes: the
+# supervisor must allocate a real pty. The pty must also be the child's
+# controlling terminal, otherwise resizing it never delivers SIGWINCH — the only
+# resize channel mosh-client has. That setup is `setsid` + `TIOCSCTTY`, i.e.
+# `pre_exec`, i.e. `unsafe`; `portable-pty` is the widely used, safe wrapper for
+# that dance (plus `CommandBuilder`, `resize`, `Child`). This crate contains no
+# `unsafe` of its own. Pinned exactly: the API was verified against this version
+# on docs.rs.
+portable-pty = "=0.9.0"
