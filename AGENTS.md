@@ -61,6 +61,26 @@ depends on the UI, and never imports `gpui`.
 - Theme colors come from `cx.theme()`. No hardcoded colors in application code.
 - Repeated elements need domain-derived `ElementId`s, never list indexes.
 
+### Known gpui-kit 0.6.1 errata
+
+The published docs and the pinned skill references in `.ai/gpui-kit/` are wrong on
+the points below. Verified by reading the resolved sources
+(`gpui-component 0.6.1`, `gpui-base 0.6.1`, `gpui-pre 0.3.5`). Trust the source,
+not the prose.
+
+| Documented as | Reality in 0.6.1 |
+| --- | --- |
+| `cx.theme().surface` | No such field — `Theme` derefs to `ThemeColor`, which has no `surface`. Use `cx.theme().sidebar` for panel/sidebar backgrounds. |
+| Accent colours listed as flat fields | Not all documented names exist; check `theme/theme_color.rs` before using one. |
+| `gpui_kit::component::ButtonVariants` | Not re-exported at the component root. Import from `gpui_kit::component::button::{Button, ButtonVariants as _}`. |
+| `Styled::overflow_y_scroll` | Removed. Use `ScrollableElement::overflow_y_scrollbar`. |
+| `Theme::toggle_mode(cx)` | Does not exist. Use `Theme::change(mode, Some(window), cx)`. |
+| `push_notification` on `Context` | Notifications are window-scoped: `window.push_notification(Notification::error(..), cx)`. |
+| `cx.defer(..)` for a toast | `defer` yields only `&mut App`, no window. Use `cx.defer_in(window, ..)`. |
+| Size methods need no import | `.small()`/`.large()` come from the `Sizable` trait; `.disabled()` from `Disableable`; `.when()` from `FluentBuilder` (in `prelude`); `.overflow_y_scrollbar()` from `ScrollableElement`. Missing these traits is the single most common cause of "no method named" errors here. |
+
+`gpui-kit = "0.6"` resolves to `gpui-pre 0.3.5` — read that version's source.
+
 ## Rust rules
 
 - Edition 2021. `cargo fmt` clean. `cargo clippy` clean (warnings are failures
