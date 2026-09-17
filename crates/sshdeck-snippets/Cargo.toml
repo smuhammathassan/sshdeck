@@ -5,3 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Versions verified against crates.io on 2026-09-17: serde 1.0.229,
+# serde_json 1.0.151, thiserror 2.0.20. `#[serde(try_from = "…", into = "…")]`
+# verified against https://serde.rs/container-attrs.html.
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
