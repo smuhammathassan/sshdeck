@@ -143,13 +143,68 @@ polling loop.
 
 It is still ~150× below the baseline, and comfortably inside the 1 % hard cap,
 so it is not blocking. But the 0.2 % target exists precisely to make the battery
-claim defensible, and it is not met. Next diagnostic: measure CPU with the
-window fully occluded or minimised. If CPU drops to ~0, the cost is the visible
-window's draw loop rather than application work, which tells us exactly where to
-look.
+claim defensible, and it is not met. **Resolved the same day.** With the window *unfocused*, CPU measures **0.0 %** —
+both with no session and with a live session. A frontmost window measures
+0.8–0.9 %. So the cost is the **visible/active window's draw loop**, not
+application work: it is the compositor redrawing a window nobody is interacting
+with, and it does not accrue when the app is in the background. Since a terminal
+is normally left open in the background, the 0.2 % target is met in the state
+that actually matters for battery, and is missed only while the window is
+frontmost and focused.
 
-### Not yet measured
+### 2026-09-17 — second measurement, live session
 
-The per-session rows need a reachable SSH host. Until one is available the
-per-session budget is unproven — the idle figure says nothing about whether a
-session costs 5 MB or 40 MB.
+Same binary family (`8e6a16c`, release from CI run `35190706845`), this time as a
+**.app bundle** — the form factor that actually ships — with a real SSH session
+open to a remote host (`root@144.91.114.16`, Ubuntu 24.04, `Linux 6.8.0`).
+
+| Metric | Target | Hard cap | Measured | Verdict |
+| --- | --- | --- | --- | --- |
+| Processes | 1 | 2 | **1** | ✅ pass |
+| Binary size | ≤ 25 MB | 40 MB | **21.5 MB** | ✅ pass |
+| Idle RSS (no session, bundle) | ≤ 60 MB | 100 MB | **71.8 MB** | ⚠️ over target, well under cap |
+| Idle RSS (close, bare binary) | ≤ 60 MB | 100 MB | **60–64 MB** | ⚠️ at target |
+| **RSS with 1 live session** | ≤ 120 MB | 180 MB | **61–72 MB** | ✅ **pass** |
+| **Marginal cost per session** | ≤ 15 MB | 25 MB | **≈ 0–2 MB** | ✅ **pass** |
+| Threads, no session | — | — | 5–6 | — |
+| Threads, 1 session | — | — | 10–11 | — |
+| Idle CPU, window unfocused | ≤ 0.2 % | 1 % | **0.0 %** | ✅ **pass** |
+| Idle CPU, window frontmost | ≤ 0.2 % | 1 % | 0.8–0.9 % | ❌ frontmost only |
+| 8 h idle RSS growth | < 2 MB | 10 MB | not measured | — |
+| Time to first frame | ≤ 300 ms | 700 ms | not measured | — |
+| 10 sessions | ≤ 250 MB | 400 MB | not measured (see note) | — |
+
+**Headline: a live SSH session costs ≈ 0–2 MB.** Memory does not scale with
+sessions the way the baseline's does — the grid is the only per-session
+allocation of consequence, and its scrollback is capped. Sessions do add ~5
+threads each, which is the real per-session resource to watch.
+
+The bundle costs ~8 MB more than the bare binary at idle (71.8 vs 60–64 MB); the
+bundle figure is the honest one because it is what ships.
+
+### End-to-end verification
+
+The session was verified three ways, not assumed:
+
+1. **Headless** — `sshdeck --connect vps --exec "…"` streamed real remote output
+   (Ubuntu MOTD, `uname`, `id -un`, `hostname`) to stdout and exited **0**.
+2. **Socket** — `lsof -a -p <pid> -i` showed the app itself holding
+   `172.22.4.3:… -> 144.91.114.16:22 (ESTABLISHED)`.
+3. **Rendered** — a screenshot of the running app showed the remote prompt
+   `root@mail:~#` drawn in the GPUI terminal pane, the **OSC window title**
+   captured from the server (`root@mail: ~`), a connected indicator on the host
+   row, and `connected` in the status bar.
+
+That third check matters because headless mode bypasses the UI entirely: it
+proves transport and PTY, not rendering. Only the screenshot proves the grid is
+painted from real remote bytes.
+
+### Still unmeasured
+
+- **10 sessions.** Not measured: driving ten tabs needs UI interaction, and GUI
+  automation is not available for this window (gpui exposes no accessibility
+  tree, and the automation API cannot resolve its `CGWindow`). The measured
+  marginal cost of ≈ 0–2 MB per session suggests ≈ 75–90 MB, but that is an
+  extrapolation and is labelled as such rather than presented as a result.
+- **8 h idle growth** and **time to first frame** — both need a longer-running
+  instrumented run than a single session.
