@@ -42,7 +42,7 @@ actions!(palette, [PaletteUp, PaletteDown, PaletteCancel]);
 /// `Command` component relies on. Enter is handled through the input's
 /// `PressEnter` event instead and is deliberately not bound here: binding it as
 /// well would confirm the same command twice.
-const CONTEXT: &str = "SshDeckPalette";
+pub const CONTEXT: &str = "SshDeckPalette";
 
 /// Stable identity for a palette command; the host dispatches on this.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -428,6 +428,19 @@ impl PaletteView {
         // borrow of `cx` ends before `focus` needs it mutably.
         let handle = self.query.read(cx).focus_handle(cx);
         handle.focus(window, cx);
+    }
+
+    /// Moves the highlighted command by `delta` (`-1` up, `+1` down).
+    ///
+    /// The host calls this when it carries [`CONTEXT`] and receives the palette's
+    /// navigation actions while focus is outside the view.
+    pub fn nudge(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.move_selection(delta, cx);
+    }
+
+    /// Runs the Escape path: invokes the installed cancel callback.
+    pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel(window, cx);
     }
 
     fn refilter(&mut self, query: &str) {

@@ -20,11 +20,16 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, px, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    div, px, AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, WindowOptions,
 };
+use keys_pane::KeysPane;
+use palette::PaletteView;
+use settings::SettingsView;
+use sftp_pane::SftpPane;
 use sshdeck_core::session::SessionConfig;
 use sshdeck_core::{Host, HostId, HostStore, SessionState};
+use sshdeck_sftp::SftpClient;
 use terminal::{PaneStatus, TerminalPane};
 
 fn main() {
@@ -52,6 +57,16 @@ struct Session {
     status: PaneStatus,
 }
 
+/// A full-region pane that shows over the session content while it is open.
+///
+/// Each variant is created on demand and dropped when it closes, so a pane that
+/// holds a transport (SFTP) never outlives its own visibility.
+enum Overlay {
+    Settings(Entity<SettingsView>),
+    Keys(Entity<KeysPane>),
+    Sftp(Entity<SftpPane>),
+}
+
 struct SshDeck {
     store: HostStore,
     selected: Option<HostId>,
@@ -63,6 +78,14 @@ struct SshDeck {
     draft_address: Entity<InputState>,
     /// The in-flight secret prompt, when a host needs a password we do not have.
     secret: Option<(HostId, Entity<InputState>)>,
+    /// The command palette while it is open, if at all.
+    palette: Option<Entity<PaletteView>>,
+    /// The settings, keys or SFTP pane showing over the session, if at all.
+    overlay: Option<Overlay>,
+    /// Index of the session the SFTP pane is attached to, if any.
+    sftp_attached: Option<usize>,
+    /// Bumped per attach attempt so a superseded SFTP connect is ignored.
+    sftp_generation: u64,
     /// Subscription handles must outlive construction, so they are owned here.
     _subscriptions: Vec<Subscription>,
 }
@@ -102,6 +125,10 @@ impl SshDeck {
             draft_label,
             draft_address,
             secret: None,
+            palette: None,
+            overlay: None,
+            sftp_attached: None,
+            sftp_generation: 0,
             _subscriptions: subscriptions,
         }
     }
@@ -214,13 +241,16 @@ impl SshDeck {
         let pane = cx.new(|cx| TerminalPane::new(config, window, cx));
         // Re-render the chrome whenever the pane's status changes. The pane is
         // the only thing that reads the event channel; the shell just mirrors.
-        let subscription = cx.observe_in(&pane, window, |this, pane, _window, cx| {
+        let subscription = cx.observe_in(&pane, window, |this, pane, window, cx| {
             let status = pane.read(cx).status();
             // Match by handle rather than trusting the active index: the pane can
             // notify before the tab is registered.
             if let Some(session) = this.sessions.iter_mut().find(|s| s.pane == pane) {
                 session.status = status;
             }
+            // A session that just authenticated is what the SFTP pane attaches
+            // to; a session that ended is what it detaches from.
+            this.reconcile_sftp(window, cx);
             cx.notify();
         });
         self._subscriptions.push(subscription);
@@ -237,6 +267,9 @@ impl SshDeck {
         });
         self.active = Some(self.sessions.len() - 1);
         pane.update(cx, |pane, cx| pane.focus(window, cx));
+        // The new tab is active now; the SFTP pane must follow it even before the
+        // session reaches `Connected` (it detaches until then).
+        self.reconcile_sftp(window, cx);
 
         if let Some(message) = failed {
             window.push_notification(
@@ -257,6 +290,225 @@ impl SshDeck {
             .iter()
             .filter(|s| s.status.state.is_active())
             .count()
+    }
+
+    /// Replaces the session area with `overlay` (or restores it with `None`).
+    ///
+    /// A pane that is being replaced is dropped, closing any transport it held;
+    /// the SFTP bookkeeping is cleared and any in-flight connect is invalidated.
+    fn show_overlay(&mut self, overlay: Option<Overlay>, cx: &mut Context<Self>) {
+        self.sftp_attached = None;
+        self.sftp_generation = self.sftp_generation.wrapping_add(1);
+        self.overlay = overlay;
+        cx.notify();
+    }
+
+    fn close_overlay(&mut self, cx: &mut Context<Self>) {
+        self.show_overlay(None, cx);
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Some(Overlay::Settings(_))) {
+            self.close_overlay(cx);
+            return;
+        }
+        let view = cx.new(|cx| SettingsView::new(window, cx));
+        view.update(cx, |view, cx| view.focus(window, cx));
+        self.show_overlay(Some(Overlay::Settings(view)), cx);
+    }
+
+    fn open_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Some(Overlay::Keys(_))) {
+            self.close_overlay(cx);
+            return;
+        }
+        let view = cx.new(|cx| KeysPane::new(window, cx));
+        self.show_overlay(Some(Overlay::Keys(view)), cx);
+    }
+
+    fn open_sftp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Some(Overlay::Sftp(_))) {
+            self.close_overlay(cx);
+            return;
+        }
+        let pane = cx.new(|cx| SftpPane::new(window, cx));
+        self.show_overlay(Some(Overlay::Sftp(pane)), cx);
+        // `show_overlay` cleared the bookkeeping, so this is a fresh attach.
+        self.reconcile_sftp(window, cx);
+    }
+
+    /// Attaches the SFTP pane to the active session's transport, or detaches it.
+    ///
+    /// Called whenever the tab selection or a session's state changes. At most
+    /// one SFTP session is live: a client is opened only while a session is
+    /// authenticated, and dropped as soon as that session ends or another tab
+    /// becomes active (docs/BUDGET.md: no connection per tab).
+    fn reconcile_sftp(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // Only a visible SFTP pane can hold a client. When it is closed its
+        // entity, and the transport with it, is already gone.
+        let pane = match &self.overlay {
+            Some(Overlay::Sftp(pane)) => pane.clone(),
+            _ => return,
+        };
+
+        let target = self.active.filter(|&index| {
+            self.sessions
+                .get(index)
+                .is_some_and(|session| matches!(session.status.state, SessionState::Connected))
+        });
+        if self.sftp_attached == target {
+            return;
+        }
+        self.sftp_attached = target;
+        self.sftp_generation = self.sftp_generation.wrapping_add(1);
+        let generation = self.sftp_generation;
+
+        // Drop the previous transport before opening the next one.
+        pane.update(cx, |pane, cx| pane.set_client(None, cx));
+
+        let Some(index) = target else {
+            return;
+        };
+        let session = match self.sessions.get(index) {
+            Some(session) => session.pane.read(cx).session(),
+            None => None,
+        };
+        let Some(session) = session else {
+            return;
+        };
+
+        cx.spawn_in(window, async move |this, cx| {
+            let connected = SftpClient::connect(&session).await;
+            this.update_in(cx, |this, window, cx| {
+                // A newer attach, or a closed pane, has superseded this attempt.
+                if this.sftp_generation != generation {
+                    return;
+                }
+                match connected {
+                    Ok(client) => pane.update(cx, |pane, cx| pane.set_client(Some(client), cx)),
+                    Err(error) => {
+                        // Leave the pane in its "not connected" state. Retrying is
+                        // a user action, so no loop runs here.
+                        this.sftp_attached = None;
+                        window.push_notification(
+                            Notification::warning(format!("SFTP could not open: {error}")),
+                            cx,
+                        );
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Opens the palette, or moves focus back to it when it is already open.
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(palette) = self.palette.clone() {
+            palette.update(cx, |palette, cx| palette.focus(window, cx));
+            cx.notify();
+            return;
+        }
+
+        let root = cx.entity().downgrade();
+        let palette = cx.new(|cx| PaletteView::new(window, cx));
+
+        let select_root = root.clone();
+        let cancel_root = root;
+        palette.update(cx, |palette, _cx| {
+            palette.set_on_select(move |command, window, cx| {
+                select_root
+                    .update(cx, |this, cx| this.dispatch_command(command, window, cx))
+                    .ok();
+            });
+            palette.set_on_cancel(move |_window, cx| {
+                cancel_root
+                    .update(cx, |this, cx| {
+                        this.palette = None;
+                        cx.notify();
+                    })
+                    .ok();
+            });
+        });
+
+        self.palette = Some(palette);
+        cx.notify();
+    }
+
+    /// Runs one palette command against the handlers this view already has.
+    fn dispatch_command(
+        &mut self,
+        command: palette::CommandId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Choosing a command closes the palette, whatever its outcome.
+        self.palette = None;
+        match command {
+            palette::CommandId::AddHost => self.add_draft_host(window, cx),
+            palette::CommandId::ConnectSelectedHost => match self.selected.clone() {
+                Some(id) => {
+                    if let Some(host) = self.store.inventory().get(&id).cloned() {
+                        self.connect(host, window, cx);
+                    }
+                }
+                None => window.push_notification(Notification::warning("Select a host first"), cx),
+            },
+            palette::CommandId::RemoveSelectedHost => match self.selected.clone() {
+                Some(id) => self.remove_host(&id, window, cx),
+                None => window.push_notification(Notification::warning("Select a host first"), cx),
+            },
+            // The palette performs the theme toggle itself; kept so a dispatched
+            // toggle still works if that ever changes.
+            palette::CommandId::ToggleTheme => {
+                let next = if Theme::global(cx).is_dark() {
+                    ThemeMode::Light
+                } else {
+                    ThemeMode::Dark
+                };
+                Theme::change(next, Some(window), cx);
+            }
+            // The palette marks these unavailable and never dispatches them.
+            palette::CommandId::OpenSftp
+            | palette::CommandId::ManageKeys
+            | palette::CommandId::OpenSettings => {}
+        }
+        cx.notify();
+    }
+
+    fn on_palette_up(
+        &mut self,
+        _: &palette::PaletteUp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.nudge_palette(-1, cx);
+    }
+
+    fn on_palette_down(
+        &mut self,
+        _: &palette::PaletteDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.nudge_palette(1, cx);
+    }
+
+    fn on_palette_cancel(
+        &mut self,
+        _: &palette::PaletteCancel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(palette) = self.palette.clone() {
+            palette.update(cx, |palette, cx| palette.dismiss(window, cx));
+        }
+    }
+
+    fn nudge_palette(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(palette) = self.palette.clone() {
+            palette.update(cx, |palette, cx| palette.nudge(delta, cx));
+        }
     }
 
     fn render_top_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -302,10 +554,40 @@ impl SshDeck {
                             }),
                     )
                     .child(
+                        Button::new("palette")
+                            .ghost()
+                            .icon(IconName::Search)
+                            .tooltip("Command palette")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_palette(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("keys")
+                            .ghost()
+                            .icon(IconName::HardDrive)
+                            .tooltip("SSH keys & known hosts")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_keys(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("sftp")
+                            .ghost()
+                            .icon(IconName::Folder)
+                            .tooltip("SFTP browser")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_sftp(window, cx);
+                            })),
+                    )
+                    .child(
                         Button::new("settings")
                             .ghost()
                             .icon(IconName::Settings2)
-                            .tooltip("Settings"),
+                            .tooltip("Settings")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_settings(window, cx);
+                            })),
                     ),
             )
     }
@@ -489,8 +771,10 @@ impl SshDeck {
                         .child(SharedString::from(state)),
                 )
                 .child(SharedString::from(label))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     this.active = Some(index);
+                    // The SFTP pane follows the active tab.
+                    this.reconcile_sftp(window, cx);
                     cx.notify();
                 }))
         });
@@ -572,7 +856,70 @@ impl SshDeck {
         )
     }
 
-    fn render_main(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.overlay.is_some() {
+            self.render_overlay(cx)
+        } else {
+            self.render_session(cx)
+        }
+    }
+
+    /// The settings, keys or SFTP pane, with a header that closes it.
+    ///
+    /// `render_main` calls this only while an overlay is present; the `None`
+    /// arm exists so the match is total and the borrow of `self.overlay` ends
+    /// before the element tree is built.
+    fn render_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let border = cx.theme().border;
+        let (title, body) = match self.overlay.as_ref() {
+            Some(Overlay::Settings(view)) => ("Settings", view.clone().into_any_element()),
+            Some(Overlay::Keys(view)) => {
+                ("SSH keys & known hosts", view.clone().into_any_element())
+            }
+            Some(Overlay::Sftp(view)) => ("SFTP", view.clone().into_any_element()),
+            None => ("", div().into_any_element()),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .flex_shrink_0()
+                    .h(px(38.))
+                    .px_3()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(div().text_sm().child(SharedString::from(title)))
+                    .child(
+                        Button::new("overlay-close")
+                            .small()
+                            .ghost()
+                            .label("Close")
+                            .on_click(cx.listener(|this, _, _, cx| this.close_overlay(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    /// The tab strip, session header and live terminal.
+    fn render_session(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
 
@@ -693,6 +1040,7 @@ impl SshDeck {
                     ),
             )
             .child(content)
+            .into_any_element()
     }
 
     fn render_status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -744,13 +1092,21 @@ impl Render for SshDeck {
         let sidebar = self.render_sidebar(cx);
         let main = self.render_main(cx);
         let status = self.render_status_bar(cx);
+        let palette = self.palette.clone();
 
-        div()
+        let mut root = div()
             .flex()
             .flex_col()
             .size_full()
             .bg(background)
             .text_color(foreground)
+            // The palette's navigation actions are bound in its own context. The
+            // context is only active while the palette is open, so these keys are
+            // never stolen from the terminal or an input.
+            .when(palette.is_some(), |el| el.key_context(palette::CONTEXT))
+            .on_action(cx.listener(Self::on_palette_up))
+            .on_action(cx.listener(Self::on_palette_down))
+            .on_action(cx.listener(Self::on_palette_cancel))
             .child(top_bar)
             .child(
                 div()
@@ -764,6 +1120,23 @@ impl Render for SshDeck {
             .child(status)
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
-            .children(Root::render_notification_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx));
+
+        if let Some(palette) = palette {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .pt(px(72.))
+                    .child(palette),
+            );
+        }
+
+        root
     }
 }

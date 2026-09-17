@@ -5,6 +5,8 @@
 //! above it supplies a [`SessionConfig`] and reads [`PaneStatus`] back for the
 //! tab strip and status bar.
 
+use std::sync::Arc;
+
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::ActiveTheme as _;
 // `push_notification` is a `WindowExt` method; without the trait in scope the
@@ -154,8 +156,9 @@ fn coalesce_row<'a>(cells: impl Iterator<Item = Cell<'a>>) -> Vec<Run> {
 /// The visible grid of a session, rendered as text runs.
 pub struct TerminalPane {
     /// `None` when the transport rejected the configuration outright; the pane
-    /// then renders the failure instead of a live grid.
-    session: Option<Session>,
+    /// then renders the failure instead of a live grid. Shared so the shell can
+    /// open an SFTP subsystem on the same authenticated connection.
+    session: Option<Arc<Session>>,
     terminal: Terminal,
     focus_handle: FocusHandle,
     /// Cell metrics in pixels, measured from the real font rather than guessed.
@@ -203,7 +206,7 @@ impl TerminalPane {
         // pane keeps no handle. `.ok()` after the failure has been recorded is
         // not a silent discard: the error is preserved in the pane's state.
         let mut pane = Self {
-            session: connected.ok(),
+            session: connected.ok().map(Arc::new),
             terminal: Terminal::new(80, 24, SCROLLBACK_LINES),
             focus_handle,
             cell,
@@ -330,6 +333,14 @@ impl TerminalPane {
             state: self.status.clone(),
             title: self.title.clone(),
         }
+    }
+
+    /// A shared handle to the live transport, if the configuration was accepted.
+    ///
+    /// The shell clones this to open an SFTP subsystem on the same session; the
+    /// `Arc` is what lets the SFTP connect task own the handle across an await.
+    pub fn session(&self) -> Option<Arc<Session>> {
+        self.session.clone()
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
