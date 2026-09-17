@@ -24,8 +24,19 @@ jobs:
           key: release-macos
       - run: cargo build -p sshdeck-app --release
       - name: Package
-        run: tar -czf sshdeck-macos-arm64.tar.gz -C target/release sshdeck
+        run: |
+          tar -czf sshdeck-macos-arm64.tar.gz -C target/release sshdeck
+          ls -lh sshdeck-macos-arm64.tar.gz
+          du -h target/release/sshdeck
+      # Always upload as a workflow artifact so a manual dispatch (which has no
+      # tag) still produces something downloadable via `gh run download`.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sshdeck-macos-arm64
+          path: sshdeck-macos-arm64.tar.gz
+          retention-days: 14
       - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: sshdeck-macos-arm64.tar.gz
           generate_release_notes: true
