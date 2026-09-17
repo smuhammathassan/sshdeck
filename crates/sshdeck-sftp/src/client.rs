@@ -729,7 +729,7 @@ async fn download_file(
         let read = match source.read(&mut buffer).await {
             Ok(0) => break Stop::Complete,
             Ok(read) => read,
-            Err(err) => break Stop::Failed(remote(err)),
+            Err(err) => break Stop::Failed(err.into()),
         };
         if let Err(err) = sink.write_all(&buffer[..read]) {
             break Stop::Failed(err.into());
