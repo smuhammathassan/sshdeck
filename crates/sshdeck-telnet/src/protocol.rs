@@ -561,7 +561,7 @@ mod tests {
         wire.extend_from_slice(b"user");
         wire.extend_from_slice(&[IAC, IAC]);
         wire.extend_from_slice(&frame(WILL, ECHO));
-        wire.extend_from_slice(b" \xff\n");
+        wire.extend_from_slice(&[b' ', IAC, IAC, b'\n']);
 
         let outcome = codec.receive(&wire).expect("decodes");
         assert_eq!(outcome.data(), b"login: user\xff \xff\n");
