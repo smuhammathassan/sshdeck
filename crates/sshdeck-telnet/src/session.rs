@@ -162,7 +162,7 @@ fn run(config: Config, commands: Receiver<Command>, events: Sender<TelnetEvent>)
         terminal_type,
     } = config;
 
-    let stream = match TcpStream::connect((host.as_str(), port)) {
+    let mut stream = match TcpStream::connect((host.as_str(), port)) {
         Ok(stream) => stream,
         Err(err) => {
             let _ = events.send_blocking(TelnetEvent::Error(format!("{host}:{port}: {err}")));

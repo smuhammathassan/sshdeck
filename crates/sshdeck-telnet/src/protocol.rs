@@ -573,15 +573,15 @@ mod tests {
         assert_eq!(outcome.data(), b"login: user\xff \xff\n");
         assert_eq!(
             outcome.replies(),
-            &[IAC, WILL, TERMINAL_TYPE, IAC, DO, ECHO][..]
+            &[IAC, WILL, TERMINAL_TYPE, IAC, DO, ECHO]
         );
     }
 
     #[test]
     fn resize_emits_a_well_formed_naws_subnegotiation() {
         assert_eq!(
-            naws(80, 24),
-            vec![IAC, SB, WINDOW_SIZE, 0, 80, 0, 24, IAC, SE]
+            naws(80, 24).as_slice(),
+            &[IAC, SB, WINDOW_SIZE, 0, 80, 0, 24, IAC, SE]
         );
 
         // The parser reads back exactly what the builder wrote.
@@ -599,8 +599,8 @@ mod tests {
     #[test]
     fn terminal_type_frame_is_well_formed() {
         assert_eq!(
-            terminal_type("xterm"),
-            vec![
+            terminal_type("xterm").as_slice(),
+            &[
                 IAC,
                 SB,
                 TERMINAL_TYPE,
