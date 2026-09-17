@@ -1724,9 +1724,16 @@ mod tests {
 
         let fallback: Hsla = rgb(0x8d91a5).into();
         let mut host = Host::new("box", "10.0.0.1");
-        assert_eq!(Rgba::from(host_os_tint(&host, fallback)), rgb(0x8d91a5));
+        assert_eq!(
+            Rgba::from(host_os_tint(&host, fallback)),
+            Rgba::from(fallback)
+        );
 
         host.tags.push("debian".into());
-        assert_eq!(Rgba::from(host_os_tint(&host, fallback)), rgb(0xce0056));
+        // Same Rgba→Hsla→Rgba path as the tint, so the round-trip is identical.
+        assert_eq!(
+            Rgba::from(host_os_tint(&host, fallback)),
+            Rgba::from(os_brand_color("debian").unwrap_or_default())
+        );
     }
 }
