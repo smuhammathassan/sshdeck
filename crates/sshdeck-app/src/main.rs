@@ -1055,9 +1055,9 @@ impl SshDeck {
         // hover, `--list-select` when selected. Only the default maps to a
         // gpui-kit token (`muted.background`); the other two are the recovered
         // hex values, since the theme exposes no token for them.
-        let card = cx.theme().muted;
-        let card_selected = rgb(0x32364a);
-        let card_hover = rgb(0x3e4257);
+        let card: Hsla = cx.theme().muted;
+        let card_selected: Hsla = rgb(0x32364a).into();
+        let card_hover: Hsla = rgb(0x3e4257).into();
 
         let query = self.filter.read(cx).value().to_string();
         let visible: Vec<Host> = self
@@ -1244,6 +1244,7 @@ impl SshDeck {
                 // panel never reaches it; a click on the scrim dismisses.
                 .child(
                     div()
+                        .id("add-host-scrim")
                         .absolute()
                         .top_0()
                         .left_0()
