@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos-arm64:
+    name: macOS arm64
+    runs-on: macos-14
+    env:
+      # The workspace profile is tuned for a local release build; a 3-core
+      # runner cannot afford codegen-units=1 plus thin LTO.
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos
+      - run: cargo build -p sshdeck-app --release
+      - name: Package
+        run: tar -czf sshdeck-macos-arm64.tar.gz -C target/release sshdeck
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: sshdeck-macos-arm64.tar.gz
+          generate_release_notes: true

@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.DS_Store
+
+# Vendored gpui-kit agent skill — a local reference, not part of the project.
+/.ai/
+
+# Reverse-engineering notes kept local; deliberately not published.
+/docs/re/

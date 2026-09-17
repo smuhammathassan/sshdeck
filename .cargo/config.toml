@@ -1,0 +1,4 @@
+# 8 GB RAM / 8 CPU M1: cap parallel rustc processes so the dep graph (GPUI is
+# large) does not exhaust memory and force swapping.
+[build]
+jobs = 4

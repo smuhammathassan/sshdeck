@@ -1,0 +1,16 @@
+[package]
+name = "sshdeck-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sshdeck"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = "0.6"
+sshdeck-core = { path = "../sshdeck-core" }
+
+[features]
+default = []

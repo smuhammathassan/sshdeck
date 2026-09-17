@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: core (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: core
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p sshdeck-core --all-targets -- -D warnings
+      - run: cargo test -p sshdeck-core
+
+  app:
+    name: app (macOS arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos
+      # GPUI builds its own Metal renderer, so this job is the slow one; the
+      # cache above is what keeps it tolerable.
+      - run: cargo build -p sshdeck-app
+      - run: cargo test -p sshdeck-app
