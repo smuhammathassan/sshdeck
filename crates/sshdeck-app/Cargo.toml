@@ -19,6 +19,7 @@ sshdeck-autocomplete = { path = "../sshdeck-autocomplete" }
 sshdeck-import = { path = "../sshdeck-import" }
 sshdeck-sftp = { path = "../sshdeck-sftp" }
 sshdeck-vault = { path = "../sshdeck-vault" }
+sshdeck-snippets = { path = "../sshdeck-snippets" }
 # `Session::events` hands back an `async_channel::Receiver`; the pane has to name
 # that type to poll it. Same version sshdeck-core already pins, so Cargo unifies
 # them and no extra code is compiled in.
