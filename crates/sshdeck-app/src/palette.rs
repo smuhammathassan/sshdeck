@@ -18,6 +18,14 @@
 //! performed here, the host-dispatched entries map to operations `SshDeck`
 //! already has (`add_draft_host`, `connect`, `remove_host`), and the rest are
 //! explicitly marked unavailable with the reason shown on the row.
+//!
+//! Visual reference: Termius's quick launcher
+//! (`termius-ui/Screenshot 2026-09-17 at 3.09.49 PM.png`, the "New Tab" search
+//! overlay) — a 720px panel anchored near the top and centred, a filled search
+//! row across the full panel width, 44px rows of icon + label + right-aligned
+//! secondary text or shortcut chip, and a 10px panel radius. The reference
+//! surface is flat (no drop shadow) and sits on the normal page, not on a
+//! dimming scrim, so this module draws neither.
 
 use gpui_kit::component::{
     input::{Input, InputEvent, InputState},
@@ -551,12 +559,14 @@ impl PaletteView {
 
 impl Render for PaletteView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let popover = cx.theme().popover;
-        let foreground = cx.theme().popover_foreground;
+        // Every colour here is a theme token: `background` is the white panel,
+        // `muted` the filled search row and the selected row, `muted_foreground`
+        // the secondary text, `border` the hairline. No literals, no shadow.
+        let panel = cx.theme().background;
+        let foreground = cx.theme().foreground;
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
-        let accent = cx.theme().accent;
-        let accent_foreground = cx.theme().accent_foreground;
+        let highlight = cx.theme().muted;
         let danger = cx.theme().danger;
 
         let host_wired = self.on_select.is_some();
@@ -564,127 +574,156 @@ impl Render for PaletteView {
         let filtered = self.filtered.clone();
         let selected = self.selected;
 
-        let rows =
-            filtered
-                .iter()
-                .enumerate()
-                .map(|(position, &command_index)| {
-                    let command = commands[command_index];
-                    let enabled = is_enabled(&command, host_wired);
-                    let is_selected = selected == Some(position);
-                    let reason = disabled_reason(&command, host_wired);
-                    let shortcut = if enabled {
-                        command.shortcut.and_then(kbd)
-                    } else {
-                        None
-                    };
+        let rows = filtered
+            .iter()
+            .enumerate()
+            .map(|(position, &command_index)| {
+                let command = commands[command_index];
+                let enabled = is_enabled(&command, host_wired);
+                let is_selected = selected == Some(position);
+                let reason = disabled_reason(&command, host_wired);
+                let shortcut = if enabled {
+                    command.shortcut.and_then(kbd)
+                } else {
+                    None
+                };
+                let has_shortcut = shortcut.is_some();
 
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .w_full()
-                        .px_2()
-                        .py_1p5()
-                        .rounded_md()
-                        .when(is_selected, |el| {
-                            el.bg(accent).text_color(accent_foreground)
-                        })
-                        .when(!enabled, |el| el.text_color(muted))
-                        .child(Icon::new(command.category.icon()).size_4().text_color(
-                            if is_selected {
-                                accent_foreground
-                            } else {
-                                muted
-                            },
-                        ))
-                        .child(div().flex_1().overflow_hidden().child(command.label()))
-                        .when_some(reason, |el, reason| {
-                            el.child(div().text_xs().text_color(danger).child(reason))
-                        })
-                        .when(reason.is_none(), |el| {
-                            el.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(command.category.label()),
-                            )
-                        })
-                        .when_some(shortcut, |el, shortcut| el.child(shortcut))
-                        .id(SharedString::from(format!(
-                            "sshdeck-palette-{}",
-                            command.id.as_str()
-                        )))
-                        .role(Role::ListBoxOption)
-                        .aria_selected(is_selected)
-                        .when(enabled, |el| {
-                            el.cursor_pointer()
-                                .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
-                                    if *hovered {
-                                        this.select(position, cx);
-                                    }
-                                }))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.activate(position, window, cx);
-                                }))
-                        })
-                })
-                .collect::<Vec<_>>();
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .w_full()
+                    .h(px(44.))
+                    .px_3()
+                    .rounded_md()
+                    .when(is_selected, |el| el.bg(highlight))
+                    .when(!enabled, |el| el.text_color(muted))
+                    .child(
+                        Icon::new(command.category.icon())
+                            .size_5()
+                            .text_color(if is_selected { foreground } else { muted }),
+                    )
+                    .child(div().flex_1().overflow_hidden().child(command.label()))
+                    .when_some(shortcut, |el, shortcut| el.child(shortcut))
+                    .when(reason.is_none() && !has_shortcut, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(command.category.label()),
+                        )
+                    })
+                    .when_some(reason, |el, reason| {
+                        el.child(div().text_xs().text_color(danger).child(reason))
+                    })
+                    .id(SharedString::from(format!(
+                        "sshdeck-palette-{}",
+                        command.id.as_str()
+                    )))
+                    .role(Role::ListBoxOption)
+                    .aria_selected(is_selected)
+                    .when(enabled, |el| {
+                        el.cursor_pointer()
+                            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                                if *hovered {
+                                    this.select(position, cx);
+                                }
+                            }))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.activate(position, window, cx);
+                            }))
+                    })
+            })
+            .collect::<Vec<_>>();
 
         let empty = rows.is_empty();
 
+        // `main.rs` centres the palette horizontally and anchors it near the
+        // top; this root adds the window gutter and caps the panel at the
+        // reference width so a narrow window still has breathing room.
         div()
             .flex()
             .flex_col()
+            .items_center()
+            .w_full()
+            .px_4()
             .key_context(CONTEXT)
             .on_action(cx.listener(Self::on_up))
             .on_action(cx.listener(Self::on_down))
             .on_action(cx.listener(Self::on_palette_cancel))
-            .w(px(560.))
-            .max_h(px(430.))
-            .overflow_hidden()
-            .rounded_lg()
-            .border_1()
-            .border_color(border)
-            .bg(popover)
-            .text_color(foreground)
             .child(
                 div()
-                    .flex_none()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(
-                        Input::new(&self.query)
-                            .small()
-                            .cleanable(true)
-                            .aria_label(SharedString::from("Search commands"))
-                            .prefix(Icon::new(IconName::Search).small().text_color(muted)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("sshdeck-palette-list")
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .flex_1()
-                    .p_2()
-                    .overflow_y_scrollbar()
-                    .when(empty, |el| {
-                        el.child(
+                    .w_full()
+                    .max_w(px(720.))
+                    .max_h(px(430.))
+                    .overflow_hidden()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(border)
+                    .bg(panel)
+                    .text_color(foreground)
+                    .child(
+                        // The search row spans the panel and is a filled,
+                        // borderless field; the focused ring comes from `Input`.
+                        div().flex_none().p_3().child(
                             div()
-                                .p_3()
-                                .text_sm()
-                                .text_color(muted)
-                                .child("No commands match that search"),
-                        )
-                    })
-                    .children(rows),
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .w_full()
+                                .bg(highlight)
+                                .rounded_md()
+                                .px_3()
+                                .child(
+                                    Input::new(&self.query)
+                                        .appearance(false)
+                                        .small()
+                                        .cleanable(true)
+                                        .aria_label(SharedString::from("Search commands"))
+                                        .prefix(
+                                            Icon::new(IconName::Search).size_4().text_color(muted),
+                                        ),
+                                ),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("sshdeck-palette-list")
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .p_2()
+                            .overflow_y_scrollbar()
+                            .when(empty, |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_1()
+                                        .flex_col()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap_2()
+                                        .py_8()
+                                        .child(
+                                            Icon::new(IconName::Search).size_5().text_color(muted),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(muted)
+                                                .child("No commands match that search"),
+                                        ),
+                                )
+                            })
+                            .children(rows),
+                    )
+                    .child(render_hints(muted, border)),
             )
-            .child(render_hints(muted, border))
     }
 }
 
@@ -760,5 +799,23 @@ mod tests {
         let matches = filter_commands(&commands, "THEME");
         assert_eq!(matches.len(), 1);
         assert_eq!(commands[matches[0]].id(), CommandId::ToggleTheme);
+    }
+
+    #[test]
+    fn registry_is_honest_about_what_it_can_do() {
+        let commands = registry();
+        let mut ids = commands.iter().map(|c| c.id.as_str()).collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), commands.len(), "command ids must be unique");
+        for command in &commands {
+            assert!(
+                command.is_builtin()
+                    || command.needs_host()
+                    || command.unavailable_reason().is_some(),
+                "{} must either run or say why it cannot",
+                command.id.as_str()
+            );
+        }
     }
 }
