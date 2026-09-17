@@ -16,12 +16,14 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _};
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
+};
+use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
     div, px, rgb, AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity,
-    FocusHandle, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, Window,
+    FocusHandle, Focusable as _, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    Render, SharedString, Styled as _, Window,
 };
 use sshdeck_snippets::{Snippet, SnippetError, SnippetId, SnippetStore, Variable};
 
