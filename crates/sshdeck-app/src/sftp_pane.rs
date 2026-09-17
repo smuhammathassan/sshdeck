@@ -1559,7 +1559,9 @@ impl Render for SftpPane {
                     .child(left)
                     .child(right),
             )
-            .child(self.render_transfers(cx))
+            .when(!self.transfers.is_empty(), |this| {
+                this.child(self.render_transfers(cx))
+            })
     }
 }
 

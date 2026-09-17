@@ -56,6 +56,7 @@
 
 use std::sync::Arc;
 
+use crate::glyph;
 use async_channel::Receiver;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -414,45 +415,78 @@ impl ForwardPane {
     /// right. `New forwarding` is disabled without a session, because a forward
     /// cannot exist off one.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
-        let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
-        let connected = self.session.is_some();
-        let active = self
-            .forwards
-            .iter()
-            .filter(|row| row.status.is_active())
-            .count();
 
         div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
-            .h(px(44.))
+            .h(px(56.))
             .px_3()
             .flex_shrink_0()
-            .bg(cx.theme().background)
+            .bg(cx.theme().popover)
             .border_b_1()
             .border_color(border)
             .child(
-                Button::new("forward-new")
-                    .icon(IconName::Plus)
-                    .label("New forwarding")
-                    .disabled(!connected)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.form_open = !this.form_open;
-                        // A message about a form that just closed no longer applies.
-                        if !this.form_open {
-                            this.error = None;
-                        }
-                        cx.notify();
-                    })),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_0()
+                    .child(
+                        Button::new("forward-new")
+                            .icon(IconName::Plus)
+                            .label("New forwarding")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.form_open = !this.form_open;
+                                if !this.form_open {
+                                    this.error = None;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("forward-new-caret")
+                            .ghost()
+                            .icon(IconName::ChevronDown)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.form_open = !this.form_open;
+                                if !this.form_open {
+                                    this.error = None;
+                                }
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 div()
-                    .text_size(px(12.))
-                    .text_color(muted)
-                    .child(format!("{active} active of {}", self.forwards.len())),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .child(
+                        Button::new("forward-search")
+                            .ghost()
+                            .icon(IconName::Search)
+                            .tooltip("Search port forwards")
+                            .disabled(true),
+                    )
+                    .child(
+                        Button::new("forward-grid")
+                            .ghost()
+                            .icon(Icon::default().data(glyph::GRID))
+                            .tooltip("Grid view")
+                            .disabled(true),
+                    )
+                    .child(
+                        Button::new("forward-calendar")
+                            .ghost()
+                            .icon(Icon::default().data(glyph::CALENDAR))
+                            .tooltip("Calendar view")
+                            .disabled(true),
+                    ),
             )
     }
 
@@ -525,22 +559,11 @@ impl ForwardPane {
 
     /// The list, or whichever state stands in for it.
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
-        // No session: say so rather than show an empty tunnels list.
-        if self.session.is_none() {
-            return empty_state(
-                cx,
-                "No session",
-                "Open an SSH session to forward ports through it.",
-            )
-            .into_any_element();
-        }
-
         if self.forwards.is_empty() {
             return empty_state(
                 cx,
                 "Set up port forwarding",
-                "Add a port forward to reach databases, web apps, and other services \
-                 through the session.",
+                "Save port forwarding to access databases, web apps, and other services.",
             )
             .into_any_element();
         }
@@ -705,8 +728,9 @@ fn empty_state(cx: &App, title: &str, detail: &str) -> Div {
                 .rounded(px(16.))
                 .bg(cx.theme().muted)
                 .child(
-                    Icon::new(IconName::ExternalLink)
-                        .large()
+                    Icon::default()
+                        .data(glyph::FORWARD)
+                        .size(px(32.))
                         .text_color(foreground),
                 ),
         )

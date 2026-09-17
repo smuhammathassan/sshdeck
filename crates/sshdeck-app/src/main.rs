@@ -1241,7 +1241,6 @@ impl SshDeck {
     /// - `SSH keys & known hosts` → sidebar "Keys" button and the palette.
     /// - Theme toggle → palette "Toggle Light / Dark Theme".
     fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let collapsed = self.sidebar_collapsed;
         // Header stays dark navy #1d2033 in both Light and Dark (hardcoded; no theme token covers it in Light).
         let header_bg = rgb(0x1d2033);
         let header_fg = rgb(0xffffff);
@@ -1274,15 +1273,6 @@ impl SshDeck {
                     }),
             )
             .child(
-                Button::new("palette")
-                    .ghost()
-                    .icon(IconName::Search)
-                    .tooltip("Command palette")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_palette(window, cx);
-                    })),
-            )
-            .child(
                 Button::new("notifications")
                     .ghost()
                     .icon(Icon::default().data(glyph::BELL).size(px(16.)))
@@ -1292,15 +1282,18 @@ impl SshDeck {
                             .push_notification(Notification::info("Notifications coming soon"), cx);
                     }),
             )
-            .child(
-                Button::new("account")
-                    .ghost()
-                    .icon(IconName::CircleUser)
-                    .tooltip("Settings & account")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_settings(window, cx);
-                    })),
-            );
+            .when(matches!(self.tab, MainTab::Session(_)), |this| {
+                this.child(
+                    Button::new("right-sidebar-toggle")
+                        .ghost()
+                        .icon(IconName::PanelRight)
+                        .tooltip("Toggle host details")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.details_open = !this.details_open;
+                            cx.notify();
+                        })),
+                )
+            });
 
         div()
             .flex()
@@ -1320,24 +1313,6 @@ impl SshDeck {
             .border_b_1()
             .border_color(rgba(0x8d91a540))
             .window_control_area(WindowControlArea::Drag)
-            .child(
-                Button::new("sidebar-toggle")
-                    .ghost()
-                    .icon(if collapsed {
-                        IconName::PanelLeftOpen
-                    } else {
-                        IconName::PanelLeftClose
-                    })
-                    .tooltip(if collapsed {
-                        "Expand sidebar"
-                    } else {
-                        "Collapse sidebar"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.sidebar_collapsed = !this.sidebar_collapsed;
-                        cx.notify();
-                    })),
-            )
             .child(self.render_tabs(cx))
             .child(actions)
     }
@@ -1652,12 +1627,12 @@ impl SshDeck {
         let selected_fg = cx.theme().foreground; // #ffffff
         let hover_bg = rgb(0x3e4257);
 
-        div()
+        let mut tab_div = div()
             .id(SharedString::from(format!("tab-{label}")))
             .flex()
             .flex_row()
             .items_center()
-            .gap_2()
+            .gap_1p5()
             .px_3()
             .h(px(51.))
             .rounded_md()
@@ -1671,7 +1646,24 @@ impl SshDeck {
                     .size(px(16.))
                     .text_color(if is_active { selected_fg } else { muted }),
             )
-            .child(label)
+            .child(label);
+
+        if label == "Vaults" {
+            tab_div = tab_div
+                .child(
+                    Icon::default()
+                        .data(glyph::CLOUD)
+                        .size(px(14.))
+                        .text_color(muted),
+                )
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(px(12.))
+                        .text_color(muted),
+                );
+        }
+
+        tab_div
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_tab(target, window, cx);
             }))
@@ -1726,8 +1718,39 @@ impl SshDeck {
             };
             let state_label = session.status.state.label();
             let id = session.host.clone();
-            let reconnect_id = id.clone();
             let close_id = id.clone();
+
+            let host_opt = self.store.inventory().get(&session.host);
+            let os_tile = if let Some(host) = host_opt {
+                let tint = host_os_tint(host, rgb(0xe95420).into());
+                div()
+                    .size(px(20.))
+                    .rounded(px(5.))
+                    .bg(rgb(0x351d18))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .data(glyph::UBUNTU)
+                            .size(px(14.))
+                            .text_color(tint),
+                    )
+            } else {
+                div()
+                    .size(px(20.))
+                    .rounded(px(5.))
+                    .bg(rgb(0x282b3d))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .data(glyph::TERMINAL_PROMPT)
+                            .size(px(14.))
+                            .text_color(glyph_color),
+                    )
+            };
 
             strip = strip.child(
                 div()
@@ -1747,22 +1770,8 @@ impl SshDeck {
                         let tip = state_label.clone();
                         move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
                     })
-                    .child(Icon::new(IconName::SquareTerminal).text_color(glyph_color))
+                    .child(os_tile)
                     .child(SharedString::from(label))
-                    .child(
-                        Button::new(SharedString::from(format!("reconnect-tab-{reconnect_id}")))
-                            .ghost()
-                            .icon(IconName::RotateCw)
-                            .tooltip("Reconnect")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                if let Some(host) =
-                                    this.store.inventory().get(&reconnect_id).cloned()
-                                {
-                                    this.connect(host, window, cx);
-                                }
-                            })),
-                    )
                     .child(
                         Button::new(SharedString::from(format!("close-tab-{close_id}")))
                             .ghost()
@@ -2015,10 +2024,12 @@ impl SshDeck {
                 match self.left_nav {
                     LeftNav::Hosts => self.render_vault(cx),
                     LeftNav::Keychain | LeftNav::KnownHosts => {
-                        // KeysPane covers both SSH keys and known hosts. Section is
-                        // private with no public setter, so the same pane is rendered
-                        // for both nav entries and the user switches inside the pane.
                         let pane = self.ensure_keys_pane(window, cx);
+                        let section = match self.left_nav {
+                            LeftNav::KnownHosts => keys_pane::KeysSection::Hosts,
+                            _ => keys_pane::KeysSection::Keys,
+                        };
+                        pane.update(cx, |p, cx| p.show(section, cx));
                         div()
                             .flex()
                             .flex_col()
@@ -2547,491 +2558,581 @@ impl SshDeck {
         let theme_picker_open = self.theme_picker_open;
         let selected_theme = self.selected_theme.clone();
 
-        let body: AnyElement = match selected_host.clone() {
-            None => div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .p_6()
-                .text_color(muted)
-                .child("Select a host to see details")
-                .into_any_element(),
-            Some(host) => {
-                let host_for_connect = host.clone();
+        let (body, connect_btn): (AnyElement, Option<AnyElement>) = match selected_host.clone() {
+            None => (
                 div()
                     .flex()
                     .flex_col()
-                    .gap_3()
-                    .p_3()
-                    .overflow_y_scrollbar()
-                    // Card 1: Address
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_3()
-                            .p_3()
-                            .rounded_md()
-                            .bg(card_bg)
-                            .border_1()
-                            .border_color(border)
-                            .child(
-                                div()
-                                    .size(px(40.))
-                                    .rounded(px(8.))
-                                    .bg(orange)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        Icon::default()
-                                            .data(glyph::UBUNTU)
-                                            .size(px(24.))
-                                            .text_color(rgb(0xffffff)),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .flex_1()
-                                    .child(div().text_xs().text_color(muted).child("Address"))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(fg)
-                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                            .child(SharedString::from(host.address.clone())),
-                                    ),
-                            ),
-                    )
-                    // Card 2: General
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .p_3()
-                            .rounded_md()
-                            .bg(card_bg)
-                            .border_1()
-                            .border_color(border)
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                            .text_color(fg)
-                                            .child("General"),
-                                    )
-                                    .child(
-                                        Button::new("general-backspace")
-                                            .ghost()
-                                            .icon(
-                                                Icon::default()
-                                                    .data(glyph::BACKSPACE)
-                                                    .size(px(14.)),
-                                            )
-                                            .tooltip("Clear")
-                                            .on_click(|_, window, cx| {
-                                                window.push_notification(
-                                                    Notification::info("Cleared"),
-                                                    cx,
-                                                );
-                                            }),
-                                    ),
-                            )
-                            .child(div().text_xs().text_color(muted).child("Label"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(fg)
-                                    .child(SharedString::from(host.label.clone())),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .pt_1()
-                                    .border_t_1()
-                                    .border_color(rgba(0x8d91a51a))
-                                    .child(div().text_xs().text_color(muted).child("Parent Group"))
-                                    .child(div().text_xs().text_color(fg).child("Default")),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(div().text_xs().text_color(muted).child("Tags"))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(accent)
-                                            .cursor_pointer()
-                                            .child("+ Add tag"),
-                                    ),
-                            ),
-                    )
-                    // Share this host
-                    .child(
-                        div()
-                            .id("share-this-host-btn")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_center()
-                            .gap_2()
-                            .p_2()
-                            .text_color(accent)
-                            .cursor_pointer()
-                            .child(Icon::default().data(glyph::SHARE).size(px(14.)))
-                            .child(div().text_sm().child("Share this host"))
-                            .on_click(|_, window, cx| {
-                                window.push_notification(Notification::info("Sharing options"), cx);
-                            }),
-                    )
-                    // Card 3: SSH & Credentials
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2p5()
-                            .p_3()
-                            .rounded_md()
-                            .bg(card_bg)
-                            .border_1()
-                            .border_color(border)
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                            .text_color(fg)
-                                            .child(format!("SSH on {} port", host.port)),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                    .text_color(muted)
-                                    .child("Credentials"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(div().text_xs().text_color(muted).child("Username"))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(fg)
-                                            .child(SharedString::from(host.username.clone())),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(div().text_xs().text_color(muted).child("Password"))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .justify_between()
-                                            .child(div().text_sm().text_color(fg).child(
-                                                if password_visible {
-                                                    match &host.auth {
-                                                        sshdeck_core::AuthMethod::Password {
-                                                            secret_ref,
-                                                        } => secret_ref.clone(),
-                                                        _ => "(no password set)".to_string(),
-                                                    }
-                                                } else {
-                                                    "••••••••".to_string()
-                                                },
-                                            ))
-                                            .child(
-                                                Button::new("pwd-toggle")
-                                                    .ghost()
-                                                    .icon(
-                                                        Icon::default()
-                                                            .data(if password_visible {
-                                                                glyph::EYE_OFF
-                                                            } else {
-                                                                glyph::EYE
-                                                            })
-                                                            .size(px(14.)),
-                                                    )
-                                                    .tooltip(if password_visible {
-                                                        "Hide password"
-                                                    } else {
-                                                        "Show password"
-                                                    })
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.password_visible =
-                                                            !this.password_visible;
-                                                        cx.notify();
-                                                    })),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div().flex().flex_row().items_center().pt_1().child(
-                                    Button::new("btn-ssh-id")
-                                        .ghost()
-                                        .small()
-                                        .label("+ SSH ID, Key, Certificate, FIDO2")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.credentials_popover_open =
-                                                !this.credentials_popover_open;
-                                            cx.notify();
-                                        })),
-                                ),
-                            )
-                            .when(popover_open, |el| {
-                                el.child(
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .p_6()
+                    .text_color(muted)
+                    .child("Select a host to see details")
+                    .into_any_element(),
+                None,
+            ),
+            Some(host) => {
+                let host_for_connect = host.clone();
+                (
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_3()
+                        .overflow_y_scrollbar()
+                        // Card 1: Address
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_3()
+                                .p_3()
+                                .rounded_md()
+                                .bg(card_bg)
+                                .border_1()
+                                .border_color(border)
+                                .child(
+                                    div()
+                                        .size(px(40.))
+                                        .rounded(px(8.))
+                                        .bg(orange)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Icon::default()
+                                                .data(glyph::UBUNTU)
+                                                .size(px(24.))
+                                                .text_color(rgb(0xffffff)),
+                                        ),
+                                )
+                                .child(
                                     div()
                                         .flex()
                                         .flex_col()
-                                        .p_2()
-                                        .rounded_md()
+                                        .flex_1()
+                                        .gap_1()
+                                        .child(div().text_xs().text_color(muted).child("Address"))
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded(px(4.))
+                                                .bg(rgb(0xf7f9fa))
+                                                .border_1()
+                                                .border_color(border)
+                                                .text_sm()
+                                                .text_color(fg)
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                .child(SharedString::from(host.address.clone())),
+                                        ),
+                                ),
+                        )
+                        // Card 2: General
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .p_3()
+                                .rounded_md()
+                                .bg(card_bg)
+                                .border_1()
+                                .border_color(border)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                .text_color(fg)
+                                                .child("General"),
+                                        )
+                                        .child(
+                                            Button::new("general-backspace")
+                                                .ghost()
+                                                .icon(
+                                                    Icon::default()
+                                                        .data(glyph::BACKSPACE)
+                                                        .size(px(14.)),
+                                                )
+                                                .tooltip("Clear")
+                                                .on_click(|_, window, cx| {
+                                                    window.push_notification(
+                                                        Notification::info("Cleared"),
+                                                        cx,
+                                                    );
+                                                }),
+                                        ),
+                                )
+                                .child(div().text_xs().text_color(muted).child("Label"))
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(px(4.))
                                         .bg(rgb(0xf7f9fa))
                                         .border_1()
                                         .border_color(border)
-                                        .gap_1()
-                                        .child(
-                                            Button::new("add-ssh-key")
-                                                .ghost()
-                                                .small()
-                                                .icon(
-                                                    Icon::default().data(glyph::KEY).size(px(14.)),
-                                                )
-                                                .label("SSH Key")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.credentials_popover_open = false;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("add-cert")
-                                                .ghost()
-                                                .small()
-                                                .icon(
-                                                    Icon::default()
-                                                        .data(glyph::CERTIFICATE)
-                                                        .size(px(14.)),
-                                                )
-                                                .label("Certificate")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.credentials_popover_open = false;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("add-fido2")
-                                                .ghost()
-                                                .small()
-                                                .icon(
-                                                    Icon::default()
-                                                        .data(glyph::SECURITY_KEY)
-                                                        .size(px(14.)),
-                                                )
-                                                .label("Security Key / FIDO2")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.credentials_popover_open = false;
-                                                    cx.notify();
-                                                })),
-                                        ),
+                                        .text_sm()
+                                        .text_color(fg)
+                                        .child(SharedString::from(host.label.clone())),
                                 )
-                            }),
-                    )
-                    // Card 4: Show more collapsible
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .p_3()
-                            .rounded_md()
-                            .bg(card_bg)
-                            .border_1()
-                            .border_color(border)
-                            .child(
-                                Button::new("btn-show-more")
-                                    .ghost()
-                                    .small()
-                                    .label(if show_more {
-                                        "Show less ▴"
-                                    } else {
-                                        "Show more ▾"
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_more = !this.show_more;
-                                        cx.notify();
-                                    })),
-                            )
-                            .when(show_more, |el| {
-                                el.child(
+                                .child(
                                     div()
                                         .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .pt_2()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .pt_1()
                                         .border_t_1()
                                         .border_color(rgba(0x8d91a51a))
                                         .child(
                                             div()
-                                                .text_xs()
-                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                .text_color(muted)
-                                                .child("Terminal Theme"),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("btn-terminal-theme-select")
                                                 .flex()
                                                 .flex_row()
                                                 .items_center()
-                                                .justify_between()
-                                                .p_2()
-                                                .rounded_md()
+                                                .gap_1p5()
+                                                .child(
+                                                    Icon::default()
+                                                        .data(glyph::FOLDER)
+                                                        .size(px(12.))
+                                                        .text_color(muted),
+                                                )
+                                                .child(div().text_xs().text_color(muted).child("Parent Group")),
+                                        )
+                                        .child(div().text_xs().text_color(fg).child("Default")),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    Icon::default()
+                                                        .data(glyph::TAG)
+                                                        .size(px(12.))
+                                                        .text_color(muted),
+                                                )
+                                                .child(div().text_xs().text_color(muted).child("Tags")),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(accent)
+                                                .cursor_pointer()
+                                                .child("+ Add tag"),
+                                        ),
+                                ),
+                        )
+                        // Share this host
+                        .child(
+                            div()
+                                .id("share-this-host-btn")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .p_2()
+                                .text_color(accent)
+                                .cursor_pointer()
+                                .child(Icon::default().data(glyph::SHARE).size(px(14.)))
+                                .child(div().text_sm().child("Share this host"))
+                                .on_click(|_, window, cx| {
+                                    window.push_notification(Notification::info("Sharing options"), cx);
+                                }),
+                        )
+                        // Card 3: SSH & Credentials
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2p5()
+                                .p_3()
+                                .rounded_md()
+                                .bg(card_bg)
+                                .border_1()
+                                .border_color(border)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                .text_color(fg)
+                                                .child("SSH on"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded(px(4.))
                                                 .bg(rgb(0xf7f9fa))
                                                 .border_1()
                                                 .border_color(border)
-                                                .cursor_pointer()
-                                                .hover(|s| s.border_color(accent))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.theme_picker_open =
-                                                        !this.theme_picker_open;
-                                                    cx.notify();
-                                                }))
+                                                .text_xs()
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                .text_color(fg)
+                                                .child(format!("{}", host.port)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                .text_color(fg)
+                                                .child("port"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .text_color(muted)
+                                        .child("Credentials"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(div().text_xs().text_color(muted).child("Username"))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    Icon::new(IconName::User)
+                                                        .size(px(14.))
+                                                        .text_color(muted),
+                                                )
                                                 .child(
                                                     div()
                                                         .text_sm()
                                                         .text_color(fg)
-                                                        .child(selected_theme.clone()),
-                                                )
-                                                .child(
-                                                    div().text_xs().text_color(muted).child("▾"),
+                                                        .child(SharedString::from(host.username.clone())),
                                                 ),
-                                        )
-                                        .when(theme_picker_open, |theme_el| {
-                                            let themes = [
-                                                "Termius Dark",
-                                                "Termius Light",
-                                                "Monokai",
-                                                "Solarized Dark",
-                                                "Dracula",
-                                                "Nord",
-                                                "One Dark",
-                                            ];
-                                            theme_el.child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .p_2()
-                                                    .rounded_md()
-                                                    .bg(rgb(0xffffff))
-                                                    .border_1()
-                                                    .border_color(border)
-                                                    .gap_1()
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .font_weight(gpui_kit::FontWeight::BOLD)
-                                                            .text_color(muted)
-                                                            .child("Select Color Theme"),
-                                                    )
-                                                    .children(themes.into_iter().map(|th| {
-                                                        let th_str = th.to_string();
-                                                        let is_cur = th == selected_theme;
-                                                        let th_id = SharedString::from(format!(
-                                                            "theme-opt-{}",
-                                                            th.replace(' ', "-")
-                                                        ));
-                                                        div()
-                                                            .id(th_id)
-                                                            .flex()
-                                                            .flex_row()
-                                                            .items_center()
-                                                            .justify_between()
-                                                            .px_2()
-                                                            .py_1p5()
-                                                            .rounded_md()
-                                                            .cursor_pointer()
-                                                            .when(is_cur, |s| s.bg(rgb(0xe6ebed)))
-                                                            .hover(|s| s.bg(rgb(0xf0f3f5)))
-                                                            .on_click(cx.listener(
-                                                                move |this, _, _, cx| {
-                                                                    this.selected_theme =
-                                                                        th_str.clone();
-                                                                    this.theme_picker_open = false;
-                                                                    cx.notify();
-                                                                },
-                                                            ))
-                                                            .child(
-                                                                div()
-                                                                    .text_sm()
-                                                                    .text_color(fg)
-                                                                    .child(th),
-                                                            )
-                                                            .when(is_cur, |s| {
-                                                                s.child(
-                                                                    div()
-                                                                        .text_xs()
-                                                                        .text_color(accent)
-                                                                        .child("✓"),
-                                                                )
-                                                            })
-                                                    })),
-                                            )
-                                        })
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(muted)
-                                                .child("Startup Snippet: (None)"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(muted)
-                                                .child("Keep-alive interval: 15s"),
                                         ),
                                 )
-                            }),
-                    )
-                    // Connect button
-                    .child(
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(div().text_xs().text_color(muted).child("Password"))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        .child(
+                                                            Icon::default()
+                                                                .data(glyph::KEY)
+                                                                .size(px(14.))
+                                                                .text_color(muted),
+                                                        )
+                                                        .child(div().text_sm().text_color(fg).child(
+                                                            if password_visible {
+                                                                match &host.auth {
+                                                                    sshdeck_core::AuthMethod::Password {
+                                                                        secret_ref,
+                                                                    } => secret_ref.clone(),
+                                                                    _ => "(no password set)".to_string(),
+                                                                }
+                                                            } else {
+                                                                "••••••••".to_string()
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new("pwd-toggle")
+                                                        .ghost()
+                                                        .icon(
+                                                            Icon::default()
+                                                                .data(if password_visible {
+                                                                    glyph::EYE_OFF
+                                                                } else {
+                                                                    glyph::EYE
+                                                                })
+                                                                .size(px(14.)),
+                                                        )
+                                                        .tooltip(if password_visible {
+                                                            "Hide password"
+                                                        } else {
+                                                            "Show password"
+                                                        })
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.password_visible =
+                                                                !this.password_visible;
+                                                            cx.notify();
+                                                        })),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div().flex().flex_row().items_center().pt_1().child(
+                                        Button::new("btn-ssh-id")
+                                            .ghost()
+                                            .small()
+                                            .label("+ SSH ID, Key, Certificate, FIDO2")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.credentials_popover_open =
+                                                    !this.credentials_popover_open;
+                                                cx.notify();
+                                            })),
+                                    ),
+                                )
+                                .when(popover_open, |el| {
+                                    el.child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .p_2()
+                                            .rounded_md()
+                                            .bg(rgb(0xf7f9fa))
+                                            .border_1()
+                                            .border_color(border)
+                                            .gap_1()
+                                            .child(
+                                                Button::new("add-ssh-key")
+                                                    .ghost()
+                                                    .small()
+                                                    .icon(
+                                                        Icon::default().data(glyph::KEY).size(px(14.)),
+                                                    )
+                                                    .label("SSH Key")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.credentials_popover_open = false;
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("add-cert")
+                                                    .ghost()
+                                                    .small()
+                                                    .icon(
+                                                        Icon::default()
+                                                            .data(glyph::CERTIFICATE)
+                                                            .size(px(14.)),
+                                                    )
+                                                    .label("Certificate")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.credentials_popover_open = false;
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("add-fido2")
+                                                    .ghost()
+                                                    .small()
+                                                    .icon(
+                                                        Icon::default()
+                                                            .data(glyph::SECURITY_KEY)
+                                                            .size(px(14.)),
+                                                    )
+                                                    .label("Security Key / FIDO2")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.credentials_popover_open = false;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    )
+                                }),
+                        )
+                        // Card 4: Show more collapsible
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .p_3()
+                                .rounded_md()
+                                .bg(card_bg)
+                                .border_1()
+                                .border_color(border)
+                                .child(
+                                    Button::new("btn-show-more")
+                                        .ghost()
+                                        .small()
+                                        .label(if show_more {
+                                            "Show less ▴"
+                                        } else {
+                                            "Show more ▾"
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.show_more = !this.show_more;
+                                            cx.notify();
+                                        })),
+                                )
+                                .when(show_more, |el| {
+                                    el.child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .pt_2()
+                                            .border_t_1()
+                                            .border_color(rgba(0x8d91a51a))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                    .text_color(muted)
+                                                    .child("Terminal Theme"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("btn-terminal-theme-select")
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .p_2()
+                                                    .rounded_md()
+                                                    .bg(rgb(0xf7f9fa))
+                                                    .border_1()
+                                                    .border_color(border)
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.border_color(accent))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.theme_picker_open =
+                                                            !this.theme_picker_open;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .text_color(fg)
+                                                            .child(selected_theme.clone()),
+                                                    )
+                                                    .child(
+                                                        div().text_xs().text_color(muted).child("▾"),
+                                                    ),
+                                            )
+                                            .when(theme_picker_open, |theme_el| {
+                                                let themes = [
+                                                    "Termius Dark",
+                                                    "Termius Light",
+                                                    "Monokai",
+                                                    "Solarized Dark",
+                                                    "Dracula",
+                                                    "Nord",
+                                                    "One Dark",
+                                                ];
+                                                theme_el.child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .p_2()
+                                                        .rounded_md()
+                                                        .bg(rgb(0xffffff))
+                                                        .border_1()
+                                                        .border_color(border)
+                                                        .gap_1()
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                                                .text_color(muted)
+                                                                .child("Select Color Theme"),
+                                                        )
+                                                        .children(themes.into_iter().map(|th| {
+                                                            let th_str = th.to_string();
+                                                            let is_cur = th == selected_theme;
+                                                            let th_id = SharedString::from(format!(
+                                                                "theme-opt-{}",
+                                                                th.replace(' ', "-")
+                                                            ));
+                                                            div()
+                                                                .id(th_id)
+                                                                .flex()
+                                                                .flex_row()
+                                                                .items_center()
+                                                                .justify_between()
+                                                                .px_2()
+                                                                .py_1p5()
+                                                                .rounded_md()
+                                                                .cursor_pointer()
+                                                                .when(is_cur, |s| s.bg(rgb(0xe6ebed)))
+                                                                .hover(|s| s.bg(rgb(0xf0f3f5)))
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.selected_theme =
+                                                                            th_str.clone();
+                                                                        this.theme_picker_open = false;
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .child(
+                                                                    div()
+                                                                        .text_sm()
+                                                                        .text_color(fg)
+                                                                        .child(th),
+                                                                )
+                                                                .when(is_cur, |s| {
+                                                                    s.child(
+                                                                        div()
+                                                                            .text_xs()
+                                                                            .text_color(accent)
+                                                                            .child("✓"),
+                                                                    )
+                                                                })
+                                                        })),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child("Startup Snippet: (None)"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child("Keep-alive interval: 15s"),
+                                            ),
+                                    )
+                                }),
+                        )
+                        .into_any_element(),
+                    Some(
                         Button::new("details-connect")
                             .primary()
                             .label("Connect")
+                            .w_full()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.connect(host_for_connect.clone(), window, cx);
-                            })),
-                    )
-                    .into_any_element()
+                            }))
+                            .into_any_element(),
+                    ),
+                )
             }
         };
 
@@ -3055,6 +3156,16 @@ impl SshDeck {
                     .overflow_hidden()
                     .child(body),
             )
+            .when_some(connect_btn, |this, btn| {
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .p_3()
+                        .border_t_1()
+                        .border_color(border)
+                        .child(btn),
+                )
+            })
             .into_any_element()
     }
 

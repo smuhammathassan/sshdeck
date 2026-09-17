@@ -623,6 +623,38 @@ impl LogsPane {
             )
             .into_any_element()
     }
+
+    fn render_upgrade_banner(&self, cx: &mut Context<Self>) -> Div {
+        let border = cx.theme().border;
+        let fg = cx.theme().foreground;
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px_4()
+            .py_2p5()
+            .mx_3()
+            .mt_3()
+            .rounded(px(8.))
+            .bg(cx.theme().background)
+            .border_1()
+            .border_color(border)
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(fg)
+                    .child("Logs are not available on your current plan."),
+            )
+            .child(
+                Button::new("logs-upgrade")
+                    .small()
+                    .ghost()
+                    .label("Upgrade ↑")
+                    .tooltip("sshdeck is 100% free and local"),
+            )
+    }
 }
 
 impl Render for LogsPane {
@@ -638,7 +670,7 @@ impl Render for LogsPane {
             .text_color(foreground)
             .text_size(px(14.))
             .track_focus(&self.focus_handle)
-            .child(self.render_toolbar(cx))
+            .child(self.render_upgrade_banner(cx))
             .child(self.render_body(cx))
     }
 }

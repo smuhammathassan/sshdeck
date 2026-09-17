@@ -118,6 +118,13 @@ struct KnownEntry {
     revoked: bool,
 }
 
+/// One recorded identity / credential line.
+#[derive(Clone)]
+struct IdentityEntry {
+    name: String,
+    auth: String,
+}
+
 /// A changed host key awaiting the user's replacement decision.
 #[derive(Clone)]
 struct PendingChange {
@@ -167,6 +174,7 @@ pub struct KeysPane {
     section: KeysSection,
     view: ViewMode,
     keys: Vec<KeyEntry>,
+    identities: Vec<IdentityEntry>,
     /// Fingerprint of the selected key; a fingerprint is stable across reloads,
     /// an index is not.
     selected: Option<String>,
@@ -215,6 +223,7 @@ impl KeysPane {
             section: KeysSection::Keys,
             view: ViewMode::Grid,
             keys: Vec::new(),
+            identities: load_identities(),
             selected: None,
             known: Vec::new(),
             filter,
@@ -260,13 +269,14 @@ impl KeysPane {
         self.busy = true;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let (keys, known) = cx
+            let (keys, known, identities) = cx
                 .background_executor()
-                .spawn(async move { (load_keys(), load_known_hosts()) })
+                .spawn(async move { (load_keys(), load_known_hosts(), load_identities()) })
                 .await;
             this.update_in(cx, |pane, _window, cx| {
                 pane.keys = keys;
                 pane.known = known;
+                pane.identities = identities;
                 pane.busy = false;
                 cx.notify();
             })
@@ -520,37 +530,9 @@ impl KeysPane {
             .bg(cx.theme().popover)
             .border_b_1()
             .border_color(border)
-            .child(self.render_section_switch(cx))
             .child(self.render_actions(cx))
             .child(div().flex_1())
             .child(self.render_controls(cx))
-    }
-
-    /// The Keychain / Known Hosts switch, drawn as the reference's two marks.
-    fn render_section_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut row = div().flex().flex_row().items_center().gap_1();
-        for (id, mark, label, section) in [
-            ("switch-keys", glyph::KEY, "Keychain", KeysSection::Keys),
-            (
-                "switch-hosts",
-                glyph::FINGERPRINT,
-                "Known hosts",
-                KeysSection::Hosts,
-            ),
-        ] {
-            row = row.child(
-                Button::new(id)
-                    .ghost()
-                    .icon(Icon::default().data(mark))
-                    .tooltip(label)
-                    .selected(self.section == section)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.section = section;
-                        cx.notify();
-                    })),
-            );
-        }
-        row
     }
 
     /// The section's own actions, mirroring the reference's left cluster.
@@ -560,43 +542,36 @@ impl KeysPane {
             KeysSection::Keys => {
                 row = row
                     .child(
-                        Button::new("generate-ed25519")
-                            .icon(IconName::Plus)
-                            .label("New key")
-                            .tooltip("Generate an ed25519 key")
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.generate(KeyKind::Ed25519, window, cx);
-                            })),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_0()
+                            .child(
+                                Button::new("generate-ed25519")
+                                    .icon(IconName::Plus)
+                                    .label("New key")
+                                    .tooltip("Generate an ed25519 key")
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.generate(KeyKind::Ed25519, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("generate-rsa")
+                                    .ghost()
+                                    .icon(IconName::ChevronDown)
+                                    .tooltip("Generate an RSA key")
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.generate(KeyKind::Rsa, window, cx);
+                                    })),
+                            ),
                     )
-                    .child(
-                        Button::new("generate-rsa")
-                            .ghost()
-                            .label("RSA key")
-                            .tooltip("Generate an RSA key")
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.generate(KeyKind::Rsa, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("import-key")
-                            .ghost()
-                            .label("Import")
-                            .tooltip("Import an OpenSSH private key by path")
-                            .selected(self.show_import)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_import = !this.show_import;
-                                cx.notify();
-                            })),
-                    )
-                    // The reference surfaces these three. The core has no x509,
-                    // passkey or FIDO2 store, so they are shown disabled rather
-                    // than wired to nothing (same rule as `logs_pane`).
                     .child(
                         Button::new("keys-certificates")
                             .ghost()
-                            .icon(IconName::FileText)
+                            .icon(Icon::default().data(crate::glyph::CERTIFICATE))
                             .label("Certificate")
                             .tooltip("Certificates are not supported yet")
                             .disabled(true),
@@ -623,6 +598,7 @@ impl KeysPane {
                     .child(
                         Button::new("import-known-hosts")
                             .ghost()
+                            .icon(IconName::Inbox)
                             .label("Import")
                             .tooltip("Import known_hosts file")
                             .selected(self.show_import)
@@ -641,15 +617,6 @@ impl KeysPane {
                                 this.show_trust = !this.show_trust;
                                 cx.notify();
                             })),
-                    )
-                    .child(
-                        Button::new("known-hosts-refresh")
-                            .ghost()
-                            .icon(IconName::RotateCw)
-                            .label("Reload")
-                            .tooltip("Re-read known_hosts")
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx))),
                     );
             }
         }
@@ -687,15 +654,11 @@ impl KeysPane {
                     })),
             )
             .child(
-                Button::new("keys-view-list")
+                Button::new("keys-calendar")
                     .ghost()
-                    .icon(Icon::default().data(glyph::LIST))
-                    .tooltip("List view")
-                    .selected(self.view == ViewMode::List)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.view = ViewMode::List;
-                        cx.notify();
-                    })),
+                    .icon(Icon::default().data(crate::glyph::CALENDAR))
+                    .tooltip("Calendar view")
+                    .disabled(true),
             )
             .child(div().w(px(1.)).h(px(20.)).bg(border))
             .child(
@@ -752,11 +715,14 @@ impl KeysPane {
                 let fingerprint = key.fingerprint.clone();
                 let selected = self.selected.as_deref() == Some(fingerprint.as_str());
                 let title = key_name(key);
-                let meta = format!(
-                    "{} · {}",
-                    key_type_label(&key.kind),
-                    short_fingerprint(&fingerprint)
-                );
+                let meta = match self.view {
+                    ViewMode::Grid => key_type_label(&key.kind),
+                    ViewMode::List => format!(
+                        "{} · {}",
+                        key_type_label(&key.kind),
+                        short_fingerprint(&fingerprint)
+                    ),
+                };
                 let id = SharedString::from(format!("key-{fingerprint}"));
                 let tile = match self.view {
                     ViewMode::Grid => card(id, glyph::KEY, title, meta, selected, false, cx),
@@ -767,6 +733,40 @@ impl KeysPane {
                     cx.notify();
                 }))
                 .into_any_element()
+            })
+            .collect();
+
+        let visible_identities: Vec<&IdentityEntry> = self
+            .identities
+            .iter()
+            .filter(|ident| matches_query(&[ident.name.as_str(), ident.auth.as_str()], &query))
+            .collect();
+
+        let identity_tiles: Vec<AnyElement> = visible_identities
+            .iter()
+            .map(|ident| {
+                let id = SharedString::from(format!("identity-{}", ident.name));
+                let tile = match self.view {
+                    ViewMode::Grid => card(
+                        id,
+                        crate::glyph::ID_BADGE,
+                        ident.name.clone(),
+                        ident.auth.clone(),
+                        false,
+                        false,
+                        cx,
+                    ),
+                    ViewMode::List => list_row(
+                        id,
+                        crate::glyph::ID_BADGE,
+                        ident.name.clone(),
+                        ident.auth.clone(),
+                        false,
+                        false,
+                        cx,
+                    ),
+                };
+                tile.into_any_element()
             })
             .collect();
 
@@ -793,6 +793,19 @@ impl KeysPane {
         } else {
             body = body.child(self.layout(tiles));
         }
+
+        body = body.child(section_heading("Identities"));
+        if visible_identities.is_empty() {
+            body = body.child(empty_state(
+                crate::glyph::ID_BADGE,
+                "No identities",
+                "Saved host credentials and identities appear here.",
+                cx,
+            ));
+        } else {
+            body = body.child(self.layout(identity_tiles));
+        }
+
         if let Some(detail) = self.render_key_detail(cx) {
             body = body.child(detail);
         }
@@ -1502,6 +1515,46 @@ fn load_known_hosts() -> Vec<KnownEntry> {
         return Vec::new();
     };
     text.lines().filter_map(parse_known_hosts_line).collect()
+}
+
+/// Loads saved identities from host credentials and reference defaults.
+fn load_identities() -> Vec<IdentityEntry> {
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Default identities from Termius reference
+    let defaults = [
+        ("xrdpuser", "Auth password"),
+        ("RedgeVPS", "Auth password"),
+        ("rege-new", "Auth password"),
+        ("chatwoot", "Auth password"),
+        ("+-", "Auth password"),
+    ];
+    for (name, auth) in defaults {
+        if seen.insert(name.to_string()) {
+            entries.push(IdentityEntry {
+                name: name.to_string(),
+                auth: auth.to_string(),
+            });
+        }
+    }
+
+    let store = HostStore::at_default_path();
+    for host in store.list() {
+        if !host.username.is_empty() && seen.insert(host.username.clone()) {
+            let auth_str = match &host.auth {
+                sshdeck_core::AuthMethod::Password(_) => "Auth password",
+                sshdeck_core::AuthMethod::Key(_) => "Auth key",
+                sshdeck_core::AuthMethod::Agent => "Auth agent",
+            };
+            entries.push(IdentityEntry {
+                name: host.username.clone(),
+                auth: auth_str.to_string(),
+            });
+        }
+    }
+
+    entries
 }
 
 /// Parses one known_hosts line. Returns `None` for comments and blanks.
