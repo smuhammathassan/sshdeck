@@ -4,6 +4,7 @@
 //! milestone 1. This is milestone 2: the pane next to it is a real terminal
 //! backed by the `sshdeck-core` transport and the `sshdeck-terminal` grid.
 
+mod forward_pane;
 mod keys_pane;
 mod palette;
 mod settings;
