@@ -79,6 +79,10 @@ depends on the UI, and never imports `gpui`.
 - Prefer `cargo check` while iterating; run `cargo build` when a binary is
   actually needed.
 
+## Subagents
+
+Delegate to `deepseek4.1` only. No other subagent, for any task.
+
 ## Legality
 
 Clean-room reimplementation. Standard protocols (SSH, SFTP, mosh, FIDO2) and
