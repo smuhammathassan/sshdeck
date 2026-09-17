@@ -5,3 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Parsing only: the spec model is a tolerant hand-rolled reader over
+# `serde_json::Value` so malformed entries can be skipped, which serde's
+# derived `Deserialize` cannot do per-entry. No other dependency is needed.
+serde_json = { workspace = true }

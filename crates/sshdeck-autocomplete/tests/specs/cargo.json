@@ -1,0 +1,22 @@
+{
+  "name": "cargo",
+  "description": "Rust package manager",
+  "subcommands": [
+    {
+      "name": "build",
+      "description": "Compile the current package",
+      "options": [
+        {
+          "name": "--release",
+          "description": "Build artifacts in release mode"
+        },
+        {
+          "name": "--target",
+          "description": "Build for the target triple",
+          "args": {}
+        }
+      ]
+    },
+    { "name": ["test", "t"], "description": "Run the tests" }
+  ]
+}

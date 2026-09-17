@@ -1,0 +1,4 @@
+{
+  "name": "broken",
+  "subcommands": [
+    { "name": "this file is deliberately not valid JSON",

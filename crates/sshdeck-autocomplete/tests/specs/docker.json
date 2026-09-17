@@ -1,0 +1,37 @@
+{
+  "name": "docker",
+  "description": "Manage containers and images",
+  "options": [
+    { "name": "--debug", "description": "Enable debug output" }
+  ],
+  "subcommands": [
+    {
+      "name": "image",
+      "description": "Manage images",
+      "subcommands": [
+        {
+          "name": "ls",
+          "description": "List images",
+          "options": [
+            { "name": "-a", "description": "Show all images" },
+            { "name": "--digests", "description": "Show digests" }
+          ]
+        },
+        { "name": "rm", "description": "Remove one or more images" }
+      ]
+    },
+    {
+      "name": ["container", "c"],
+      "description": "Manage containers",
+      "subcommands": [
+        {
+          "name": "ls",
+          "description": "List containers",
+          "options": [
+            { "name": "-a", "description": "Show all containers" }
+          ]
+        }
+      ]
+    }
+  ]
+}

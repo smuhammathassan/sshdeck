@@ -1,0 +1,45 @@
+{
+  "name": "git",
+  "description": "Distributed version control system",
+  "options": [
+    {
+      "name": "--color",
+      "description": "Use colored output",
+      "args": {
+        "name": "when",
+        "description": "When to use color",
+        "suggestions": ["always", "auto", "never"]
+      }
+    },
+    { "name": "--version", "description": "Print the git version" }
+  ],
+  "subcommands": [
+    {
+      "name": "commit",
+      "description": "Record changes to the repository",
+      "options": [
+        {
+          "name": ["-m", "--message"],
+          "description": "Use the given message as the commit message",
+          "args": { "name": "message" }
+        },
+        { "name": ["-a", "--all"], "description": "Stage already tracked files" },
+        { "name": "--amend", "description": "Replace the tip of the current branch" },
+        {
+          "name": "--no-verify",
+          "description": "Bypass pre-commit and commit-msg hooks"
+        }
+      ]
+    },
+    {
+      "name": "checkout",
+      "description": "Switch branches or restore working tree files",
+      "options": [
+        { "name": "-b", "description": "Create and check out a new branch" },
+        { "name": "--orphan", "description": "Create a new orphan branch" }
+      ]
+    },
+    { "name": "status", "description": "Show the working tree status" },
+    { "name": "add", "description": "Add file contents to the index" }
+  ]
+}
