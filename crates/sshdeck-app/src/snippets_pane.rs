@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use crate::glyph;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
@@ -560,7 +561,7 @@ impl SnippetsPane {
                     )
                     .child(
                         Button::new("snippets-shell-history")
-                            .icon(IconName::Calendar)
+                            .icon(Icon::default().data(glyph::CLOCK))
                             .label("Shell History")
                             .small()
                             .ghost()
@@ -806,7 +807,8 @@ impl SnippetsPane {
                     .rounded(px(8.))
                     .bg(glyph)
                     .child(
-                        Icon::new(IconName::File)
+                        Icon::default()
+                            .data(glyph::SNIPPET)
                             .small()
                             .text_color(Hsla::from(rgb(0xffffff))),
                     ),
@@ -1085,7 +1087,7 @@ impl SnippetsPane {
     fn render_empty(&self, cx: &App) -> Div {
         empty_state(
             cx,
-            "No snippets yet",
+            "Create snippet",
             "Save your most used commands as snippets to reuse them in one click.",
         )
     }
@@ -1132,7 +1134,7 @@ impl Render for SnippetsPane {
     }
 }
 
-/// Centred empty state, mirroring the port-forwarding pane's `empty_state`.
+/// Centred empty state, mirroring Termius Screenshot 29.
 fn empty_state(cx: &App, title: &str, detail: &str) -> Div {
     let muted = cx.theme().muted_foreground;
     let foreground = cx.theme().foreground;
@@ -1154,7 +1156,12 @@ fn empty_state(cx: &App, title: &str, detail: &str) -> Div {
                 .justify_center()
                 .rounded(px(16.))
                 .bg(cx.theme().muted)
-                .child(Icon::new(IconName::File).large().text_color(foreground)),
+                .child(
+                    Icon::default()
+                        .data(glyph::SNIPPET)
+                        .large()
+                        .text_color(foreground),
+                ),
         )
         .child(
             div()
@@ -1170,13 +1177,6 @@ fn empty_state(cx: &App, title: &str, detail: &str) -> Div {
                 .text_size(px(14.))
                 .text_color(muted)
                 .child(SharedString::from(detail.to_string())),
-        )
-        .child(
-            // Hint to use the toolbar button.
-            div()
-                .text_size(px(12.))
-                .text_color(muted)
-                .child("Use “New snippet” above to create one."),
         )
 }
 

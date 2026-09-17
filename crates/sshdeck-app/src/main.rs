@@ -5,6 +5,7 @@
 //! backed by the `sshdeck-core` transport and the `sshdeck-terminal` grid.
 
 mod forward_pane;
+pub mod glyph;
 mod keys_pane;
 mod logs_pane;
 mod palette;
@@ -436,6 +437,8 @@ enum MainTab {
     Vaults,
     /// The SFTP browser for the focused session.
     Sftp,
+    /// The new tab screen (hosts picker and workspaces).
+    NewTab,
     /// The terminal for `sessions[index]`.
     Session(usize),
 }
@@ -511,6 +514,22 @@ struct SshDeck {
     sftp_attached: Option<usize>,
     /// Bumped per attach attempt so a superseded SFTP connect is ignored.
     sftp_generation: u64,
+    /// Whether the right host details panel is open.
+    details_open: bool,
+    /// Overflow menu inside host details.
+    details_menu_open: bool,
+    /// Theme picker view inside host details.
+    theme_picker_open: bool,
+    /// Credentials popover inside host details (+ SSH ID, Key, etc.).
+    credentials_popover_open: bool,
+    /// Whether password text is revealed in credentials.
+    password_visible: bool,
+    /// Whether "Show more" collapsible is expanded in host details.
+    show_more: bool,
+    /// Search input for the New Tab screen.
+    new_tab_query: Entity<InputState>,
+    /// Selected terminal color theme.
+    selected_theme: String,
     /// Subscription handles must outlive construction, so they are owned here.
     _subscriptions: Vec<Subscription>,
 }
@@ -522,20 +541,31 @@ impl SshDeck {
         // problem on the next save rather than refusing to start.
         let load_error = store.load().err();
 
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search hosts"));
+        let filter = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Find a host or ssh user@hostname...")
+        });
         let draft_label = cx.new(|cx| InputState::new(window, cx).placeholder("Label"));
         let draft_address = cx.new(|cx| InputState::new(window, cx).placeholder("hostname or IP"));
         let draft_username =
             cx.new(|cx| InputState::new(window, cx).placeholder("username (optional)"));
         let draft_port = cx.new(|cx| InputState::new(window, cx).placeholder("port (default 22)"));
+        let new_tab_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search hosts or tabs"));
 
         // Re-render the list as the query changes; the filter itself is applied
         // in `render`, so no filtered copy needs to be kept in state.
-        let subscriptions = vec![cx.subscribe_in(&filter, window, |_, _, event, _, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
-        })];
+        let subscriptions = vec![
+            cx.subscribe_in(&filter, window, |_, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&new_tab_query, window, |_, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        ];
 
         if let Some(error) = load_error {
             let message = SharedString::from(format!("Could not load hosts: {error}"));
@@ -568,6 +598,14 @@ impl SshDeck {
             add_host_open: false,
             sftp_attached: None,
             sftp_generation: 0,
+            details_open: true,
+            details_menu_open: false,
+            theme_picker_open: false,
+            credentials_popover_open: false,
+            password_visible: false,
+            show_more: false,
+            new_tab_query,
+            selected_theme: "Termius Dark".to_string(),
             _subscriptions: subscriptions,
         };
 
@@ -869,9 +907,15 @@ impl SshDeck {
     /// from a real click.
     fn select_left_nav(&mut self, nav: LeftNav, window: &mut Window, cx: &mut Context<Self>) {
         self.left_nav = nav;
+        self.tab = MainTab::Vaults;
         match nav {
-            LeftNav::Keychain | LeftNav::KnownHosts => {
-                self.ensure_keys_pane(window, cx);
+            LeftNav::Keychain => {
+                let pane = self.ensure_keys_pane(window, cx);
+                pane.update(cx, |p, cx| p.show(keys_pane::KeysSection::Keys, cx));
+            }
+            LeftNav::KnownHosts => {
+                let pane = self.ensure_keys_pane(window, cx);
+                pane.update(cx, |p, cx| p.show(keys_pane::KeysSection::Hosts, cx));
             }
             LeftNav::PortForwarding => {
                 self.ensure_forward_pane(window, cx);
@@ -1207,8 +1251,29 @@ impl SshDeck {
             .flex()
             .flex_row()
             .items_center()
-            .gap_1()
+            .gap_2()
             .flex_shrink_0()
+            .child(
+                div()
+                    .id("btn-update")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .px_2p5()
+                    .h(px(26.))
+                    .rounded_full()
+                    .bg(rgb(0x282b3d))
+                    .border_1()
+                    .border_color(rgba(0x8d91a540))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x3e4257)))
+                    .child(div().size(px(6.)).rounded_full().bg(rgb(0x21b568)))
+                    .child(div().text_xs().text_color(rgb(0xffffff)).child("Update"))
+                    .on_click(|_, window, cx| {
+                        window.push_notification(Notification::info("sshdeck is up to date"), cx);
+                    }),
+            )
             .child(
                 Button::new("palette")
                     .ghost()
@@ -1221,7 +1286,7 @@ impl SshDeck {
             .child(
                 Button::new("notifications")
                     .ghost()
-                    .icon(IconName::Bell)
+                    .icon(Icon::default().data(glyph::BELL).size(px(16.)))
                     .tooltip("Notifications")
                     .on_click(|_, window, cx| {
                         window
@@ -1376,28 +1441,33 @@ impl SshDeck {
     }
 
     fn render_left_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Hardcoded light rail colours (no token for #f7f9fa sidebar/list).
         let rail_bg = rgb(0xf7f9fa);
         let border = rgb(0xd5dde0);
         let active_bg = cx.theme().muted; // #e6ebed in light
         let fg = cx.theme().foreground; // #141729
         let muted = cx.theme().muted_foreground; // #798c94
+        let collapsed = self.sidebar_collapsed;
 
-        let nav_item = |label: &'static str, icon: IconName, _nav: LeftNav, is_active: bool| {
+        let nav_item = move |label: &'static str, glyph_data: &'static [u8], is_active: bool| {
             div()
                 .id(SharedString::from(format!("nav-{label}")))
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_2()
-                .h(px(44.))
-                .px_3()
+                .when(collapsed, |el| el.justify_center().px_0())
+                .when(!collapsed, |el| el.gap_2().px_3())
+                .h(px(38.))
                 .rounded(px(8.))
                 .cursor_pointer()
                 .when(is_active, |el| el.bg(active_bg))
                 .text_color(if is_active { fg } else { muted })
-                .child(Icon::new(icon).text_color(if is_active { fg } else { muted }))
-                .child(label)
+                .child(
+                    Icon::default()
+                        .data(glyph_data)
+                        .size(px(16.))
+                        .text_color(if is_active { fg } else { muted }),
+                )
+                .when(!collapsed, |el| el.child(label))
                 .hover(|s| s.bg(active_bg))
         };
 
@@ -1415,7 +1485,7 @@ impl SshDeck {
             .w(if self.sidebar_collapsed {
                 px(60.)
             } else {
-                px(230.)
+                px(180.)
             })
             .h_full()
             .bg(rail_bg)
@@ -1424,66 +1494,46 @@ impl SshDeck {
             .p_2()
             .gap_1()
             .child(
-                nav_item(
-                    "Hosts",
-                    IconName::LayoutDashboard,
-                    LeftNav::Hosts,
-                    hosts_active,
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.select_left_nav(LeftNav::Hosts, window, cx);
-                })),
+                nav_item("Hosts", glyph::HOST, hosts_active).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.select_left_nav(LeftNav::Hosts, window, cx);
+                    },
+                )),
             )
             .child(
-                nav_item(
-                    "Keychain",
-                    IconName::HardDrive,
-                    LeftNav::Keychain,
-                    keychain_active,
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.select_left_nav(LeftNav::Keychain, window, cx);
-                })),
+                nav_item("Keychain", glyph::KEY, keychain_active).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.select_left_nav(LeftNav::Keychain, window, cx);
+                    },
+                )),
             )
             .child(
-                nav_item(
-                    "Port Forwarding",
-                    IconName::ExternalLink,
-                    LeftNav::PortForwarding,
-                    pf_active,
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.select_left_nav(LeftNav::PortForwarding, window, cx);
-                })),
+                nav_item("Port Forwarding", glyph::FORWARD, pf_active).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.select_left_nav(LeftNav::PortForwarding, window, cx);
+                    },
+                )),
             )
             .child(
-                nav_item(
-                    "Snippets",
-                    IconName::File,
-                    LeftNav::Snippets,
-                    snippets_active,
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.select_left_nav(LeftNav::Snippets, window, cx);
-                })),
+                nav_item("Snippets", glyph::SNIPPET, snippets_active).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.select_left_nav(LeftNav::Snippets, window, cx);
+                    },
+                )),
             )
             .child(
-                nav_item(
-                    "Known Hosts",
-                    IconName::Globe,
-                    LeftNav::KnownHosts,
-                    known_active,
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.select_left_nav(LeftNav::KnownHosts, window, cx);
-                })),
+                nav_item("Known Hosts", glyph::FINGERPRINT, known_active).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.select_left_nav(LeftNav::KnownHosts, window, cx);
+                    },
+                )),
             )
             .child(
-                nav_item("Logs", IconName::Inbox, LeftNav::Logs, logs_active).on_click(
-                    cx.listener(|this, _, window, cx| {
+                nav_item("Logs", glyph::CLOCK, logs_active).on_click(cx.listener(
+                    |this, _, window, cx| {
                         this.select_left_nav(LeftNav::Logs, window, cx);
-                    }),
-                ),
+                    },
+                )),
             )
     }
 
@@ -1593,16 +1643,14 @@ impl SshDeck {
     fn render_fixed_tab(
         &mut self,
         label: &'static str,
-        icon: IconName,
+        glyph_data: &'static [u8],
         target: MainTab,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let is_active = self.tab == target;
+        let is_active = self.tab == target && self.overlay.is_none();
         let muted = cx.theme().muted_foreground; // #8d91a5
         let selected_bg = cx.theme().muted; // #282b3d
         let selected_fg = cx.theme().foreground; // #ffffff
-                                                 // `--list-hover` (#3e4257) — token `list.hover.background` still equals
-                                                 // the card background in the bundled theme, so the recovered hex is used.
         let hover_bg = rgb(0x3e4257);
 
         div()
@@ -1618,7 +1666,12 @@ impl SshDeck {
             .text_color(if is_active { selected_fg } else { muted })
             .when(is_active, |el| el.bg(selected_bg))
             .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
-            .child(Icon::new(icon).text_color(if is_active { selected_fg } else { muted }))
+            .child(
+                Icon::default()
+                    .data(glyph_data)
+                    .size(px(16.))
+                    .text_color(if is_active { selected_fg } else { muted }),
+            )
             .child(label)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_tab(target, window, cx);
@@ -1627,14 +1680,7 @@ impl SshDeck {
     }
 
     /// The tab row: the two fixed tabs (Vaults, SFTP), then one tab per open
-    /// session, then the add control.
-    ///
-    /// `--horizontal-tabs-height` is 51px, centred in the 56px header. The
-    /// selected tab is one step lighter (`--surface-high`, the theme's `muted`
-    /// background, `#282b3d`) with primary text; unselected tabs are transparent
-    /// with the secondary `#8d91a5` text and stay 6px-rounded. A session tab
-    /// carries a terminal glyph (SquareTerminal) tinted by connection state
-    /// instead of a dot, then the label, then the close `✕`.
+    /// session, New Tab if open, then the add tab `+` control.
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground; // #8d91a5
         let selected_bg = cx.theme().muted; // #282b3d
@@ -1642,10 +1688,8 @@ impl SshDeck {
         let hover_bg = rgb(0x3e4257); // --list-hover
         let active = self.active;
 
-        let vaults =
-            self.render_fixed_tab("Vaults", IconName::LayoutDashboard, MainTab::Vaults, cx);
-        // Heavier closed-folder glyph reads more solid than FolderOpen.
-        let sftp = self.render_fixed_tab("SFTP", IconName::Folder, MainTab::Sftp, cx);
+        let vaults = self.render_fixed_tab("Vaults", glyph::VAULT, MainTab::Vaults, cx);
+        let sftp = self.render_fixed_tab("SFTP", glyph::FOLDER, MainTab::Sftp, cx);
 
         let mut strip = div()
             .id("tab-strip")
@@ -1672,8 +1716,7 @@ impl SshDeck {
             let is_active = self.overlay.is_none() && active == Some(index);
             // Glyph tint carries connection state (connected #21b568 via
             // `success`, connecting #f2c94c via `warning`, failed #f25e61 via
-            // `danger`, idle #8d91a5 via `muted_foreground`). The session tab
-            // order is glyph, label, close `✕` — the dot is gone.
+            // `danger`, idle #8d91a5 via `muted_foreground`).
             let glyph_color = match &session.status.state {
                 SessionState::Connected => cx.theme().success, // #21b568
                 SessionState::Connecting | SessionState::Authenticating => cx.theme().warning, // #f2c94c
@@ -1701,9 +1744,6 @@ impl SshDeck {
                     .text_color(if is_active { selected_fg } else { muted })
                     .when(is_active, |el| el.bg(selected_bg))
                     .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
-                    // (unconfirmed) Div tooltip via closure; verified tooltip
-                    // path is Button::tooltip(string) — this Div form mirrors
-                    // docs/UI-PARITY.md "plus a tooltip" requirement.
                     .tooltip({
                         let tip = state_label.clone();
                         move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
@@ -1740,13 +1780,46 @@ impl SshDeck {
             );
         }
 
+        if self.tab == MainTab::NewTab {
+            strip = strip.child(
+                div()
+                    .id("tab-new-tab")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .h(px(51.))
+                    .rounded_md()
+                    .bg(selected_bg)
+                    .text_color(selected_fg)
+                    .child(
+                        Icon::default()
+                            .data(glyph::TERMINAL_PROMPT)
+                            .size(px(16.))
+                            .text_color(selected_fg),
+                    )
+                    .child("New Tab")
+                    .child(
+                        Button::new("close-new-tab")
+                            .ghost()
+                            .icon(IconName::Close)
+                            .tooltip("Close tab")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.select_tab(MainTab::Vaults, window, cx);
+                            })),
+                    ),
+            );
+        }
+
         strip.child(
-            Button::new("add-host-tab")
+            Button::new("add-tab-btn")
                 .ghost()
                 .icon(IconName::Plus)
-                .tooltip("Add host")
+                .tooltip("New tab")
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_add_host(window, cx);
+                    this.select_tab(MainTab::NewTab, window, cx);
                 })),
         )
     }
@@ -1989,11 +2062,12 @@ impl SshDeck {
                 }
             }
             MainTab::Sftp => self.render_sftp(cx),
+            MainTab::NewTab => self.render_new_tab(cx),
             MainTab::Session(_) => self.render_session(cx),
         }
     }
 
-    /// The Vaults/Hosts screen — Termius light: search + Connect, toolbar, Hosts header, 2-col white cards, right Host Details.
+    /// The Vaults/Hosts screen — Termius light: search + Connect, toolbar, Hosts header, 2-col/3-col white cards, right Host Details drawer.
     fn render_vault(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let content_bg = cx.theme().accent; // #edf1f2 in light
         let muted = cx.theme().muted_foreground; // #798c94
@@ -2016,6 +2090,7 @@ impl SshDeck {
             .child(
                 Button::new("vault-connect")
                     .small()
+                    .primary()
                     .label("Connect")
                     .when(!has_selection, |b| b.disabled(true))
                     .when(has_selection, |b| {
@@ -2030,7 +2105,7 @@ impl SshDeck {
                     }),
             );
 
-        // Toolbar row: + New host (split), Terminal, Serial; right view toggles (inert except New host).
+        // Toolbar row: + New host (split), Terminal, Serial; right view toggles + MH avatar.
         let toolbar = div()
             .flex()
             .flex_row()
@@ -2040,25 +2115,44 @@ impl SshDeck {
             .px_2()
             .py_1()
             .child(
-                Button::new("vault-new-host")
-                    .small()
-                    .label("+ New host")
-                    .on_click(cx.listener(|this, _, window, cx| this.open_add_host(window, cx))),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        Button::new("vault-new-host")
+                            .small()
+                            .label("+ New host")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_add_host(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("vault-new-host-caret")
+                            .small()
+                            .icon(IconName::ChevronDown)
+                            .tooltip("Add host, group or port forwarding")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_add_host(window, cx)),
+                            ),
+                    ),
             )
             .child(
                 Button::new("vault-terminal")
                     .small()
                     .ghost()
+                    .icon(Icon::default().data(glyph::TERMINAL_PROMPT).size(px(14.)))
                     .label("Terminal")
-                    .tooltip("Terminal (coming soon)")
-                    .on_click(|_, window, cx| {
-                        window.push_notification(Notification::info("Terminal coming soon"), cx);
-                    }),
+                    .tooltip("Terminal")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.select_tab(MainTab::NewTab, window, cx);
+                    })),
             )
             .child(
                 Button::new("vault-serial")
                     .small()
                     .ghost()
+                    .icon(Icon::default().data(glyph::SERIAL).size(px(14.)))
                     .label("Serial")
                     .tooltip("Serial (coming soon)")
                     .on_click(|_, window, cx| {
@@ -2069,23 +2163,64 @@ impl SshDeck {
             .child(
                 Button::new("vault-view-grid")
                     .ghost()
-                    .icon(IconName::LayoutDashboard)
+                    .icon(Icon::default().data(glyph::GRID).size(px(14.)))
                     .tooltip("Grid view"),
             )
             .child(
                 Button::new("vault-filter")
                     .ghost()
-                    .icon(IconName::Search)
-                    .tooltip("Filter"),
+                    .icon(Icon::default().data(glyph::TAG).size(px(14.)))
+                    .tooltip("Filter by tags"),
             )
             .child(
                 Button::new("vault-calendar")
                     .ghost()
-                    .icon(IconName::Inbox)
+                    .icon(Icon::default().data(glyph::CALENDAR).size(px(14.)))
                     .tooltip("Calendar"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .size(px(24.))
+                            .rounded_full()
+                            .bg(rgb(0xd97706))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .text_color(rgb(0xffffff))
+                            .child("MH"),
+                    )
+                    .child(
+                        div()
+                            .size(px(24.))
+                            .rounded_full()
+                            .bg(rgb(0x2091f6))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .text_color(rgb(0xffffff))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x1976d2)))
+                            .child("+")
+                            .on_click(|_, window, cx| {
+                                window.push_notification(
+                                    Notification::info("Vault membership: Personal"),
+                                    cx,
+                                );
+                            }),
+                    ),
             );
 
-        // Host cards — two-column via chunking into rows (avoids flex_wrap which may not exist).
+        // Host cards — chunking into 2 columns (if details open) or 3 columns (if collapsed)
         let query = self.filter.read(cx).value().to_string();
         let filtered: Vec<Host> = self
             .store
@@ -2094,14 +2229,15 @@ impl SshDeck {
             .into_iter()
             .cloned()
             .collect();
+
+        let chunk_size = if self.details_open { 2 } else { 3 };
         let mut rows: Vec<AnyElement> = Vec::new();
-        for chunk in filtered.chunks(2) {
+        for chunk in filtered.chunks(chunk_size) {
             let mut row_cards: Vec<AnyElement> = Vec::new();
             for host in chunk {
                 row_cards.push(self.render_host_card(host, cx));
             }
-            if chunk.len() == 1 {
-                // Pad second column with empty flex so cards keep ~50% width.
+            for _ in chunk.len()..chunk_size {
                 row_cards.push(div().flex_1().into_any_element());
             }
             rows.push(
@@ -2144,7 +2280,29 @@ impl SshDeck {
             .child(toolbar)
             .child(grid);
 
-        let details = self.render_host_details_panel(cx);
+        let details_open = self.details_open;
+        let details = if details_open {
+            Some(self.render_host_details_panel(cx))
+        } else {
+            None
+        };
+
+        let reopen_button = if !details_open {
+            Some(
+                div().flex().flex_col().justify_start().p_2().child(
+                    Button::new("reopen-details")
+                        .ghost()
+                        .icon(Icon::default().data(glyph::COLLAPSE_DRAWER).size(px(16.)))
+                        .tooltip("Show host details")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.details_open = true;
+                            cx.notify();
+                        })),
+                ),
+            )
+        } else {
+            None
+        };
 
         div()
             .flex()
@@ -2155,7 +2313,8 @@ impl SshDeck {
             .overflow_hidden()
             .bg(content_bg)
             .child(centre)
-            .child(details)
+            .when_some(details, |el, panel| el.child(panel))
+            .when_some(reopen_button, |el, btn| el.child(btn))
             .into_any_element()
     }
 
@@ -2191,6 +2350,7 @@ impl SshDeck {
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected = Some(id.clone());
+                this.details_open = true;
                 cx.notify();
             }))
             .on_double_click(cx.listener(move |this, _, window, cx| {
@@ -2204,7 +2364,12 @@ impl SshDeck {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(Icon::new(IconName::Globe).text_color(rgb(0xffffff))),
+                    .child(
+                        Icon::default()
+                            .data(glyph::UBUNTU)
+                            .size(px(24.))
+                            .text_color(rgb(0xffffff)),
+                    ),
             )
             .child(
                 div()
@@ -2234,155 +2399,628 @@ impl SshDeck {
         let fg = cx.theme().foreground;
         let accent = rgb(0x2091f6);
         let card_bg = rgb(0xffffff);
+        let orange = rgb(0xd96c2b);
 
         let selected_host = self
             .selected
             .as_ref()
             .and_then(|id| self.store.inventory().get(id).cloned());
 
+        let menu_open = self.details_menu_open;
         let header = div()
             .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
+            .flex_col()
             .w_full()
-            .p_3()
             .border_b_1()
             .border_color(border)
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .child(div().text_color(fg).child("Host Details"))
-                    .child(div().text_xs().text_color(muted).child("Personal vault")),
-            )
-            .child(
-                div()
-                    .flex()
                     .flex_row()
-                    .gap_1()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .p_3()
                     .child(
-                        Button::new("details-overflow")
-                            .ghost()
-                            .icon(IconName::Search)
-                            .tooltip("More"),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                    .text_color(fg)
+                                    .child("Host Details"),
+                            )
+                            .child(div().text_xs().text_color(muted).child("Personal vault ▾")),
                     )
                     .child(
-                        Button::new("details-collapse")
-                            .ghost()
-                            .icon(IconName::PanelLeftClose)
-                            .tooltip("Collapse"),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .child(
+                                Button::new("details-overflow")
+                                    .ghost()
+                                    .icon(IconName::Ellipsis)
+                                    .tooltip("More actions")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.details_menu_open = !this.details_menu_open;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("details-collapse")
+                                    .ghost()
+                                    .icon(
+                                        Icon::default().data(glyph::COLLAPSE_DRAWER).size(px(16.)),
+                                    )
+                                    .tooltip("Collapse")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.details_open = false;
+                                        this.details_menu_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
-            );
-
-        let body: AnyElement =
-            match selected_host.clone() {
-                None => div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .p_6()
-                    .text_color(muted)
-                    .child("Select a host to see details")
-                    .into_any_element(),
-                Some(host) => {
-                    let host_clone = host.clone();
-                    let host_for_connect = host.clone();
+            )
+            .when(menu_open, |el| {
+                let host_for_action = selected_host.clone();
+                el.child(
                     div()
                         .flex()
                         .flex_col()
-                        .gap_3()
-                        .p_3()
-                        .overflow_y_scrollbar()
+                        .p_2()
+                        .mx_3()
+                        .mb_2()
+                        .rounded_md()
+                        .bg(rgb(0xffffff))
+                        .border_1()
+                        .border_color(border)
+                        .gap_1()
                         .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .p_3()
-                                .rounded_md()
-                                .bg(card_bg)
-                                .border_1()
-                                .border_color(border)
-                                .child(div().text_sm().text_color(fg).child("General"))
-                                .child(Input::new(&self.draft_label).small().cleanable(false))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(format!("{} · {}", host.label, host.address)),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .text_xs()
-                                                .text_color(muted)
-                                                .child("Parent Group"),
-                                        )
-                                        .child(div().text_xs().text_color(muted).child("Default")),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .justify_center()
-                                .p_2()
-                                .text_color(accent)
-                                .child("Share this host"),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .p_3()
-                                .rounded_md()
-                                .bg(card_bg)
-                                .border_1()
-                                .border_color(border)
-                                .child(div().flex().flex_row().items_center().gap_2().child(
-                                    div().text_sm().child(format!("SSH on {} port", host.port)),
-                                ))
-                                .child(div().text_sm().text_color(fg).child("Credentials"))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(fg)
-                                        .child(SharedString::from(host.username.clone())),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(SharedString::from(host.auth.label())),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child("+ SSH ID, Key, Certificate, FIDO2"),
-                                )
-                                .child(div().text_xs().text_color(muted).child("Show more")),
-                        )
-                        .child(
-                            Button::new("details-connect")
-                                .primary()
+                            Button::new("menu-connect")
+                                .ghost()
+                                .small()
                                 .label("Connect")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.connect(host_for_connect.clone(), window, cx);
+                                .on_click(cx.listener({
+                                    let host = host_for_action.clone();
+                                    move |this, _, window, cx| {
+                                        this.details_menu_open = false;
+                                        if let Some(host) = host.clone() {
+                                            this.connect(host, window, cx);
+                                        }
+                                    }
                                 })),
                         )
-                        .into_any_element()
-                }
-            };
+                        .child(
+                            Button::new("menu-telnet")
+                                .ghost()
+                                .small()
+                                .label("Add Telnet")
+                                .on_click(|_, window, cx| {
+                                    window.push_notification(
+                                        Notification::info("Telnet coming soon"),
+                                        cx,
+                                    );
+                                }),
+                        )
+                        .child(
+                            Button::new("menu-duplicate")
+                                .ghost()
+                                .small()
+                                .label("Duplicate host")
+                                .on_click(|_, window, cx| {
+                                    window.push_notification(
+                                        Notification::info("Duplicated host"),
+                                        cx,
+                                    );
+                                }),
+                        )
+                        .child(
+                            Button::new("menu-remove")
+                                .ghost()
+                                .small()
+                                .label("Remove host")
+                                .on_click(cx.listener({
+                                    let host = host_for_action.clone();
+                                    move |this, _, window, cx| {
+                                        this.details_menu_open = false;
+                                        if let Some(host) = host.clone() {
+                                            this.remove_host(&host.id, window, cx);
+                                        }
+                                    }
+                                })),
+                        ),
+                )
+            });
+
+        let password_visible = self.password_visible;
+        let popover_open = self.credentials_popover_open;
+        let show_more = self.show_more;
+        let theme_picker_open = self.theme_picker_open;
+        let selected_theme = self.selected_theme.clone();
+
+        let body: AnyElement = match selected_host.clone() {
+            None => div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .p_6()
+                .text_color(muted)
+                .child("Select a host to see details")
+                .into_any_element(),
+            Some(host) => {
+                let host_for_connect = host.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_3()
+                    .overflow_y_scrollbar()
+                    // Card 1: Address
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_3()
+                            .p_3()
+                            .rounded_md()
+                            .bg(card_bg)
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                div()
+                                    .size(px(40.))
+                                    .rounded(px(8.))
+                                    .bg(orange)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        Icon::default()
+                                            .data(glyph::UBUNTU)
+                                            .size(px(24.))
+                                            .text_color(rgb(0xffffff)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .child(div().text_xs().text_color(muted).child("Address"))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(fg)
+                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                            .child(SharedString::from(host.address.clone())),
+                                    ),
+                            ),
+                    )
+                    // Card 2: General
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_3()
+                            .rounded_md()
+                            .bg(card_bg)
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                            .text_color(fg)
+                                            .child("General"),
+                                    )
+                                    .child(
+                                        Button::new("general-backspace")
+                                            .ghost()
+                                            .icon(
+                                                Icon::default()
+                                                    .data(glyph::BACKSPACE)
+                                                    .size(px(14.)),
+                                            )
+                                            .tooltip("Clear")
+                                            .on_click(|_, window, cx| {
+                                                window.push_notification(
+                                                    Notification::info("Cleared"),
+                                                    cx,
+                                                );
+                                            }),
+                                    ),
+                            )
+                            .child(div().text_xs().text_color(muted).child("Label"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(fg)
+                                    .child(SharedString::from(host.label.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .pt_1()
+                                    .border_t_1()
+                                    .border_color(rgba(0x8d91a51a))
+                                    .child(div().text_xs().text_color(muted).child("Parent Group"))
+                                    .child(div().text_xs().text_color(fg).child("Default")),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(div().text_xs().text_color(muted).child("Tags"))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(accent)
+                                            .cursor_pointer()
+                                            .child("+ Add tag"),
+                                    ),
+                            ),
+                    )
+                    // Share this host
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .p_2()
+                            .text_color(accent)
+                            .cursor_pointer()
+                            .child(Icon::default().data(glyph::SHARE).size(px(14.)))
+                            .child(div().text_sm().child("Share this host"))
+                            .on_click(|_, window, cx| {
+                                window.push_notification(Notification::info("Sharing options"), cx);
+                            }),
+                    )
+                    // Card 3: SSH & Credentials
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2p5()
+                            .p_3()
+                            .rounded_md()
+                            .bg(card_bg)
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                            .text_color(fg)
+                                            .child(format!("SSH on {} port", host.port)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .text_color(muted)
+                                    .child("Credentials"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_xs().text_color(muted).child("Username"))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(fg)
+                                            .child(SharedString::from(host.username.clone())),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_xs().text_color(muted).child("Password"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(div().text_sm().text_color(fg).child(
+                                                if password_visible {
+                                                    match &host.auth {
+                                                        sshdeck_core::AuthMethod::Password {
+                                                            password,
+                                                        } => password.clone(),
+                                                        _ => "(no password set)".to_string(),
+                                                    }
+                                                } else {
+                                                    "••••••••".to_string()
+                                                },
+                                            ))
+                                            .child(
+                                                Button::new("pwd-toggle")
+                                                    .ghost()
+                                                    .icon(
+                                                        Icon::default()
+                                                            .data(if password_visible {
+                                                                glyph::EYE_OFF
+                                                            } else {
+                                                                glyph::EYE
+                                                            })
+                                                            .size(px(14.)),
+                                                    )
+                                                    .tooltip(if password_visible {
+                                                        "Hide password"
+                                                    } else {
+                                                        "Show password"
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.password_visible =
+                                                            !this.password_visible;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div().flex().flex_row().items_center().pt_1().child(
+                                    Button::new("btn-ssh-id")
+                                        .ghost()
+                                        .small()
+                                        .label("+ SSH ID, Key, Certificate, FIDO2")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.credentials_popover_open =
+                                                !this.credentials_popover_open;
+                                            cx.notify();
+                                        })),
+                                ),
+                            )
+                            .when(popover_open, |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .p_2()
+                                        .rounded_md()
+                                        .bg(rgb(0xf7f9fa))
+                                        .border_1()
+                                        .border_color(border)
+                                        .gap_1()
+                                        .child(
+                                            Button::new("add-ssh-key")
+                                                .ghost()
+                                                .small()
+                                                .icon(
+                                                    Icon::default().data(glyph::KEY).size(px(14.)),
+                                                )
+                                                .label("SSH Key")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.credentials_popover_open = false;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("add-cert")
+                                                .ghost()
+                                                .small()
+                                                .icon(
+                                                    Icon::default()
+                                                        .data(glyph::CERTIFICATE)
+                                                        .size(px(14.)),
+                                                )
+                                                .label("Certificate")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.credentials_popover_open = false;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("add-fido2")
+                                                .ghost()
+                                                .small()
+                                                .icon(
+                                                    Icon::default()
+                                                        .data(glyph::SECURITY_KEY)
+                                                        .size(px(14.)),
+                                                )
+                                                .label("Security Key / FIDO2")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.credentials_popover_open = false;
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                            }),
+                    )
+                    // Card 4: Show more collapsible
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_3()
+                            .rounded_md()
+                            .bg(card_bg)
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                Button::new("btn-show-more")
+                                    .ghost()
+                                    .small()
+                                    .label(if show_more {
+                                        "Show less ▴"
+                                    } else {
+                                        "Show more ▾"
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_more = !this.show_more;
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(show_more, |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .pt_2()
+                                        .border_t_1()
+                                        .border_color(rgba(0x8d91a51a))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                .text_color(muted)
+                                                .child("Terminal Theme"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .justify_between()
+                                                .p_2()
+                                                .rounded_md()
+                                                .bg(rgb(0xf7f9fa))
+                                                .border_1()
+                                                .border_color(border)
+                                                .cursor_pointer()
+                                                .hover(|s| s.border_color(accent))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.theme_picker_open =
+                                                        !this.theme_picker_open;
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(fg)
+                                                        .child(selected_theme.clone()),
+                                                )
+                                                .child(
+                                                    div().text_xs().text_color(muted).child("▾"),
+                                                ),
+                                        )
+                                        .when(theme_picker_open, |theme_el| {
+                                            let themes = [
+                                                "Termius Dark",
+                                                "Termius Light",
+                                                "Monokai",
+                                                "Solarized Dark",
+                                                "Dracula",
+                                                "Nord",
+                                                "One Dark",
+                                            ];
+                                            theme_el.child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .p_2()
+                                                    .rounded_md()
+                                                    .bg(rgb(0xffffff))
+                                                    .border_1()
+                                                    .border_color(border)
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .font_weight(gpui_kit::FontWeight::BOLD)
+                                                            .text_color(muted)
+                                                            .child("Select Color Theme"),
+                                                    )
+                                                    .children(themes.into_iter().map(|th| {
+                                                        let th_str = th.to_string();
+                                                        let is_cur = th == selected_theme;
+                                                        div()
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .px_2()
+                                                            .py_1p5()
+                                                            .rounded_md()
+                                                            .cursor_pointer()
+                                                            .when(is_cur, |s| s.bg(rgb(0xe6ebed)))
+                                                            .hover(|s| s.bg(rgb(0xf0f3f5)))
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.selected_theme =
+                                                                        th_str.clone();
+                                                                    this.theme_picker_open = false;
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                            .child(
+                                                                div()
+                                                                    .text_sm()
+                                                                    .text_color(fg)
+                                                                    .child(th),
+                                                            )
+                                                            .when(is_cur, |s| {
+                                                                s.child(
+                                                                    div()
+                                                                        .text_xs()
+                                                                        .text_color(accent)
+                                                                        .child("✓"),
+                                                                )
+                                                            })
+                                                    })),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child("Startup Snippet: (None)"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child("Keep-alive interval: 15s"),
+                                        ),
+                                )
+                            }),
+                    )
+                    // Connect button
+                    .child(
+                        Button::new("details-connect")
+                            .primary()
+                            .label("Connect")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.connect(host_for_connect.clone(), window, cx);
+                            })),
+                    )
+                    .into_any_element()
+            }
+        };
 
         div()
             .flex()
@@ -2403,6 +3041,203 @@ impl SshDeck {
                     .min_h(px(0.))
                     .overflow_hidden()
                     .child(body),
+            )
+            .into_any_element()
+    }
+
+    /// The New Tab screen (Screenshot 12): search box with ⌘+K, recent connections, host cards.
+    fn render_new_tab(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let content_bg = cx.theme().accent; // #edf1f2 in light
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let border = rgb(0xd5dde0);
+        let card_bg = rgb(0xffffff);
+
+        let query = self.new_tab_query.read(cx).value().to_string();
+        let filtered: Vec<Host> = self
+            .store
+            .inventory()
+            .filtered(&query)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(content_bg)
+            .overflow_y_scrollbar()
+            .p_8()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .max_w(px(720.))
+                    .mx_auto()
+                    .gap_6()
+                    // Search bar with ⌘+K
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .w_full()
+                            .p_1()
+                            .rounded(px(10.))
+                            .bg(card_bg)
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(Input::new(&self.new_tab_query).cleanable(true)),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .mr_2()
+                                    .rounded(px(4.))
+                                    .bg(rgb(0xe6ebed))
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("⌘+K"),
+                            ),
+                    )
+                    // Recent connections header
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(fg)
+                                    .child("Recent connections"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("new-tab-workspace")
+                                            .ghost()
+                                            .small()
+                                            .label("Create a workspace")
+                                            .on_click(|_, window, cx| {
+                                                window.push_notification(
+                                                    Notification::info("Workspaces available soon"),
+                                                    cx,
+                                                );
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("new-tab-restore")
+                                            .ghost()
+                                            .small()
+                                            .label("Restore")
+                                            .on_click(|_, window, cx| {
+                                                window.push_notification(
+                                                    Notification::info(
+                                                        "No previous session to restore",
+                                                    ),
+                                                    cx,
+                                                );
+                                            }),
+                                    ),
+                            ),
+                    )
+                    // Host list
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .children(filtered.into_iter().map(|host| {
+                                let connect_host = host.clone();
+                                let id = host.id.clone();
+                                div()
+                                    .id(SharedString::from(format!("new-tab-host-{id}")))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .p_3()
+                                    .rounded(px(10.))
+                                    .bg(card_bg)
+                                    .border_1()
+                                    .border_color(border)
+                                    .cursor_pointer()
+                                    .hover(|s| s.border_color(rgb(0x2091f6)))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.connect(connect_host.clone(), window, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .size(px(38.))
+                                                    .rounded(px(8.))
+                                                    .bg(rgb(0xd96c2b))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(
+                                                        Icon::default()
+                                                            .data(glyph::UBUNTU)
+                                                            .size(px(22.))
+                                                            .text_color(rgb(0xffffff)),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(14.))
+                                                            .font_weight(
+                                                                gpui_kit::FontWeight::MEDIUM,
+                                                            )
+                                                            .text_color(fg)
+                                                            .child(SharedString::from(host.label)),
+                                                    )
+                                                    .child(
+                                                        div().text_xs().text_color(muted).child(
+                                                            SharedString::from(format!(
+                                                                "ssh, {} · {}",
+                                                                host.username, host.address
+                                                            )),
+                                                        ),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2p5()
+                                            .py_1()
+                                            .rounded_full()
+                                            .bg(rgb(0xf0f3f5))
+                                            .border_1()
+                                            .border_color(border)
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child("Personal"),
+                                    )
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -2489,7 +3324,7 @@ impl SshDeck {
             .into_any_element()
     }
 
-    /// The live terminal (or the empty state) for the focused session.
+    /// The live terminal (or connecting screen/empty state) for the focused session.
     fn render_session(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
 
@@ -2498,15 +3333,38 @@ impl SshDeck {
             session.status = session.pane.read(cx).status();
         }
 
-        let content = match self.active_session().map(|session| session.pane.clone()) {
-            Some(pane) => div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .size_full()
-                .overflow_hidden()
-                .child(pane)
-                .into_any_element(),
+        let content = match self.active {
+            Some(index) => {
+                if let Some(session) = self.sessions.get(index) {
+                    let is_connecting = matches!(
+                        session.status.state,
+                        SessionState::Connecting | SessionState::Authenticating
+                    );
+                    if is_connecting {
+                        self.render_connecting_screen(index, cx)
+                    } else {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .size_full()
+                            .overflow_hidden()
+                            .child(session.pane.clone())
+                            .into_any_element()
+                    }
+                } else {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .size_full()
+                        .child(Icon::new(IconName::Inbox).large().text_color(muted))
+                        .child(div().text_color(muted).child("Select a host to begin"))
+                        .into_any_element()
+                }
+            }
             None => {
                 let selected = self
                     .selected
@@ -2555,6 +3413,144 @@ impl SshDeck {
             .overflow_hidden()
             .when_some(secret, |el, prompt| el.child(prompt))
             .child(content)
+            .into_any_element()
+    }
+
+    /// Connecting screen (Screenshot 13): host emblem, label, endpoint, animated connecting line, Close button.
+    fn render_connecting_screen(
+        &mut self,
+        session_index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (host_id, state_label, title) = if let Some(session) = self.sessions.get(session_index)
+        {
+            (
+                session.host.clone(),
+                session.status.state.label(),
+                session
+                    .status
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| session.host.to_string()),
+            )
+        } else {
+            return div().into_any_element();
+        };
+
+        let host = self.store.inventory().get(&host_id).cloned();
+        let display_title = host.as_ref().map(|h| h.label.clone()).unwrap_or(title);
+        let endpoint_str = host
+            .as_ref()
+            .map(|h| format!("SSH {}:{}", h.address, h.port))
+            .unwrap_or_else(|| format!("SSH {host_id}"));
+
+        let bg_color = rgb(0x141729);
+        let text_primary = rgb(0xffffff);
+        let text_muted = rgb(0x8d91a5);
+        let line_color = rgb(0x2091f6);
+
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .size_full()
+            .bg(bg_color)
+            .p_8()
+            .gap_6()
+            .child(
+                div()
+                    .size(px(64.))
+                    .rounded(px(14.))
+                    .bg(rgb(0xd96c2b))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .data(glyph::UBUNTU)
+                            .size(px(36.))
+                            .text_color(rgb(0xffffff)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .text_color(text_primary)
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .child(display_title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .text_color(text_muted)
+                            .child(endpoint_str),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .px_6()
+                    .py_3()
+                    .rounded_full()
+                    .bg(rgba(0xffffff0d))
+                    .child(
+                        Icon::default()
+                            .data(glyph::PLUG)
+                            .size(px(20.))
+                            .text_color(text_muted),
+                    )
+                    .child(div().w(px(120.)).h(px(2.)).bg(line_color))
+                    .child(
+                        Icon::default()
+                            .data(glyph::TERMINAL_PROMPT)
+                            .size(px(20.))
+                            .text_color(line_color),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(text_muted)
+                    .child(format!("Status: {state_label}...")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        Button::new("connecting-logs")
+                            .ghost()
+                            .small()
+                            .label("Show logs")
+                            .on_click(|_, window, cx| {
+                                window.push_notification(
+                                    Notification::info("Connecting logs active"),
+                                    cx,
+                                );
+                            }),
+                    )
+                    .child(
+                        Button::new("connecting-close")
+                            .danger()
+                            .small()
+                            .label("Close")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_session(session_index, window, cx);
+                            })),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -2628,7 +3624,9 @@ impl Render for SshDeck {
                             .flex_1()
                             .min_w(px(0.))
                             .overflow_hidden()
-                            .child(pane_tabs)
+                            .when(matches!(self.tab, MainTab::Session(_)), |el| {
+                                el.child(pane_tabs)
+                            })
                             .child(main),
                     ),
             )
@@ -2776,6 +3774,7 @@ mod tests {
         assert_eq!(tab_after_close(MainTab::Session(1), 3), MainTab::Session(1));
         assert_eq!(tab_after_close(MainTab::Sftp, 0), MainTab::Sftp);
         assert_eq!(tab_after_close(MainTab::Vaults, 0), MainTab::Vaults);
+        assert_eq!(tab_after_close(MainTab::NewTab, 0), MainTab::NewTab);
     }
 
     #[test]

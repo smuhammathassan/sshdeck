@@ -1,32 +1,14 @@
-//! The remote file browser pane.
+//! The dual-pane SFTP file browser.
 //!
-//! A self-contained gpui-kit view over one live [`SftpClient`]: it lists a
-//! remote directory (name, size, kind, permissions, modified time), navigates
-//! with a breadcrumb trail and a parent button, and surfaces the client's
-//! transfer queue with progress and per-transfer cancellation.
-//!
-//! # Wiring contract
-//!
-//! `SftpPane::new` deliberately takes no transport. The host view owns the SSH
-//! session, so only the host can open SFTP on that session — `SftpClient::connect`
-//! is async and session-scoped. The host supplies a live handle with
-//! [`SftpPane::set_client`] and clears it again with `None`:
-//!
-//! ```ignore
-//! let pane = cx.new(|cx| SftpPane::new(window, cx));
-//! // ... later, once SFTP is up on the session:
-//! pane.update(cx, |pane, cx| pane.set_client(Some(client), cx));
-//! ```
-//!
-//! Until a handle is supplied the pane renders a "not connected" state rather
-//! than a blank listing. [`SftpPane::client`] and [`SftpPane::current_path`] are
-//! the matching readers.
-//!
-//! Every remote call runs on a GPUI foreground task, so no `await` blocks the
-//! UI thread. Listings are capped at [`MAX_DIR_ENTRIES`] and the transfer view
-//! at [`MAX_TRANSFERS`], so a pathological remote directory cannot grow the
-//! process without bound (docs/BUDGET.md).
+//! Visual parity with Termius dual-pane SFTP (Screenshots 14, 15, 17):
+//! - Split 50/50: Left pane is the Local file browser; Right pane is either the
+//!   "Connect to host" empty state, the Host selection drawer, or the live Remote browser.
+//! - Local filesystem browser scans disk using `std::fs::read_dir`, surfacing
+//!   entry name, permissions string (`drwxr-xr-x+`), modified date, size and kind.
+//! - Breadcrumb trail navigation with `<` and `>` arrow buttons.
+//! - Remote file browser surfaces the remote directory with transfer progress and queue.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -38,60 +20,147 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, px, AnyElement, Context, Div, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Styled as _, Window,
+    div, px, rgb, AnyElement, App, Context, Div, FocusHandle, Hsla, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window,
 };
+use sshdeck_core::Host;
 use sshdeck_sftp::{
     DirEntry, FileKind, SftpClient, SftpError, TransferEvent, TransferId, TransferState,
 };
 
+use crate::glyph;
+
 /// Directory listings are truncated to this many entries so a pathological
-/// remote directory cannot become the memory cliff docs/BUDGET.md warns about.
+/// directory cannot become a memory cliff (docs/BUDGET.md).
 const MAX_DIR_ENTRIES: usize = 1_000;
 
 /// The transfer view keeps at most this many rows; the oldest is evicted.
 const MAX_TRANSFERS: usize = 64;
 
 /// One transfer as the pane last saw it.
-///
-/// `TransferEvent` carries only an id and a state, so that is all a row can
-/// show; the crate does not expose the enqueued `Transfer` back to consumers.
 struct TransferRow {
     id: TransferId,
     state: TransferState,
 }
 
-/// The remote file browser.
+/// One entry in the local filesystem browser.
+#[derive(Clone, Debug)]
+pub struct LocalEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub permissions: String,
+    pub modified: Option<SystemTime>,
+}
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+fn format_unix_mode(mode: u32, is_dir: bool) -> String {
+    let d = if is_dir { 'd' } else { '-' };
+    let r1 = if mode & 0o400 != 0 { 'r' } else { '-' };
+    let w1 = if mode & 0o200 != 0 { 'w' } else { '-' };
+    let x1 = if mode & 0o100 != 0 { 'x' } else { '-' };
+    let r2 = if mode & 0o040 != 0 { 'r' } else { '-' };
+    let w2 = if mode & 0o020 != 0 { 'w' } else { '-' };
+    let x2 = if mode & 0o010 != 0 { 'x' } else { '-' };
+    let r3 = if mode & 0o004 != 0 { 'r' } else { '-' };
+    let w3 = if mode & 0o002 != 0 { 'w' } else { '-' };
+    let x3 = if mode & 0o001 != 0 { 'x' } else { '-' };
+    format!("{d}{r1}{w1}{x1}{r2}{w2}{x2}{r3}{w3}{x3}")
+}
+
+fn format_mode(metadata: &std::fs::Metadata, is_dir: bool) -> String {
+    #[cfg(unix)]
+    {
+        format_unix_mode(metadata.permissions().mode(), is_dir)
+    }
+    #[cfg(not(unix))]
+    {
+        if is_dir {
+            "drwxr-xr-x".to_string()
+        } else {
+            "-rw-r--r--".to_string()
+        }
+    }
+}
+
+fn read_local_dir(path: &Path) -> Result<Vec<LocalEntry>, String> {
+    let entries_iter = std::fs::read_dir(path).map_err(|e| e.to_string())?;
+    let mut items = Vec::new();
+    for res in entries_iter {
+        let Ok(entry) = res else { continue };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let is_dir = metadata.is_dir();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let permissions = format_mode(&metadata, is_dir);
+        let size = if is_dir { 0 } else { metadata.len() };
+        let modified = metadata.modified().ok();
+        items.push(LocalEntry {
+            name,
+            is_dir,
+            size,
+            permissions,
+            modified,
+        });
+    }
+    items.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+    Ok(items)
+}
+
+/// The dual-pane SFTP browser.
 pub struct SftpPane {
-    /// `None` until the host supplies one; the pane then shows "not connected".
+    /// `None` until a remote host is connected; the right pane then renders empty or host picker.
     client: Option<Arc<SftpClient>>,
-    /// Canonical absolute path of the directory being shown.
+    remote_host_label: Option<String>,
     cwd: String,
     entries: Vec<DirEntry>,
-    /// Whether `entries` was truncated by [`MAX_DIR_ENTRIES`].
     truncated: bool,
     selected: Option<usize>,
     loading: bool,
-    /// A listing or navigation failure, rendered instead of a blank pane.
     error: Option<String>,
     transfers: Vec<TransferRow>,
-    /// Bumped per listing so a superseded load cannot overwrite a newer one.
     load_generation: u64,
-    /// Bumped per attached client so a stale transfer stream is ignored.
     watch_generation: u64,
     focus_handle: FocusHandle,
+
+    // Local pane state
+    local_cwd: PathBuf,
+    local_entries: Vec<LocalEntry>,
+    local_selected: Option<usize>,
+    local_history: Vec<PathBuf>,
+    local_history_idx: usize,
+    local_error: Option<String>,
+
+    // Remote host picker state
+    show_host_picker: bool,
+    available_hosts: Vec<Host>,
+    on_connect: Option<Box<dyn Fn(Host, &mut Window, &mut App)>>,
 }
 
 impl SftpPane {
-    /// Creates a disconnected pane.
-    ///
-    /// The host must call [`Self::set_client`] once SFTP is up; until then the
-    /// pane renders its "not connected" state.
+    /// Creates the SFTP pane, initializing the local file browser with the user's home directory.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
+
+        let initial_local = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+        let local_entries = read_local_dir(&initial_local).unwrap_or_default();
+
         Self {
             client: None,
+            remote_host_label: None,
             cwd: String::new(),
             entries: Vec::new(),
             truncated: false,
@@ -102,7 +171,38 @@ impl SftpPane {
             load_generation: 0,
             watch_generation: 0,
             focus_handle,
+
+            local_cwd: initial_local.clone(),
+            local_entries,
+            local_selected: None,
+            local_history: vec![initial_local],
+            local_history_idx: 0,
+            local_error: None,
+
+            show_host_picker: false,
+            available_hosts: Vec::new(),
+            on_connect: None,
         }
+    }
+
+    /// Supplies the list of inventory hosts for the right-hand "Select Host" picker.
+    pub fn set_available_hosts(&mut self, hosts: Vec<Host>, cx: &mut Context<Self>) {
+        self.available_hosts = hosts;
+        cx.notify();
+    }
+
+    /// Sets the label of the connected remote host (e.g. "Ali Jawwad").
+    pub fn set_remote_host_label(&mut self, label: Option<String>, cx: &mut Context<Self>) {
+        self.remote_host_label = label;
+        cx.notify();
+    }
+
+    /// Registers the callback invoked when the user selects a host in the right-pane picker.
+    pub fn set_on_connect<F>(&mut self, f: F)
+    where
+        F: Fn(Host, &mut Window, &mut App) + 'static,
+    {
+        self.on_connect = Some(Box::new(f));
     }
 
     /// The live SFTP handle, if one has been supplied.
@@ -110,24 +210,20 @@ impl SftpPane {
         self.client.as_deref()
     }
 
-    /// The canonical path currently being listed; empty until the first load.
+    /// The canonical path currently being listed on the remote server; empty until first load.
     pub fn current_path(&self) -> &str {
         &self.cwd
     }
 
-    /// Attaches or detaches the SFTP transport.
-    ///
-    /// Passing `Some` begins watching the transfer queue and loads the default
-    /// directory. Passing `None` returns the pane to its "not connected" state
-    /// and drops every listing and transfer row it was holding.
+    /// Attaches or detaches the remote SFTP transport.
     pub fn set_client(&mut self, client: Option<SftpClient>, cx: &mut Context<Self>) {
-        // Any in-flight load or transfer stream for the old handle is now stale.
         self.watch_generation = self.watch_generation.wrapping_add(1);
         match client {
             Some(client) => {
                 let client = Arc::new(client);
                 let events = client.transfers();
                 self.client = Some(client);
+                self.show_host_picker = false;
                 self.cwd.clear();
                 self.entries.clear();
                 self.truncated = false;
@@ -139,6 +235,7 @@ impl SftpPane {
             }
             None => {
                 self.client = None;
+                self.remote_host_label = None;
                 self.cwd.clear();
                 self.entries.clear();
                 self.truncated = false;
@@ -151,7 +248,57 @@ impl SftpPane {
         cx.notify();
     }
 
-    /// Reloads the current directory (the default directory before any load).
+    // ── Local navigation ──────────────────────────────────────────────────
+
+    fn load_local(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        match read_local_dir(&path) {
+            Ok(entries) => {
+                self.local_cwd = path;
+                self.local_entries = entries;
+                self.local_selected = None;
+                self.local_error = None;
+            }
+            Err(err) => {
+                self.local_error = Some(err);
+            }
+        }
+        cx.notify();
+    }
+
+    fn navigate_local(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.local_history_idx + 1 < self.local_history.len() {
+            self.local_history.truncate(self.local_history_idx + 1);
+        }
+        self.local_history.push(path.clone());
+        self.local_history_idx = self.local_history.len() - 1;
+        self.load_local(path, cx);
+    }
+
+    fn navigate_local_back(&mut self, cx: &mut Context<Self>) {
+        if self.local_history_idx > 0 {
+            self.local_history_idx -= 1;
+            let path = self.local_history[self.local_history_idx].clone();
+            self.load_local(path, cx);
+        }
+    }
+
+    fn navigate_local_forward(&mut self, cx: &mut Context<Self>) {
+        if self.local_history_idx + 1 < self.local_history.len() {
+            self.local_history_idx += 1;
+            let path = self.local_history[self.local_history_idx].clone();
+            self.load_local(path, cx);
+        }
+    }
+
+    fn navigate_local_up(&mut self, cx: &mut Context<Self>) {
+        if let Some(parent) = self.local_cwd.parent() {
+            self.navigate_local(parent.to_path_buf(), cx);
+        }
+    }
+
+    // ── Remote navigation ─────────────────────────────────────────────────
+
+    /// Reloads the current remote directory.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let path = if self.cwd.is_empty() {
             ".".to_string()
@@ -161,12 +308,12 @@ impl SftpPane {
         self.load(path, cx);
     }
 
-    /// Navigates to an absolute path.
+    /// Navigates to an absolute remote path.
     fn navigate(&mut self, path: String, cx: &mut Context<Self>) {
         self.load(path, cx);
     }
 
-    /// Enters the named child of the current directory.
+    /// Enters the named child directory on the remote server.
     fn activate(&mut self, name: &str, cx: &mut Context<Self>) {
         match sshdeck_sftp::join(&self.cwd, name) {
             Ok(path) => self.load(path, cx),
@@ -177,18 +324,13 @@ impl SftpPane {
         }
     }
 
-    /// Jumps to the parent of the current directory, when there is one.
+    /// Jumps to the parent remote directory.
     fn go_up(&mut self, cx: &mut Context<Self>) {
         if let Some(parent) = parent_path(&self.cwd) {
             self.load(parent, cx);
         }
     }
 
-    /// Starts an async canonicalize-then-list for `path`.
-    ///
-    /// The remote calls run on a GPUI foreground task and only await the
-    /// client's channels, so the UI thread itself never blocks. The result is
-    /// applied only when no newer load has superseded it.
     fn load(&mut self, path: String, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
@@ -202,8 +344,6 @@ impl SftpPane {
 
         cx.spawn(async move |pane, cx| {
             let result = async {
-                // Resolve first so symlinks and `..` become one path, then list
-                // that path rather than a hand-built string.
                 let canonical = client.canonicalize(&path).await?;
                 let entries = client.list(&canonical).await?;
                 Ok::<_, SftpError>((canonical, entries))
@@ -234,16 +374,12 @@ impl SftpPane {
         .detach();
     }
 
-    /// Stores a listing, truncating it to the budgeted maximum.
     fn set_entries(&mut self, mut entries: Vec<DirEntry>) {
-        // `list` already sorts directories first, so truncation keeps them and
-        // drops the tail; `list`'s own Vec is the only transient allocation.
         self.truncated = entries.len() > MAX_DIR_ENTRIES;
         entries.truncate(MAX_DIR_ENTRIES);
         self.entries = entries;
     }
 
-    /// Forwards transfer-queue events into the view while the client lives.
     fn watch_transfers(
         &mut self,
         events: async_channel::Receiver<TransferEvent>,
@@ -270,7 +406,6 @@ impl SftpPane {
         .detach();
     }
 
-    /// Folds one transfer event into the bounded row list.
     fn apply_transfer(&mut self, event: TransferEvent) {
         let id = event.id();
         let state = event.state().clone();
@@ -284,87 +419,438 @@ impl SftpPane {
         self.transfers.push(TransferRow { id, state });
     }
 
-    /// Asks the client to cancel one transfer.
     fn cancel(&self, id: TransferId, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
         };
         cx.spawn(async move |_pane, _cx| {
-            // The queue is the source of truth: it emits the final `Cancelled`
-            // event itself, so the immediate result needs no further handling.
             let _ = client.cancel_transfer(id).await;
         })
         .detach();
     }
 
-    /// The pane's title bar: the remote half of the SFTP screen.
-    ///
-    /// The reference labels each half with its host; this pane is remote-only,
-    /// so it says "Remote" and carries the count of the listing it is showing.
-    fn render_header(&self, cx: &mut Context<Self>) -> Div {
-        let muted = cx.theme().muted_foreground;
-        let connected = self.client.is_some();
-        let counting = connected && !self.loading && self.error.is_none();
+    // ── Local browser rendering ───────────────────────────────────────────
+
+    fn render_local_header(&self, cx: &mut Context<Self>) -> Div {
+        let border = cx.theme().border;
+        let foreground = cx.theme().foreground;
 
         div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
-            .h(px(40.))
+            .h(px(48.))
             .px_3()
             .flex_shrink_0()
             .border_b_1()
-            .border_color(cx.theme().border)
+            .border_color(border)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(Icon::new(IconName::Globe).small().text_color(if connected {
-                        cx.theme().primary
-                    } else {
-                        muted
-                    }))
-                    .child(div().text_sm().child("Remote")),
+                    .child(
+                        div()
+                            .size(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .bg(rgb(0x1d2033))
+                            .child(
+                                Icon::default()
+                                    .data(glyph::LOCAL_HOST)
+                                    .small()
+                                    .text_color(Hsla::from(rgb(0xffffff))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_size(px(14.))
+                            .text_color(foreground)
+                            .child("Local"),
+                    ),
             )
-            .when(counting, |el| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(format!("{} items", self.entries.len())),
-                )
-            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("local-filter-btn")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Search)
+                            .label("Filter"),
+                    )
+                    .child(
+                        Button::new("local-actions-btn")
+                            .ghost()
+                            .small()
+                            .label("Actions ▾"),
+                    ),
+            )
     }
 
-    /// The navigation toolbar: parent/refresh actions and the breadcrumb trail.
+    fn render_local_path_bar(&self, cx: &mut Context<Self>) -> Div {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let folder_tint = rgb(0x3b82f6);
+
+        let can_back = self.local_history_idx > 0;
+        let can_forward = self.local_history_idx + 1 < self.local_history.len();
+
+        let mut crumbs: Vec<AnyElement> = Vec::new();
+        let mut path_accum = PathBuf::from("/");
+        for comp in self.local_cwd.components() {
+            let name = comp.as_os_str().to_string_lossy().to_string();
+            if name.is_empty() || name == "/" {
+                continue;
+            }
+            path_accum.push(&name);
+            let target_path = path_accum.clone();
+
+            crumbs.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Icon::default()
+                            .data(glyph::FOLDER)
+                            .small()
+                            .text_color(Hsla::from(folder_tint)),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "crumb-{}",
+                            target_path.display()
+                        )))
+                        .ghost()
+                        .xsmall()
+                        .label(name)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.navigate_local(target_path.clone(), cx);
+                        })),
+                    )
+                    .child(div().text_xs().text_color(muted).child("›"))
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .h(px(40.))
+            .px_2()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                Button::new("local-nav-back")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronLeft)
+                    .disabled(!can_back)
+                    .on_click(cx.listener(|this, _, _, cx| this.navigate_local_back(cx))),
+            )
+            .child(
+                Button::new("local-nav-forward")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronRight)
+                    .disabled(!can_forward)
+                    .on_click(cx.listener(|this, _, _, cx| this.navigate_local_forward(cx))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .flex_1()
+                    .overflow_x_scrollbar()
+                    .children(crumbs),
+            )
+    }
+
+    fn render_local_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let hover_bg = cx.theme().accent;
+        let folder_tint = rgb(0x3b82f6);
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .flex_shrink_0()
+            .text_xs()
+            .text_color(muted)
+            .border_b_1()
+            .border_color(border)
+            .child(div().flex_1().child("Name"))
+            .child(div().w(px(170.)).child("Date Modified ▴"))
+            .child(div().w(px(90.)).child("Size"))
+            .child(div().w(px(80.)).child("Kind"));
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+
+        // Parent directory row '..'
+        if self.local_cwd.parent().is_some() {
+            rows.push(
+                div()
+                    .id("local-entry-parent")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .border_b_1()
+                    .border_color(border)
+                    .hover(move |el| el.bg(hover_bg))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.navigate_local_up(cx);
+                    }))
+                    .child(
+                        Icon::default()
+                            .data(glyph::FOLDER)
+                            .small()
+                            .text_color(Hsla::from(folder_tint)),
+                    )
+                    .child(
+                        div().flex().flex_col().flex_1().child(
+                            div()
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .child(".."),
+                        ),
+                    )
+                    .child(div().w(px(170.)))
+                    .child(div().w(px(90.)))
+                    .child(div().w(px(80.)))
+                    .into_any_element(),
+            );
+        }
+
+        for (idx, entry) in self.local_entries.iter().enumerate() {
+            let is_dir = entry.is_dir;
+            let name = entry.name.clone();
+            let activate_path = self.local_cwd.join(&name);
+            let mode = entry.permissions.clone();
+            let size = if is_dir {
+                "- -".to_string()
+            } else {
+                human_size(entry.size)
+            };
+            let modified = entry
+                .modified
+                .map(format_modified)
+                .unwrap_or_else(|| "—".to_string());
+            let kind = if is_dir {
+                "folder".to_string()
+            } else {
+                Path::new(&name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("file")
+                    .to_string()
+            };
+            let selected = self.local_selected == Some(idx);
+            let selected_bg = cx.theme().muted;
+
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("local-item-{name}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .border_b_1()
+                    .border_color(border)
+                    .when(selected, |el| el.bg(selected_bg))
+                    .hover(move |el| el.bg(hover_bg))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.local_selected = Some(idx);
+                        cx.notify();
+                    }))
+                    .when(is_dir, |el| {
+                        el.on_double_click(cx.listener(move |this, _, _, cx| {
+                            this.navigate_local(activate_path.clone(), cx);
+                        }))
+                    })
+                    .child(
+                        Icon::default()
+                            .data(glyph::FOLDER)
+                            .small()
+                            .text_color(if is_dir {
+                                Hsla::from(folder_tint)
+                            } else {
+                                muted
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .font_family("Menlo")
+                                    .child(mode),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(170.))
+                            .text_xs()
+                            .text_color(muted)
+                            .font_family("Menlo")
+                            .child(modified),
+                    )
+                    .child(
+                        div()
+                            .w(px(90.))
+                            .text_xs()
+                            .text_color(muted)
+                            .font_family("Menlo")
+                            .child(size),
+                    )
+                    .child(div().w(px(80.)).text_xs().text_color(muted).child(kind))
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_y_scrollbar()
+            .child(header)
+            .children(rows)
+    }
+
+    // ── Remote pane rendering ─────────────────────────────────────────────
+
+    fn render_remote_header(&self, cx: &mut Context<Self>) -> Div {
+        let border = cx.theme().border;
+        let foreground = cx.theme().foreground;
+        let label = self
+            .remote_host_label
+            .clone()
+            .unwrap_or_else(|| "Remote Host".to_string());
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(48.))
+            .px_3()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(rgb(0xe95420))
+                            .child(
+                                Icon::default()
+                                    .data(glyph::UBUNTU)
+                                    .small()
+                                    .text_color(Hsla::from(rgb(0xffffff))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_size(px(14.))
+                            .text_color(foreground)
+                            .child(label),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("remote-filter-btn")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Search)
+                            .label("Filter"),
+                    )
+                    .child(
+                        Button::new("remote-actions-btn")
+                            .ghost()
+                            .small()
+                            .label("Actions ▾"),
+                    ),
+            )
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
-        let folder_tint = cx.theme().primary;
+        let folder_tint = rgb(0x3b82f6);
         let has_parent = parent_path(&self.cwd).is_some();
         let connected = self.client.is_some();
 
         let up = Button::new("sftp-up")
             .ghost()
-            .small()
-            .icon(IconName::ArrowUp)
+            .xsmall()
+            .icon(IconName::ChevronLeft)
             .tooltip("Parent folder")
             .disabled(!connected || !has_parent)
             .on_click(cx.listener(|this, _, _, cx| this.go_up(cx)));
 
         let refresh = Button::new("sftp-refresh")
             .ghost()
-            .small()
-            .icon(IconName::Replace)
+            .xsmall()
+            .icon(IconName::ChevronRight)
             .tooltip("Refresh")
             .disabled(!connected)
             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)));
 
-        // Each crumb is a folder glyph plus its name, separated by a chevron;
-        // like the reference, the trail starts at the first real segment.
         let mut trail: Vec<AnyElement> = Vec::new();
         for (index, (label, path)) in breadcrumb_crumbs(&self.cwd).into_iter().enumerate() {
             if index > 0 {
@@ -377,9 +863,10 @@ impl SftpPane {
                 );
             }
             trail.push(
-                Icon::new(IconName::Folder)
+                Icon::default()
+                    .data(glyph::FOLDER)
                     .small()
-                    .text_color(folder_tint)
+                    .text_color(Hsla::from(folder_tint))
                     .into_any_element(),
             );
             trail.push(
@@ -427,11 +914,6 @@ impl SftpPane {
             )
     }
 
-    /// The listing body, or the state that stands in for it.
-    ///
-    /// Returns `impl IntoElement` rather than `Div`: the scrollable wrapper
-    /// (`ScrollableElement::overflow_y_scrollbar`) is a `Scrollable<_>`, not a
-    /// `Div`, so every branch here returns that wrapper type.
     fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
@@ -444,23 +926,6 @@ impl SftpPane {
             .flex_1()
             .overflow_y_scrollbar();
 
-        // No transport: say so rather than show an empty folder.
-        if self.client.is_none() {
-            return body
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child(Icon::new(IconName::FolderClosed).large().text_color(muted))
-                .child(div().text_sm().child("Not connected"))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("Open an SFTP session to browse remote files"),
-                );
-        }
-
-        // A failure outranks any listing: it explains why there is none.
         if let Some(error) = &self.error {
             return body
                 .items_center()
@@ -516,16 +981,55 @@ impl SftpPane {
             .border_b_1()
             .border_color(border)
             .child(div().flex_1().child("Name"))
-            .child(div().w(px(170.)).child("Date Modified"))
+            .child(div().w(px(170.)).child("Date Modified ▾"))
             .child(div().w(px(90.)).child("Size"))
             .child(div().w(px(80.)).child("Kind"));
 
-        let rows: Vec<_> = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| self.render_entry(index, entry, cx))
-            .collect();
+        let mut rows: Vec<AnyElement> = Vec::new();
+
+        if parent_path(&self.cwd).is_some() {
+            let hover_bg = cx.theme().accent;
+            let folder_tint = rgb(0x3b82f6);
+            rows.push(
+                div()
+                    .id("remote-entry-parent")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .border_b_1()
+                    .border_color(border)
+                    .hover(move |el| el.bg(hover_bg))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.go_up(cx);
+                    }))
+                    .child(
+                        Icon::default()
+                            .data(glyph::FOLDER)
+                            .small()
+                            .text_color(Hsla::from(folder_tint)),
+                    )
+                    .child(
+                        div().flex().flex_col().flex_1().child(
+                            div()
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .child(".."),
+                        ),
+                    )
+                    .child(div().w(px(170.)))
+                    .child(div().w(px(90.)))
+                    .child(div().w(px(80.)))
+                    .into_any_element(),
+            );
+        }
+
+        for (index, entry) in self.entries.iter().enumerate() {
+            rows.push(self.render_entry(index, entry, cx).into_any_element());
+        }
 
         let mut container = body.child(header).children(rows);
         if self.truncated {
@@ -541,11 +1045,6 @@ impl SftpPane {
         container
     }
 
-    /// One directory row: a category-tinted kind icon, the name over its mode
-    /// string, then the date, size and kind columns.
-    ///
-    /// Returns `impl IntoElement` because `.id(..)` wraps the div in a
-    /// `Stateful<Div>`; naming that wrapper would leak the gpui-kit type here.
     fn render_entry(
         &self,
         index: usize,
@@ -556,20 +1055,14 @@ impl SftpPane {
         let border = cx.theme().border;
         let hover_bg = cx.theme().accent;
         let selected_bg = cx.theme().muted;
+        let folder_tint = rgb(0x3b82f6);
 
         let name = entry.name().to_string();
         let is_dir = entry.is_dir();
-        let icon = kind_icon(entry.kind());
-        let icon_tint = match entry.kind() {
-            FileKind::Dir => cx.theme().primary,
-            FileKind::Symlink => cx.theme().success,
-            FileKind::File | FileKind::Other => muted,
-        };
         let kind = kind_label(entry.kind());
         let mode = entry.mode_string();
-        // The reference leaves folder sizes blank as `--`.
         let size = if is_dir {
-            "--".to_string()
+            "- -".to_string()
         } else {
             human_size(entry.size())
         };
@@ -603,7 +1096,16 @@ impl SftpPane {
                     this.activate(&activate, cx);
                 }
             }))
-            .child(Icon::new(icon).small().text_color(icon_tint))
+            .child(
+                Icon::default()
+                    .data(glyph::FOLDER)
+                    .small()
+                    .text_color(if is_dir {
+                        Hsla::from(folder_tint)
+                    } else {
+                        muted
+                    }),
+            )
             .child(
                 div()
                     .flex()
@@ -611,7 +1113,13 @@ impl SftpPane {
                     .flex_1()
                     .min_w(px(0.))
                     .overflow_hidden()
-                    .child(div().overflow_hidden().whitespace_nowrap().child(name))
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child(name),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -639,7 +1147,246 @@ impl SftpPane {
             .child(div().w(px(80.)).text_xs().text_color(muted).child(kind))
     }
 
-    /// The transfer queue at the foot of the pane.
+    fn render_empty_right(&self, cx: &mut Context<Self>) -> Div {
+        let foreground = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .size_full()
+            .p_6()
+            .child(
+                div()
+                    .size(px(72.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(16.))
+                    .bg(cx.theme().muted)
+                    .child(
+                        Icon::default()
+                            .data(glyph::FOLDER)
+                            .large()
+                            .text_color(foreground),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(20.))
+                    .font_weight(gpui_kit::FontWeight::BOLD)
+                    .text_color(foreground)
+                    .child("Connect to host"),
+            )
+            .child(
+                div()
+                    .max_w(px(340.))
+                    .text_center()
+                    .text_size(px(14.))
+                    .text_color(muted)
+                    .child("Start by connecting to a saved host\nto manage your files with SFTP."),
+            )
+            .child(
+                Button::new("sftp-select-host-btn")
+                    .label("Select host")
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_host_picker = true;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    fn render_host_picker(&self, cx: &mut Context<Self>) -> Div {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let foreground = cx.theme().foreground;
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(48.))
+            .px_3()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("host-picker-back")
+                            .ghost()
+                            .icon(IconName::ArrowLeft)
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_host_picker = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                    .text_size(px(14.))
+                                    .child("Select Host"),
+                            )
+                            .child(div().text_size(px(11.)).text_color(muted).child("Vaults ▾")),
+                    ),
+            )
+            .child(
+                Button::new("host-picker-local-btn")
+                    .primary()
+                    .small()
+                    .icon(Icon::default().data(glyph::LOCAL_HOST))
+                    .label("Local"),
+            );
+
+        let search_bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(40.))
+            .px_3()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_color(muted)
+                    .text_size(px(13.))
+                    .child(Icon::new(IconName::Search).small())
+                    .child("Search"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_color(muted)
+                    .child(Icon::default().data(glyph::TAG).small())
+                    .child(Icon::default().data(glyph::CALENDAR).small()),
+            );
+
+        let section_title = div()
+            .px_4()
+            .pt_3()
+            .pb_1()
+            .font_weight(gpui_kit::FontWeight::BOLD)
+            .text_size(px(14.))
+            .child("Hosts");
+
+        let host_rows: Vec<_> = self
+            .available_hosts
+            .iter()
+            .map(|host| {
+                let host_clone = host.clone();
+                let label = host.label.clone();
+                let username = if host.username.is_empty() {
+                    "root".to_string()
+                } else {
+                    host.username.clone()
+                };
+                let subtitle = format!("ssh, {username}");
+                let id = format!("host-picker-item-{}", host.id.as_str());
+
+                div()
+                    .id(SharedString::from(id))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().accent))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(cb) = &this.on_connect {
+                            cb(host_clone.clone(), window, cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .size(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(rgb(0xe95420))
+                            .child(
+                                Icon::default()
+                                    .data(glyph::UBUNTU)
+                                    .small()
+                                    .text_color(Hsla::from(rgb(0xffffff))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_size(px(13.))
+                                    .text_color(foreground)
+                                    .child(label),
+                            )
+                            .child(div().text_size(px(11.)).text_color(muted).child(subtitle)),
+                    )
+            })
+            .collect();
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .overflow_hidden()
+            .child(header)
+            .child(search_bar)
+            .child(section_title)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .children(host_rows),
+            )
+    }
+
+    fn render_right_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.client.is_some() {
+            div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .overflow_hidden()
+                .child(self.render_remote_header(cx))
+                .child(self.render_toolbar(cx))
+                .child(self.render_body(cx))
+                .into_any_element()
+        } else if self.show_host_picker {
+            self.render_host_picker(cx).into_any_element()
+        } else {
+            self.render_empty_right(cx).into_any_element()
+        }
+    }
+
     fn render_transfers(&self, cx: &mut Context<Self>) -> Div {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
@@ -694,7 +1441,6 @@ impl SftpPane {
         )
     }
 
-    /// One transfer row: state, progress and a cancel action while active.
     fn render_transfer(&self, row: &TransferRow, cx: &mut Context<Self>) -> Div {
         let id = row.id;
         let active = matches!(
@@ -723,7 +1469,6 @@ impl SftpPane {
                 Some(total) if *total > 0 => {
                     progress = progress.value((*done as f32 / *total as f32) * 100.0);
                 }
-                // No total: an honest indeterminate bar.
                 _ => progress = progress.loading(true),
             },
             TransferState::Complete => progress = progress.value(100.0),
@@ -774,6 +1519,27 @@ impl Render for SftpPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
+        let border = cx.theme().border;
+
+        let left = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .overflow_hidden()
+            .border_r_1()
+            .border_color(border)
+            .child(self.render_local_header(cx))
+            .child(self.render_local_path_bar(cx))
+            .child(self.render_local_body(cx));
+
+        let right = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .overflow_hidden()
+            .child(self.render_right_pane(cx));
 
         div()
             .flex()
@@ -783,9 +1549,16 @@ impl Render for SftpPane {
             .bg(background)
             .text_color(foreground)
             .track_focus(&self.focus_handle)
-            .child(self.render_header(cx))
-            .child(self.render_toolbar(cx))
-            .child(self.render_body(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(left)
+                    .child(right),
+            )
             .child(self.render_transfers(cx))
     }
 }
@@ -833,9 +1606,6 @@ fn breadcrumbs(path: &str) -> Vec<(String, String)> {
 
 /// The trail the pane renders: the crate-style breadcrumbs with the bare root
 /// crumb dropped, so it starts at the first real segment like the reference.
-///
-/// At the root (only the `/` crumb) the trail is kept, so the user still has a
-/// link back to `/`.
 fn breadcrumb_crumbs(path: &str) -> Vec<(String, String)> {
     let crumbs = breadcrumbs(path);
     if crumbs.len() > 1 {
@@ -849,83 +1619,57 @@ fn breadcrumb_crumbs(path: &str) -> Vec<(String, String)> {
 }
 
 /// `M/D/YYYY, h:MM AM/PM` for the Date Modified column.
-///
-/// ponytail: `std` has no local time zone, so this renders UTC. The value is
-/// still the server's UNIX mtime, just not shifted; upgrade to local time when a
-/// calendar crate is already in the tree.
 fn format_modified(modified: SystemTime) -> String {
     let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) else {
         return "—".to_string();
     };
     let seconds = since.as_secs();
-    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
-    let day_seconds = seconds % 86_400;
-    let hour = day_seconds / 3_600;
-    let minute = (day_seconds % 3_600) / 60;
-    let (hour12, meridiem) = match hour {
+
+    let days = seconds / 86_400;
+    let time_of_day = seconds % 86_400;
+    let hour_24 = (time_of_day / 3_600) as u32;
+    let minute = ((time_of_day % 3_600) / 60) as u32;
+
+    let (year, month, day) = civil_from_days(days as i64);
+
+    let (hour, am_pm) = match hour_24 {
         0 => (12, "AM"),
-        1..=11 => (hour, "AM"),
+        1..=11 => (hour_24, "AM"),
         12 => (12, "PM"),
-        _ => (hour - 12, "PM"),
+        _ => (hour_24 - 12, "PM"),
     };
-    format!("{month}/{day}/{year}, {hour12}:{minute:02} {meridiem}")
+
+    format!("{month}/{day}/{year}, {hour}:{minute:02} {am_pm}")
 }
 
-/// Days since the UNIX epoch to a proleptic-Gregorian `(year, month, day)`.
-///
-/// Howard Hinnant's `civil_from_days`, exact for every `i64` day count; `std`
-/// has no calendar, and this is the small checkable core of [`format_modified`].
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let shifted = days + 719_468;
-    let era = if shifted >= 0 {
-        shifted
-    } else {
-        shifted - 146_096
-    } / 146_097;
-    let day_of_era = (shifted - era * 146_097) as u64;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era as i64 + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
-    let month = if month_prime < 10 {
-        (month_prime + 3) as u32
-    } else {
-        (month_prime - 9) as u32
-    };
-    let year = if month <= 2 { year + 1 } else { year };
-    (year, month, day)
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
 }
 
-/// A one-word kind for the kind column.
+fn describe_failure(path: &str, error: &SftpError) -> String {
+    match error {
+        SftpError::NotFound => format!("Folder not found: {path}"),
+        SftpError::PermissionDenied => format!("Permission denied: {path}"),
+        other => format!("Failed to read {path}: {other}"),
+    }
+}
+
 fn kind_label(kind: FileKind) -> &'static str {
     match kind {
         FileKind::Dir => "folder",
         FileKind::File => "file",
         FileKind::Symlink => "symlink",
         FileKind::Other => "other",
-    }
-}
-
-/// The row icon for a kind.
-fn kind_icon(kind: FileKind) -> IconName {
-    match kind {
-        FileKind::Dir => IconName::Folder,
-        FileKind::File => IconName::File,
-        FileKind::Symlink => IconName::ExternalLink,
-        FileKind::Other => IconName::File,
-    }
-}
-
-/// Turns an SFTP failure into a message the pane can show; permission problems
-/// get a specific line because that is the common, actionable case.
-fn describe_failure(path: &str, error: &SftpError) -> String {
-    let text = error.to_string();
-    if text.to_ascii_lowercase().contains("permission denied") {
-        format!("Permission denied: {path}")
-    } else {
-        format!("Could not list {path}: {text}")
     }
 }
 
@@ -976,7 +1720,6 @@ mod tests {
                 ("user".to_string(), "/home/user".to_string()),
             ]
         );
-        // At the root the single crumb is kept so `/` stays reachable.
         assert_eq!(
             breadcrumb_crumbs("/"),
             vec![("/".to_string(), "/".to_string())]
@@ -989,7 +1732,6 @@ mod tests {
         let at = |seconds| format_modified(UNIX_EPOCH + Duration::from_secs(seconds));
         assert_eq!(at(0), "1/1/1970, 12:00 AM");
         assert_eq!(at(43_200), "1/1/1970, 12:00 PM");
-        // The reference's own date column, e.g. `9/17/2026, 9:03 AM`.
         assert_eq!(at(1_789_635_780), "9/17/2026, 9:03 AM");
     }
 }

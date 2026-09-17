@@ -533,7 +533,7 @@ impl KeysPane {
             ("switch-keys", glyph::KEY, "Keychain", KeysSection::Keys),
             (
                 "switch-hosts",
-                glyph::HOST,
+                glyph::FINGERPRINT,
                 "Known hosts",
                 KeysSection::Hosts,
             ),
@@ -620,6 +620,17 @@ impl KeysPane {
             }
             KeysSection::Hosts => {
                 row = row
+                    .child(
+                        Button::new("import-known-hosts")
+                            .ghost()
+                            .label("Import")
+                            .tooltip("Import known_hosts file")
+                            .selected(self.show_import)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_import = !this.show_import;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new("trust-host-key-form")
                             .icon(IconName::Plus)
@@ -925,8 +936,10 @@ impl KeysPane {
                 let meta = format!("{} · {}", entry.key_type, shown);
                 let id = SharedString::from(format!("known-{}-{title}", entry.key_type));
                 let row = match self.view {
-                    ViewMode::Grid => card(id, glyph::HOST, title, meta, false, alarm, cx),
-                    ViewMode::List => list_row(id, glyph::HOST, title, meta, false, alarm, cx),
+                    ViewMode::Grid => card(id, glyph::FINGERPRINT, title, meta, false, alarm, cx),
+                    ViewMode::List => {
+                        list_row(id, glyph::FINGERPRINT, title, meta, false, alarm, cx)
+                    }
                 };
                 match (entry.revoked, changed) {
                     (true, _) => row.child(state_pill("REVOKED", cx.theme().danger, cx)),
@@ -947,7 +960,7 @@ impl KeysPane {
         body = body.child(section_heading("Known Hosts"));
         if visible.is_empty() {
             body = body.child(empty_state(
-                glyph::HOST,
+                glyph::FINGERPRINT,
                 if self.known.is_empty() {
                     "No known hosts yet"
                 } else {
