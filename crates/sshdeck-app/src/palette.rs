@@ -424,7 +424,10 @@ impl PaletteView {
 
     /// Move keyboard focus to the query field.
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
-        self.query.read(cx).focus_handle().clone().focus(window, cx);
+        // `focus_handle` takes `cx`; take the owned handle first so the read
+        // borrow of `cx` ends before `focus` needs it mutably.
+        let handle = self.query.read(cx).focus_handle(cx);
+        handle.focus(window, cx);
     }
 
     fn refilter(&mut self, query: &str) {

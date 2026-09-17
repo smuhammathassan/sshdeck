@@ -464,7 +464,7 @@ impl SftpPane {
             .child(div().w(px(110.)).child("MODIFIED"));
 
         let now = SystemTime::now();
-        let rows: Vec<Div> = self
+        let rows: Vec<_> = self
             .entries
             .iter()
             .enumerate()
@@ -486,13 +486,16 @@ impl SftpPane {
     }
 
     /// One directory row.
+    ///
+    /// Returns `impl IntoElement` because `.id(..)` wraps the div in a
+    /// `Stateful<Div>`; naming that wrapper would leak the gpui-kit type here.
     fn render_entry(
         &self,
         index: usize,
         entry: &DirEntry,
         now: SystemTime,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let foreground = cx.theme().foreground;
         let border = cx.theme().border;
