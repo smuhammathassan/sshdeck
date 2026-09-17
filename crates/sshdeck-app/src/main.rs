@@ -156,9 +156,11 @@ fn env_password() -> Option<String> {
     std::env::var("SSHDECK_PASSWORD").ok()
 }
 
-/// The name of the dark theme in the bundled theme set, and the one the app
-/// starts in.
+/// The name of the dark theme in the bundled theme set.
 const DEFAULT_THEME: &str = "sshdeck Dark";
+
+/// The light theme name — the app now defaults to Light, header stays dark.
+const DEFAULT_LIGHT_THEME: &str = "sshdeck Light";
 
 /// Registers the bundled Termius-matched theme and makes [`DEFAULT_THEME`] the
 /// startup theme.
@@ -200,8 +202,8 @@ fn init_theme(cx: &mut App) {
         Theme::global_mut(cx).dark_theme = dark;
     }
 
-    // Dark is the default, regardless of the system appearance.
-    Theme::change(ThemeMode::Dark, None, cx);
+    // Light is the default; header stays dark navy explicitly (see render_header).
+    Theme::change(ThemeMode::Light, None, cx);
 }
 
 /// Splits the `SSHDECK_AUTOCONNECT` value into individual targets.
@@ -401,6 +403,17 @@ fn tab_after_close(tab: MainTab, closed: usize) -> MainTab {
     }
 }
 
+/// Left navigation rail entries — mirrors Termius sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeftNav {
+    Hosts,
+    Keychain,
+    PortForwarding,
+    Snippets,
+    KnownHosts,
+    Logs,
+}
+
 /// A full-region pane that shows over the session content while it is open.
 ///
 /// Each variant is created on demand and dropped when it closes, so a pane that
@@ -415,6 +428,8 @@ struct SshDeck {
     selected: Option<HostId>,
     /// Which main-region tab is showing.
     tab: MainTab,
+    /// Left rail selection — drives the content region when no overlay covers it.
+    left_nav: LeftNav,
     /// The focused session, if any: the SFTP tab and the Reconnect action follow
     /// it even while another tab is showing.
     active: Option<usize>,
@@ -479,6 +494,7 @@ impl SshDeck {
             store,
             selected: None,
             tab: MainTab::Vaults,
+            left_nav: LeftNav::Hosts,
             active: None,
             sessions: Vec::new(),
             filter,
@@ -1002,9 +1018,11 @@ impl SshDeck {
     /// - Theme toggle → palette "Toggle Light / Dark Theme".
     fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let collapsed = self.sidebar_collapsed;
+        // Header stays dark navy #1d2033 in both Light and Dark (hardcoded; no theme token covers it in Light).
+        let header_bg = rgb(0x1d2033);
+        let header_fg = rgb(0xffffff);
+        let header_muted = rgb(0x8d91a5);
 
-        // Three subtle ghost icons at 16px (medium, the default). No primary
-        // fill, no status text — the header's loudest difference is gone.
         let actions = div()
             .flex()
             .flex_row()
@@ -1046,24 +1064,17 @@ impl SshDeck {
             .items_center()
             .gap_2()
             .flex_shrink_0()
-            // `--header-height` from the recovered stylesheet.
             .h(px(56.))
-            // Traffic-light inset: the native window buttons overlay the top
-            // left of the content now that the title bar is transparent, so the
-            // sidebar toggle starts clear of them. Termius keeps the lights
-            // level with the tab row, which this 56px header contains.
+            .bg(header_bg)
+            .text_color(header_fg)
             .pl(if cfg!(target_os = "macos") {
                 px(80.)
             } else {
                 px(12.)
             })
             .pr_3()
-            // `--border-basic`: the chrome's translucent hairline, not the
-            // opaque surface border (`#32364a`). No theme token carries it.
             .border_b_1()
             .border_color(rgba(0x8d91a540))
-            // The whole header drags the window; child hitboxes still win, so
-            // the tabs and buttons keep their clicks.
             .window_control_area(WindowControlArea::Drag)
             .child(
                 Button::new("sidebar-toggle")
@@ -1181,80 +1192,150 @@ impl SshDeck {
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let surface = cx.theme().sidebar;
-        let muted = cx.theme().muted_foreground;
+        self.render_left_rail(cx)
+    }
 
-        let query = self.filter.read(cx).value().to_string();
-        let visible: Vec<Host> = self
-            .store
-            .inventory()
-            .filtered(&query)
-            .into_iter()
-            .cloned()
-            .collect();
-        let total = self.store.inventory().len();
-        let mut rows = Vec::with_capacity(visible.len());
-        for host in &visible {
-            rows.push(self.render_host_row(host, "side", cx));
-        }
+    fn render_left_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Hardcoded light rail colours (no token for #f7f9fa sidebar/list).
+        let rail_bg = rgb(0xf7f9fa);
+        let border = rgb(0xd5dde0);
+        let active_bg = cx.theme().muted; // #e6ebed in light
+        let fg = cx.theme().foreground; // #141729
+        let muted = cx.theme().muted_foreground; // #798c94
+
+        let nav_item = |label: &'static str, icon: IconName, _nav: LeftNav, is_active: bool| {
+            div()
+                .id(SharedString::from(format!("nav-{label}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .h(px(44.))
+                .px_3()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .when(is_active, |el| el.bg(active_bg))
+                .text_color(if is_active { fg } else { muted })
+                .child(Icon::new(icon).text_color(if is_active { fg } else { muted }))
+                .child(label)
+                .hover(|s| s.bg(active_bg))
+        };
+
+        let hosts_active = self.left_nav == LeftNav::Hosts;
+        let keychain_active = self.left_nav == LeftNav::Keychain;
+        let pf_active = self.left_nav == LeftNav::PortForwarding;
+        let snippets_active = self.left_nav == LeftNav::Snippets;
+        let known_active = self.left_nav == LeftNav::KnownHosts;
+        let logs_active = self.left_nav == LeftNav::Logs;
 
         div()
             .flex()
             .flex_col()
             .flex_shrink_0()
-            // Collapsed rail vs expanded panel. Termius: 180px / 240px.
             .w(if self.sidebar_collapsed {
-                px(180.)
+                px(60.)
             } else {
-                px(240.)
+                px(230.)
             })
             .h_full()
+            .bg(rail_bg)
             .border_r_1()
-            // `--border-light`, the chrome's translucent hairline.
-            .border_color(rgba(0x8d91a51a))
-            .bg(surface)
+            .border_color(border)
+            .p_2()
+            .gap_1()
+            .child(
+                nav_item(
+                    "Hosts",
+                    IconName::LayoutDashboard,
+                    LeftNav::Hosts,
+                    hosts_active,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.left_nav = LeftNav::Hosts;
+                    cx.notify();
+                })),
+            )
+            .child(
+                nav_item(
+                    "Keychain",
+                    IconName::HardDrive,
+                    LeftNav::Keychain,
+                    keychain_active,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.left_nav = LeftNav::Keychain;
+                    cx.notify();
+                })),
+            )
+            .child(
+                nav_item(
+                    "Port Forwarding",
+                    IconName::ExternalLink,
+                    LeftNav::PortForwarding,
+                    pf_active,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.left_nav = LeftNav::PortForwarding;
+                    cx.notify();
+                })),
+            )
+            .child(
+                nav_item(
+                    "Snippets",
+                    IconName::File,
+                    LeftNav::Snippets,
+                    snippets_active,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.left_nav = LeftNav::Snippets;
+                    cx.notify();
+                })),
+            )
+            .child(
+                nav_item(
+                    "Known Hosts",
+                    IconName::Globe,
+                    LeftNav::KnownHosts,
+                    known_active,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.left_nav = LeftNav::KnownHosts;
+                    cx.notify();
+                })),
+            )
+            .child(
+                nav_item("Logs", IconName::Inbox, LeftNav::Logs, logs_active).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.left_nav = LeftNav::Logs;
+                        cx.notify();
+                    }),
+                ),
+            )
+    }
+
+    fn render_empty_state(&self, title: &str, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .size_full()
+            .p_8()
+            .child(Icon::new(IconName::Inbox).large().text_color(muted))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_2()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(format!("HOSTS ({total})")),
-                            )
-                            .child(
-                                Button::new("sidebar-keys")
-                                    .ghost()
-                                    .icon(IconName::HardDrive)
-                                    .tooltip("SSH keys & known hosts")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_keys(window, cx);
-                                    })),
-                            ),
-                    )
-                    .child(Input::new(&self.filter).small().cleanable(true)),
+                    .text_color(muted)
+                    .child(SharedString::from(title.to_string())),
             )
             .child(
                 div()
-                    .id("host-list")
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .px_2()
-                    .overflow_y_scrollbar()
-                    .children(rows),
+                    .text_xs()
+                    .text_color(muted)
+                    .child("No data yet — this pane is not wired."),
             )
+            .into_any_element()
     }
 
     /// The add-host sheet: a right-hand panel over a scrim, carrying the same
@@ -1678,48 +1759,440 @@ impl SshDeck {
             return self.render_overlay(cx);
         }
         match self.tab {
-            MainTab::Vaults => self.render_vault(cx),
+            MainTab::Vaults => {
+                match self.left_nav {
+                    LeftNav::Hosts => self.render_vault(cx),
+                    LeftNav::Keychain | LeftNav::KnownHosts => {
+                        // KeysPane is reachable via the header Keys button and palette;
+                        // render an honest placeholder that names it (no fake list).
+                        self.render_empty_state(
+                            "Keychain / Known Hosts — open via header Keys or palette (KeysPane)",
+                            cx,
+                        )
+                    }
+                    LeftNav::PortForwarding => self.render_empty_state(
+                        "Port Forwarding — open via palette or header (ForwardPane)",
+                        cx,
+                    ),
+                    LeftNav::Snippets => self.render_empty_state("Snippets — no snippets yet", cx),
+                    LeftNav::Logs => self.render_empty_state("Logs — no logs yet", cx),
+                }
+            }
             MainTab::Sftp => self.render_sftp(cx),
             MainTab::Session(_) => self.render_session(cx),
         }
     }
 
-    /// The Vaults tab: the stored hosts as cards in the main region.
+    /// The Vaults/Hosts screen — Termius light: search + Connect, toolbar, Hosts header, 2-col white cards, right Host Details.
     fn render_vault(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        let hosts: Vec<Host> = self.store.inventory().hosts().to_vec();
-        let mut rows = Vec::with_capacity(hosts.len());
-        for host in &hosts {
-            rows.push(self.render_host_row(host, "vault", cx));
+        let content_bg = cx.theme().accent; // #edf1f2 in light
+        let muted = cx.theme().muted_foreground; // #798c94
+        let has_selection = self.selected.is_some();
+        let selected_id = self.selected.clone();
+
+        // Top search row: Input + Connect button (disabled until a host is selected).
+        let search_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .p_2()
+            .child(
+                div()
+                    .flex_1()
+                    .child(Input::new(&self.filter).small().cleanable(true)),
+            )
+            .child(
+                Button::new("vault-connect")
+                    .small()
+                    .label("Connect")
+                    .when(!has_selection, |b| b.disabled(true))
+                    .when(has_selection, |b| {
+                        let host = selected_id
+                            .as_ref()
+                            .and_then(|id| self.store.inventory().get(id).cloned());
+                        b.on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(host) = host.clone() {
+                                this.connect(host, window, cx);
+                            }
+                        }))
+                    }),
+            );
+
+        // Toolbar row: + New host (split), Terminal, Serial; right view toggles (inert except New host).
+        let toolbar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_2()
+            .py_1()
+            .child(
+                Button::new("vault-new-host")
+                    .small()
+                    .label("+ New host")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_add_host(window, cx))),
+            )
+            .child(
+                Button::new("vault-terminal")
+                    .small()
+                    .ghost()
+                    .label("Terminal")
+                    .tooltip("Terminal (coming soon)")
+                    .on_click(|_, window, cx| {
+                        window.push_notification(Notification::info("Terminal coming soon"), cx);
+                    }),
+            )
+            .child(
+                Button::new("vault-serial")
+                    .small()
+                    .ghost()
+                    .label("Serial")
+                    .tooltip("Serial (coming soon)")
+                    .on_click(|_, window, cx| {
+                        window.push_notification(Notification::info("Serial coming soon"), cx);
+                    }),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("vault-view-grid")
+                    .ghost()
+                    .icon(IconName::LayoutDashboard)
+                    .tooltip("Grid view"),
+            )
+            .child(
+                Button::new("vault-filter")
+                    .ghost()
+                    .icon(IconName::Search)
+                    .tooltip("Filter"),
+            )
+            .child(
+                Button::new("vault-calendar")
+                    .ghost()
+                    .icon(IconName::Inbox)
+                    .tooltip("Calendar"),
+            );
+
+        // Host cards — two-column via chunking into rows (avoids flex_wrap which may not exist).
+        let query = self.filter.read(cx).value().to_string();
+        let filtered: Vec<Host> = self
+            .store
+            .inventory()
+            .filtered(&query)
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for chunk in filtered.chunks(2) {
+            let mut row_cards: Vec<AnyElement> = Vec::new();
+            for host in chunk {
+                row_cards.push(self.render_host_card(host, cx));
+            }
+            if chunk.len() == 1 {
+                // Pad second column with empty flex so cards keep ~50% width.
+                row_cards.push(div().flex_1().into_any_element());
+            }
+            rows.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_3()
+                    .w_full()
+                    .children(row_cards)
+                    .into_any_element(),
+            );
         }
+
+        let grid = div()
+            .id("vault-grid")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scrollbar()
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(format!("Hosts ({})", filtered.len())),
+            )
+            .children(rows);
+
+        let centre = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.))
+            .bg(content_bg)
+            .overflow_hidden()
+            .child(search_row)
+            .child(toolbar)
+            .child(grid);
+
+        let details = self.render_host_details_panel(cx);
 
         div()
             .flex()
-            .flex_col()
+            .flex_row()
             .flex_1()
             .h_full()
             .min_h(px(0.))
             .overflow_hidden()
+            .bg(content_bg)
+            .child(centre)
+            .child(details)
+            .into_any_element()
+    }
+
+    fn render_host_card(&mut self, host: &Host, cx: &mut Context<Self>) -> AnyElement {
+        let is_selected = self.selected.as_ref() == Some(&host.id);
+        let connect_host = host.clone();
+        let id = host.id.clone();
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let card_bg = rgb(0xffffff);
+        let border_selected = rgb(0x2091f6);
+        let border_default = rgb(0xd5dde0);
+        let orange = rgb(0xd96c2b);
+
+        div()
+            .id(SharedString::from(format!("vault-card-{id}")))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .flex_1()
+            .h(px(64.))
+            .px_3()
+            .rounded(px(10.))
+            .bg(card_bg)
+            .border_1()
+            .border_color(if is_selected {
+                border_selected
+            } else {
+                border_default
+            })
+            .when(is_selected, |el| el.border_2())
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.selected = Some(id.clone());
+                cx.notify();
+            }))
+            .on_double_click(cx.listener(move |this, _, window, cx| {
+                this.connect(connect_host.clone(), window, cx);
+            }))
             .child(
                 div()
-                    .flex_shrink_0()
-                    .px_4()
-                    .py_3()
-                    .text_color(muted)
-                    .child(format!("VAULTS ({})", hosts.len())),
+                    .size(px(40.))
+                    .rounded(px(8.))
+                    .bg(orange)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Icon::new(IconName::Globe).text_color(rgb(0xffffff))),
             )
             .child(
                 div()
-                    .id("vault-list")
                     .flex()
                     .flex_col()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .text_color(fg)
+                            .child(SharedString::from(host.label.clone())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(muted)
+                            .child(SharedString::from(format!("ssh, {}", host.username))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_host_details_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let border = rgb(0xd5dde0);
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let accent = rgb(0x2091f6);
+        let card_bg = rgb(0xffffff);
+
+        let selected_host = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.store.inventory().get(id).cloned());
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .p_3()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(div().text_color(fg).child("Host Details"))
+                    .child(div().text_xs().text_color(muted).child("Personal vault")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .child(
+                        Button::new("details-overflow")
+                            .ghost()
+                            .icon(IconName::Search)
+                            .tooltip("More"),
+                    )
+                    .child(
+                        Button::new("details-collapse")
+                            .ghost()
+                            .icon(IconName::PanelLeftClose)
+                            .tooltip("Collapse"),
+                    ),
+            );
+
+        let body: AnyElement =
+            match selected_host.clone() {
+                None => div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
                     .gap_2()
+                    .p_6()
+                    .text_color(muted)
+                    .child("Select a host to see details")
+                    .into_any_element(),
+                Some(host) => {
+                    let host_clone = host.clone();
+                    let host_for_connect = host.clone();
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_3()
+                        .overflow_y_scrollbar()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .p_3()
+                                .rounded_md()
+                                .bg(card_bg)
+                                .border_1()
+                                .border_color(border)
+                                .child(div().text_sm().text_color(fg).child("General"))
+                                .child(Input::new(&self.draft_label).small().cleanable(false))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(format!("{} · {}", host.label, host.address)),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child("Parent Group"),
+                                        )
+                                        .child(div().text_xs().text_color(muted).child("Default")),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_center()
+                                .p_2()
+                                .text_color(accent)
+                                .child("Share this host"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .p_3()
+                                .rounded_md()
+                                .bg(card_bg)
+                                .border_1()
+                                .border_color(border)
+                                .child(div().flex().flex_row().items_center().gap_2().child(
+                                    div().text_sm().child(format!("SSH on {} port", host.port)),
+                                ))
+                                .child(div().text_sm().text_color(fg).child("Credentials"))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(fg)
+                                        .child(SharedString::from(host.username.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(SharedString::from(host.auth.label())),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("+ SSH ID, Key, Certificate, FIDO2"),
+                                )
+                                .child(div().text_xs().text_color(muted).child("Show more")),
+                        )
+                        .child(
+                            Button::new("details-connect")
+                                .primary()
+                                .label("Connect")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.connect(host_for_connect.clone(), window, cx);
+                                })),
+                        )
+                        .into_any_element()
+                }
+            };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w(px(360.))
+            .h_full()
+            .bg(card_bg)
+            .border_l_1()
+            .border_color(border)
+            .overflow_hidden()
+            .child(header)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_h(px(0.))
-                    .px_4()
-                    .pb_4()
-                    .overflow_y_scrollbar()
-                    .children(rows),
+                    .overflow_hidden()
+                    .child(body),
             )
             .into_any_element()
     }
