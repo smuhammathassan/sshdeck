@@ -11,6 +11,7 @@ members = [
     "crates/sshdeck-config",
     "crates/sshdeck-telnet",
     "crates/sshdeck-certificates",
+    "crates/sshdeck-mosh",
     "crates/sshdeck-app",
 ]
 
