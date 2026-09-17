@@ -2364,7 +2364,7 @@ impl SshDeck {
                         Icon::default()
                             .data(match self.view_mode {
                                 ViewMode::Grid => glyph::GRID,
-                                ViewMode::List => glyph::FILE,
+                                ViewMode::List => glyph::LIST,
                             })
                             .size(px(14.)),
                     )

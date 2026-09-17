@@ -70,9 +70,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, AnyElement, App, AppContext as _, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
-    Subscription, Window,
+    div, px, AnyElement, App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable as _,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, Styled as _, Subscription, Window,
 };
 use sshdeck_core::forward::{Forward, ForwardConfig, ForwardError, ForwardEvent};
 use sshdeck_core::session::Session;
@@ -595,7 +595,7 @@ impl ForwardPane {
                         .child(self.kind.hint()),
                 )
                 .when_some(self.error.as_ref(), |el, err| {
-                    el.child(Alert::error(err.as_str()).small())
+                    el.child(Alert::error("forward-form-error", err.as_str()).small())
                 })
                 .child(
                     div()

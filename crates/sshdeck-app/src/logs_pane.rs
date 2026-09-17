@@ -70,9 +70,9 @@ use gpui_kit::component::{
     WindowExt as _,
 };
 use gpui_kit::{
-    div, px, rgb, AnyElement, App, AppContext as _, Context, Div, Entity, FocusHandle,
-    Focusable as _, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, Window,
+    div, px, rgb, AppContext as _, Context, Div, Entity, FocusHandle, Focusable as _, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    Subscription, Window,
 };
 
 /// Cap for the in-memory ring buffer. `docs/BUDGET.md` treats unbounded growth as

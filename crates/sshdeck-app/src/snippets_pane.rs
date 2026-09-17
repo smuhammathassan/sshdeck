@@ -809,8 +809,10 @@ impl SnippetsPane {
                     return true;
                 }
                 s.label().to_lowercase().contains(&query)
-                    || s.template().to_lowercase().contains(&query)
-                    || s.description().to_lowercase().contains(&query)
+                    || s.template().raw().to_lowercase().contains(&query)
+                    || s.description()
+                        .map(|d| d.to_lowercase().contains(&query))
+                        .unwrap_or(false)
             })
             .collect();
 
@@ -932,20 +934,20 @@ impl SnippetsPane {
                         Button::new(format!("snippet-row-edit-{id}"))
                             .ghost()
                             .xsmall()
-                            .icon(IconName::Pencil)
+                            .icon(IconName::Settings2)
                             .tooltip("Edit")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_edit(edit_id.clone(), cx);
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_edit(&edit_id, window, cx);
                             })),
                     )
                     .child(
                         Button::new(format!("snippet-row-delete-{id}"))
                             .ghost()
                             .xsmall()
-                            .icon(IconName::Trash2)
+                            .icon(IconName::Close)
                             .tooltip("Delete")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.delete(delete_id.clone(), window, cx);
+                                this.delete(&delete_id, window, cx);
                             })),
                     ),
             )
