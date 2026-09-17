@@ -2881,7 +2881,7 @@ impl SshDeck {
                                         if let Some(mut h) = host.clone() {
                                             if !h.tags.iter().any(|t| t == "telnet") {
                                                 h.tags.push("telnet".to_string());
-                                                this.store.insert(h);
+                                                this.store.inventory_mut().upsert(h);
                                                 let _ = this.store.save();
                                                 window.push_notification(
                                                     Notification::success(
@@ -2913,17 +2913,8 @@ impl SshDeck {
                                         this.details_menu_open = false;
                                         if let Some(host) = host.clone() {
                                             let mut copy = host.clone();
-                                            copy.id = HostId::from(format!(
-                                                "{}-copy-{}",
-                                                host.id,
-                                                std::time::SystemTime::now()
-                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                    .map(|d| d.as_secs())
-                                                    .unwrap_or(0)
-                                            ));
                                             copy.label = format!("{} (Copy)", host.label);
-                                            let copy_id = copy.id.clone();
-                                            this.store.insert(copy);
+                                            let copy_id = this.store.inventory_mut().insert(copy);
                                             let _ = this.store.save();
                                             this.selected = Some(copy_id);
                                             window.push_notification(
@@ -3069,7 +3060,7 @@ impl SshDeck {
                                                     move |this, _, window, cx| {
                                                         if let Some(mut h) = this.store.inventory().get(&host_id).cloned() {
                                                             h.label = h.endpoint();
-                                                            this.store.insert(h);
+                                                            this.store.inventory_mut().upsert(h);
                                                             let _ = this.store.save();
                                                             window.push_notification(
                                                                 Notification::info("Reset host label to endpoint"),
@@ -3141,6 +3132,7 @@ impl SshDeck {
                                         )
                                         .child(
                                             div()
+                                                .id("details-btn-add-tag")
                                                 .text_xs()
                                                 .text_color(accent)
                                                 .cursor_pointer()
@@ -3176,6 +3168,7 @@ impl SshDeck {
                                                 )
                                                 .child(
                                                     div()
+                                                        .id(SharedString::from(format!("remove-tag-{hid}-{tag_str}")))
                                                         .cursor_pointer()
                                                         .text_xs()
                                                         .text_color(muted)
@@ -3184,7 +3177,7 @@ impl SshDeck {
                                                         .on_click(cx.listener(move |this, _, _, cx| {
                                                             if let Some(mut h) = this.store.inventory().get(&hid).cloned() {
                                                                 h.tags.retain(|tag| tag != &tag_str);
-                                                                this.store.insert(h);
+                                                                this.store.inventory_mut().upsert(h);
                                                                 let _ = this.store.save();
                                                                 cx.notify();
                                                             }
@@ -3225,7 +3218,7 @@ impl SshDeck {
                                                     .text_xs()
                                                     .text_color(muted)
                                                     .child("Quick tags:"),
-                                            )
+                                             )
                                             .child(
                                                 div()
                                                     .flex()
@@ -3236,6 +3229,7 @@ impl SshDeck {
                                                         let hid = host_id.clone();
                                                         let preset_str = preset.to_string();
                                                         div()
+                                                            .id(SharedString::from(format!("quick-tag-{hid}-{preset_str}")))
                                                             .px_2()
                                                             .py_0p5()
                                                             .rounded(px(10.))
@@ -3251,7 +3245,7 @@ impl SshDeck {
                                                                 if let Some(mut h) = this.store.inventory().get(&hid).cloned() {
                                                                     if !h.tags.contains(&preset_str) {
                                                                         h.tags.push(preset_str.clone());
-                                                                        this.store.insert(h);
+                                                                        this.store.inventory_mut().upsert(h);
                                                                         let _ = this.store.save();
                                                                         cx.notify();
                                                                     }
@@ -3674,7 +3668,7 @@ impl SshDeck {
                                             if let Some(mut h) = this.store.inventory().get(&host_id).cloned() {
                                                 if !h.tags.iter().any(|t| t == "telnet") {
                                                     h.tags.push("telnet".to_string());
-                                                    this.store.insert(h);
+                                                    this.store.inventory_mut().upsert(h);
                                                     let _ = this.store.save();
                                                     window.push_notification(
                                                         Notification::success("Added Telnet protocol to host"),
