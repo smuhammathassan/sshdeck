@@ -4,6 +4,9 @@ members = [
     "crates/sshdeck-core",
     "crates/sshdeck-terminal",
     "crates/sshdeck-vault",
+    "crates/sshdeck-sftp",
+    "crates/sshdeck-autocomplete",
+    "crates/sshdeck-import",
     "crates/sshdeck-app",
 ]
 
