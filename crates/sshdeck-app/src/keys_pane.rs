@@ -50,15 +50,15 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     notification::Notification,
-    scroll::ScrollableElement as _,
+    scroll::{Scrollable, ScrollableElement as _},
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
     WindowExt as _,
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
     div, px, rgba, AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity,
-    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    SharedString, Stateful, Styled as _, Subscription, Window,
+    Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    Render, SharedString, Stateful, Styled as _, Subscription, Window,
 };
 use sshdeck_core::keys::{self, KeyKind};
 use sshdeck_core::known_hosts::{self, KnownHostsError, Learned};
@@ -133,8 +133,12 @@ struct PendingChange {
 }
 
 /// Which of the two sections is showing.
+///
+/// Public because `main.rs` drives the left nav, where Keychain and Known Hosts
+/// are separate entries: it can deep-link the pane with [`KeysPane::show`]
+/// instead of relying on the in-pane switch.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Section {
+pub enum KeysSection {
     Keys,
     Hosts,
 }
@@ -160,7 +164,7 @@ enum LearnOutcome {
 
 /// SSH key and known-hosts management. Constructed by the root view.
 pub struct KeysPane {
-    section: Section,
+    section: KeysSection,
     view: ViewMode,
     keys: Vec<KeyEntry>,
     /// Fingerprint of the selected key; a fingerprint is stable across reloads,
@@ -208,7 +212,7 @@ impl KeysPane {
         })];
 
         let mut pane = Self {
-            section: Section::Keys,
+            section: KeysSection::Keys,
             view: ViewMode::Grid,
             keys: Vec::new(),
             selected: None,
@@ -226,6 +230,14 @@ impl KeysPane {
         };
         pane.reload(window, cx);
         pane
+    }
+
+    /// Shows one of the two sections. Wiring hook for the left nav.
+    pub fn show(&mut self, section: KeysSection, cx: &mut Context<Self>) {
+        if self.section != section {
+            self.section = section;
+            cx.notify();
+        }
     }
 
     /// Number of keys currently listed. Reader method for the wiring pass.
@@ -518,8 +530,13 @@ impl KeysPane {
     fn render_section_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut row = div().flex().flex_row().items_center().gap_1();
         for (id, mark, label, section) in [
-            ("switch-keys", glyph::KEY, "Keychain", Section::Keys),
-            ("switch-hosts", glyph::HOST, "Known hosts", Section::Hosts),
+            ("switch-keys", glyph::KEY, "Keychain", KeysSection::Keys),
+            (
+                "switch-hosts",
+                glyph::HOST,
+                "Known hosts",
+                KeysSection::Hosts,
+            ),
         ] {
             row = row.child(
                 Button::new(id)
@@ -540,7 +557,7 @@ impl KeysPane {
     fn render_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut row = div().flex().flex_row().items_center().gap_1();
         match self.section {
-            Section::Keys => {
+            KeysSection::Keys => {
                 row = row
                     .child(
                         Button::new("generate-ed25519")
@@ -601,7 +618,7 @@ impl KeysPane {
                             .disabled(true),
                     );
             }
-            Section::Hosts => {
+            KeysSection::Hosts => {
                 row = row
                     .child(
                         Button::new("trust-host-key-form")
@@ -1129,8 +1146,8 @@ impl Render for KeysPane {
             .child(self.render_toolbar(cx))
             .child(self.render_filter(cx))
             .child(match self.section {
-                Section::Keys => self.render_keys(cx),
-                Section::Hosts => self.render_known_hosts(cx),
+                KeysSection::Keys => self.render_keys(cx),
+                KeysSection::Hosts => self.render_known_hosts(cx),
             })
     }
 }
@@ -1138,7 +1155,7 @@ impl Render for KeysPane {
 // ── view helpers ──────────────────────────────────────────────────────────
 
 /// A vertically scrolling content column with the reference's 24px inset.
-fn scroll_body(id: &'static str) -> Stateful<Div> {
+fn scroll_body(id: &'static str) -> Scrollable<Stateful<Div>> {
     div()
         .id(id)
         .flex()
