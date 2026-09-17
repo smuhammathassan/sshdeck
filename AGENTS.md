@@ -80,6 +80,8 @@ not the prose.
 | `cx.defer(..)` for a toast | `defer` yields only `&mut App`, no window. Use `cx.defer_in(window, ..)`. |
 | Size methods need no import | `.small()`/`.large()` come from the `Sizable` trait; `.disabled()` from `Disableable`; `.when()` from `FluentBuilder` (in `prelude`); `.overflow_y_scrollbar()` from `ScrollableElement`. Missing these traits is the single most common cause of "no method named" errors here. |
 | Colour guides treat `Rgba`/`Rgb`/`Hsla` as interchangeable | `Rgba` and `Hsla` are distinct structs and there is no `Rgb` type. Theme fields (`cx.theme().foreground`, `.background`, …) are `Hsla`; parsed terminal cell colours are `Rgba`. An `Option<Rgba>` cannot fall back to an `Hsla` in `unwrap_or` — convert with `.into()` (`From<Hsla> for Rgba` and `From<Rgba> for Hsla` both exist). |
+| `Sizable` exposes `.medium()` (usage.md and settings.md both list it) | There is no `medium()` method. `sizing.rs` implements only `with_size`, `xsmall`, `small`, `large`; `Size::Medium` is the default. Use `.with_size(Size::Medium)` (import `Size` from `gpui_kit::component`). |
+| settings.md's "Complete Settings Example" imports `Settings` / `SettingPage` / `SettingGroup` / `SettingItem` / `SettingField` from `gpui_kit::component::{…}` | `gpui-component` declares `pub mod setting;` but never globs it at the crate root, so `gpui_kit::component::Settings` does not resolve. Import them from `gpui_kit::component::setting::{…}` (the same page's Import section is the correct one). |
 
 `gpui-kit = "0.6"` resolves to `gpui-pre 0.3.5` — read that version's source.
 
