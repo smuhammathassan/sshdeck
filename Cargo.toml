@@ -8,6 +8,8 @@ members = [
     "crates/sshdeck-autocomplete",
     "crates/sshdeck-import",
     "crates/sshdeck-snippets",
+    "crates/sshdeck-config",
+    "crates/sshdeck-telnet",
     "crates/sshdeck-app",
 ]
 
