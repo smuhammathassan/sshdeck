@@ -11,8 +11,10 @@
 use vt100::Parser;
 
 // The engine's colour enum is already the data shape the UI needs (default /
-// indexed / RGB), so it is re-exported rather than mirrored.
-pub use vt100::Color;
+// indexed / RGB), so it is re-exported rather than mirrored. The mouse enums
+// are re-exported the same way: the engine already parses `DECSET`/`DECRST`
+// into them, so mirroring them would only add a conversion.
+pub use vt100::{Color, MouseProtocolEncoding, MouseProtocolMode};
 
 /// Scrollback and screen state for one session.
 pub struct Terminal {
@@ -90,6 +92,58 @@ impl Terminal {
         (col, row, !screen.hide_cursor())
     }
 
+    /// Whether the remote has enabled bracketed paste (`DECSET 2004`). When it
+    /// is on, a paste must be framed with `ESC[200~`/`ESC[201~`; use
+    /// [`Terminal::encode_paste`] so that framing cannot be forgotten.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.parser.screen().bracketed_paste()
+    }
+
+    /// Whether application-cursor-keys mode (`DECSET 1`) is on. It makes the
+    /// arrow-shaped keys emit `ESC O A` instead of `ESC [ A`; use
+    /// [`Terminal::encode_key`] so the bytes match the mode.
+    #[must_use]
+    pub fn application_cursor_keys(&self) -> bool {
+        self.parser.screen().application_cursor()
+    }
+
+    /// Whether application-keypad mode (`ESC =`) is on.
+    #[must_use]
+    pub fn application_keypad(&self) -> bool {
+        self.parser.screen().application_keypad()
+    }
+
+    /// Whether the cursor is visible (`DECSET 25`).
+    #[must_use]
+    pub fn cursor_visible(&self) -> bool {
+        !self.parser.screen().hide_cursor()
+    }
+
+    /// The remote's mouse-tracking mode (`DECSET 9`/`1000`/`1002`/`1003`).
+    /// Mouse events should only be reported while this is not
+    /// [`MouseProtocolMode::None`].
+    #[must_use]
+    pub fn mouse_mode(&self) -> MouseProtocolMode {
+        self.parser.screen().mouse_protocol_mode()
+    }
+
+    /// The remote's mouse-report encoding (`DECSET 1005`/`1006`). SGR reports
+    /// from [`encode_sgr_mouse`] are only correct while this is
+    /// [`MouseProtocolEncoding::Sgr`].
+    #[must_use]
+    pub fn mouse_encoding(&self) -> MouseProtocolEncoding {
+        self.parser.screen().mouse_protocol_encoding()
+    }
+
+    /// Whether the alternate screen is in use (`DECSET 47`/`1049`).
+    // ponytail: the engine tracks 47 and 1049 but ignores 1047; 1049 is what
+    // full-screen apps use, and the caller only needs the distinction.
+    #[must_use]
+    pub fn alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
     /// The window title set by the remote via OSC 2, if any.
     #[must_use]
     pub fn title(&self) -> Option<String> {
@@ -106,6 +160,21 @@ impl Terminal {
     /// number of retained rows, so it can never exceed the scrollback cap.
     pub fn set_scrollback_offset(&mut self, offset: usize) {
         self.parser.screen_mut().set_scrollback(offset);
+    }
+
+    /// Encodes a key press using this terminal's current input modes. Prefer
+    /// this over the free [`encode_key`], which assumes the default modes.
+    #[must_use]
+    pub fn encode_key(&self, key: Key, mods: Modifiers) -> Vec<u8> {
+        encode_key_with(key, mods, self.application_cursor_keys())
+    }
+
+    /// Bytes to send for a paste of `text`, framed according to this
+    /// terminal's current bracketed-paste mode. Prefer this over the free
+    /// [`encode_paste`], which needs the mode passed in by hand.
+    #[must_use]
+    pub fn encode_paste(&self, text: &str) -> Vec<u8> {
+        encode_paste(text, self.bracketed_paste())
     }
 }
 
@@ -247,16 +316,30 @@ impl Modifiers {
     }
 }
 
-/// Encodes a key press as xterm-256color input bytes.
+/// Encodes a key press as xterm-256color input bytes, assuming the default
+/// (non-application) cursor mode.
 ///
 /// Cursor and function keys use the xterm modifier parameter
 /// (`1 + shift + 2*alt + 4*ctrl`) when any modifier is held. Ctrl+letter
 /// yields the C0 control byte (Ctrl+C -> `0x03`); Alt prefixes `ESC`.
-// ponytail: keys are encoded against xterm defaults. Application-cursor-mode
-// (`ESC O`) variants and bracketed-paste framing are left to the caller, which
-// knows the current terminal modes.
+///
+/// This signature is retained for callers that hold no [`Terminal`]; a
+/// terminal-aware caller should use [`Terminal::encode_key`] instead, which
+/// consults [`Terminal::application_cursor_keys`].
 #[must_use]
 pub fn encode_key(key: Key, mods: Modifiers) -> Vec<u8> {
+    encode_key_with(key, mods, false)
+}
+
+/// Encodes a key press as xterm-256color input bytes for a terminal in the
+/// given input mode.
+///
+/// Application-cursor-keys mode (`DECSET 1`) is the only mode that changes a
+/// key's bytes today: the arrow-shaped keys then emit `ESC O A`-style (SS3)
+/// sequences when no modifier is held. With a modifier, xterm uses the `CSI`
+/// form in both modes.
+#[must_use]
+pub fn encode_key_with(key: Key, mods: Modifiers, application_cursor_keys: bool) -> Vec<u8> {
     let m = 1 + u8::from(mods.shift()) + 2 * u8::from(mods.alt()) + 4 * u8::from(mods.ctrl());
     match key {
         Key::Char(c) => encode_char(c, mods),
@@ -264,12 +347,12 @@ pub fn encode_key(key: Key, mods: Modifiers) -> Vec<u8> {
         Key::Tab => escape_prefix(0x09, mods),
         Key::Backspace => escape_prefix(0x7f, mods),
         Key::Escape => escape_prefix(0x1b, mods),
-        Key::Up => csi(b'A', m),
-        Key::Down => csi(b'B', m),
-        Key::Right => csi(b'C', m),
-        Key::Left => csi(b'D', m),
-        Key::Home => csi(b'H', m),
-        Key::End => csi(b'F', m),
+        Key::Up => cursor_key(b'A', m, application_cursor_keys),
+        Key::Down => cursor_key(b'B', m, application_cursor_keys),
+        Key::Right => cursor_key(b'C', m, application_cursor_keys),
+        Key::Left => cursor_key(b'D', m, application_cursor_keys),
+        Key::Home => cursor_key(b'H', m, application_cursor_keys),
+        Key::End => cursor_key(b'F', m, application_cursor_keys),
         Key::Insert => tilde(2, m),
         Key::Delete => tilde(3, m),
         Key::PageUp => tilde(5, m),
@@ -340,6 +423,16 @@ fn csi(final_byte: u8, m: u8) -> Vec<u8> {
     out
 }
 
+/// Arrow-shaped cursor keys. Under application-cursor-keys with no modifier
+/// xterm uses the SS3 form (`ESC O A`); every other case uses `CSI`.
+fn cursor_key(final_byte: u8, m: u8, application_cursor_keys: bool) -> Vec<u8> {
+    if application_cursor_keys && m == 1 {
+        ss3(final_byte, m)
+    } else {
+        csi(final_byte, m)
+    }
+}
+
 /// `CSI <n>~` or `CSI <n>;<m>~` (Insert/Delete/PageUp/PageDown/F5-F12).
 fn tilde(n: u8, m: u8) -> Vec<u8> {
     let mut out = vec![0x1b, b'['];
@@ -359,6 +452,64 @@ fn ss3(final_byte: u8, m: u8) -> Vec<u8> {
     } else {
         vec![0x1b, b'O', final_byte]
     }
+}
+
+/// Bytes to send for pasting `text`, given the bracketed-paste mode.
+///
+/// When `bracketed_paste` is on the text is framed with `ESC[200~` /
+/// `ESC[201~` so the remote can tell a paste from typing. When it is off the
+/// framing would be echoed literally, so the text is sent unwrapped — but
+/// first every newline is normalised to the `\r` a Return key sends. Sending a
+/// raw `\n` instead would leave the line feed without a carriage return (the
+/// column does not reset) and a multi-line paste would trigger line by line.
+///
+/// A terminal-aware caller should use [`Terminal::encode_paste`], which reads
+/// the mode itself.
+#[must_use]
+pub fn encode_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
+    if bracketed_paste {
+        let mut out = Vec::with_capacity(text.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        let mut out = Vec::with_capacity(text.len());
+        let mut pending_cr = false;
+        for c in text.chars() {
+            match c {
+                // The `\r` of a CRLF pair is already in `out`; drop the `\n`.
+                '\n' if pending_cr => {}
+                '\n' => out.push(b'\r'),
+                _ => {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+            pending_cr = c == '\r';
+        }
+        out
+    }
+}
+
+/// Encodes a mouse event as an SGR (1006) report: `CSI < b ; x ; y M` for a
+/// press and `... m` for a release. Only correct while the remote is in
+/// [`MouseProtocolEncoding::Sgr`] (see [`Terminal::mouse_encoding`]).
+///
+/// `button` is the SGR button code (0 left, 1 middle, 2 right, 64/65 wheel;
+/// add 32 for a motion report). `col` and `row` are zero-based terminal cells;
+/// the protocol reports them one-based, which is added here.
+#[must_use]
+pub fn encode_sgr_mouse(button: u8, col: u16, row: u16, release: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x1b[<");
+    out.extend_from_slice(button.to_string().as_bytes());
+    out.push(b';');
+    out.extend_from_slice((u32::from(col) + 1).to_string().as_bytes());
+    out.push(b';');
+    out.extend_from_slice((u32::from(row) + 1).to_string().as_bytes());
+    out.push(if release { b'm' } else { b'M' });
+    out
 }
 
 #[cfg(test)]
@@ -452,5 +603,100 @@ mod tests {
             encode_key(Key::Up, Modifiers::new(false, true, true)),
             b"\x1b[1;7A".to_vec()
         );
+    }
+
+    #[test]
+    fn bracketed_paste_defaults_off_and_toggles() {
+        let mut terminal = Terminal::new(20, 5, 100);
+        assert!(!terminal.bracketed_paste());
+        terminal.feed(b"\x1b[?2004h");
+        assert!(terminal.bracketed_paste());
+        terminal.feed(b"\x1b[?2004l");
+        assert!(!terminal.bracketed_paste());
+    }
+
+    #[test]
+    fn paste_helper_wraps_only_in_bracketed_mode_and_normalises_off() {
+        let mut terminal = Terminal::new(20, 5, 100);
+        // Off: a newline becomes the Return byte so the paste is not submitted
+        // line by line, and a CRLF collapses to a single Return.
+        assert_eq!(terminal.encode_paste("one\ntwo"), b"one\rtwo".to_vec());
+        assert_eq!(terminal.encode_paste("a\r\nb"), b"a\rb".to_vec());
+        terminal.feed(b"\x1b[?2004h");
+        assert!(terminal.bracketed_paste());
+        // On: framed verbatim; the remote handles the embedded newline.
+        assert_eq!(
+            terminal.encode_paste("one\ntwo"),
+            b"\x1b[200~one\ntwo\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn application_cursor_keys_switches_arrow_form() {
+        let mut terminal = Terminal::new(20, 5, 100);
+        assert!(!terminal.application_cursor_keys());
+        assert_eq!(
+            terminal.encode_key(Key::Up, Modifiers::default()),
+            b"\x1b[A".to_vec()
+        );
+        terminal.feed(b"\x1b[?1h");
+        assert!(terminal.application_cursor_keys());
+        assert_eq!(
+            terminal.encode_key(Key::Up, Modifiers::default()),
+            b"\x1bOA".to_vec()
+        );
+        assert_eq!(
+            terminal.encode_key(Key::Left, Modifiers::default()),
+            b"\x1bOD".to_vec()
+        );
+        // A held modifier uses the CSI form in either mode.
+        assert_eq!(
+            terminal.encode_key(Key::Up, Modifiers::new(false, false, true)),
+            b"\x1b[1;5A".to_vec()
+        );
+        terminal.feed(b"\x1b[?1l");
+        assert!(!terminal.application_cursor_keys());
+        assert_eq!(
+            terminal.encode_key(Key::Up, Modifiers::default()),
+            b"\x1b[A".to_vec()
+        );
+    }
+
+    #[test]
+    fn cursor_visibility_reflects_mode() {
+        let mut terminal = Terminal::new(20, 5, 100);
+        assert!(terminal.cursor_visible());
+        terminal.feed(b"\x1b[?25l");
+        assert!(!terminal.cursor_visible());
+        terminal.feed(b"\x1b[?25h");
+        assert!(terminal.cursor_visible());
+    }
+
+    #[test]
+    fn mouse_mode_and_sgr_report_encode() {
+        let mut terminal = Terminal::new(20, 5, 100);
+        assert_eq!(terminal.mouse_mode(), MouseProtocolMode::None);
+        terminal.feed(b"\x1b[?1000h");
+        assert_eq!(terminal.mouse_mode(), MouseProtocolMode::PressRelease);
+        terminal.feed(b"\x1b[?1006h");
+        assert_eq!(terminal.mouse_encoding(), MouseProtocolEncoding::Sgr);
+        // A left press at zero-based cell (4, 9) is reported one-based.
+        assert_eq!(encode_sgr_mouse(0, 4, 9, false), b"\x1b[<0;5;10M".to_vec());
+        assert_eq!(encode_sgr_mouse(0, 4, 9, true), b"\x1b[<0;5;10m".to_vec());
+        terminal.feed(b"\x1b[?1000l");
+        assert_eq!(terminal.mouse_mode(), MouseProtocolMode::None);
+    }
+
+    #[test]
+    fn mode_survives_chunk_boundary() {
+        let mut terminal = Terminal::new(20, 5, 100);
+        // The escape sequence is split mid-parameter across two feeds.
+        terminal.feed(b"\x1b[?20");
+        assert!(!terminal.bracketed_paste());
+        terminal.feed(b"04h");
+        assert!(terminal.bracketed_paste());
+        terminal.feed(b"\x1b[?1");
+        terminal.feed(b"h");
+        assert!(terminal.application_cursor_keys());
     }
 }
