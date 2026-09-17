@@ -8,6 +8,7 @@
 //!
 //! Shape follows `docs/re/RUSSH-GAP.md` §8.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_channel::{Receiver, Sender, TrySendError};
@@ -15,12 +16,11 @@ use bytes::Bytes;
 use russh::client;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::agent::AgentIdentity;
-use russh::keys::{
-    check_known_hosts, load_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate,
-};
+use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect, Sig};
 
 use crate::forward::{self, Forward, ForwardConfig};
+use crate::jump::{ChainHop, HostChain};
 use crate::sftp::{self, SftpChannel};
 use crate::{AuthMethod, Host, SessionState};
 
@@ -79,6 +79,13 @@ pub enum SessionError {
     Backpressure,
     #[error("session is closed")]
     Closed,
+    /// A failure resolving the jump chain, before any connection is attempted.
+    #[error("host chain: {0}")]
+    Chain(#[from] crate::jump::ChainError),
+    /// A hop failed while dialling or authenticating. `hop` names it — its
+    /// position, label and `user@host:port` — so the UI can show which hop died.
+    #[error("hop {hop}: {message}")]
+    Hop { hop: String, message: String },
 }
 
 impl From<russh::Error> for SessionError {
@@ -89,7 +96,7 @@ impl From<russh::Error> for SessionError {
 
 /// What to connect to. Built from a [`Host`]; secrets are supplied separately by
 /// the caller (they live in the keychain, not in core).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
     address: String,
     port: u16,
@@ -113,6 +120,25 @@ impl SessionConfig {
         }
     }
 
+    /// An endpoint that is not backed by a `Host` — a hop resolved from a
+    /// `ProxyJump` spec. Secrets are attached with [`Self::with_password`] or
+    /// [`Self::set_password`].
+    pub fn direct(
+        address: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+        auth: AuthMethod,
+    ) -> Self {
+        Self {
+            address: address.into(),
+            port,
+            username: username.into(),
+            auth,
+            password: None,
+            passphrase: None,
+        }
+    }
+
     /// Resolved password for [`AuthMethod::Password`].
     pub fn with_password(mut self, password: impl Into<String>) -> Self {
         self.password = Some(password.into());
@@ -123,6 +149,17 @@ impl SessionConfig {
     pub fn with_passphrase(mut self, passphrase: impl Into<String>) -> Self {
         self.passphrase = Some(passphrase.into());
         self
+    }
+
+    /// In-place form of [`Self::with_password`], for a hop borrowed from a
+    /// [`HostChain`](crate::jump::HostChain).
+    pub fn set_password(&mut self, password: impl Into<String>) {
+        self.password = Some(password.into());
+    }
+
+    /// In-place form of [`Self::with_passphrase`].
+    pub fn set_passphrase(&mut self, passphrase: impl Into<String>) {
+        self.passphrase = Some(passphrase.into());
     }
 
     pub fn address(&self) -> &str {
@@ -185,6 +222,25 @@ impl Session {
         Self::spawn(config, Mode::Exec(command.to_string()))
     }
 
+    /// Spawns a connection thread that dials a jump chain: the first hop
+    /// directly, then every later hop over a `direct-tcpip` channel through the
+    /// hop before it, authenticating and verifying each hop's host key on the
+    /// way. The last hop is the target and carries the interactive shell.
+    ///
+    /// Build the chain with [`HostChain::resolve`], which follows native host
+    /// references and `ProxyJump` specs, rejects cycles and over-deep chains,
+    /// and lets the caller attach per-hop secrets via
+    /// [`HostChain::hop_mut`](crate::jump::HostChain::hop_mut).
+    pub fn connect_chain(chain: HostChain) -> Result<Self, SessionError> {
+        Self::spawn_chain(chain, Mode::Shell)
+    }
+
+    /// Like [`Self::connect_chain`], but runs one command on the target with
+    /// the SSH `exec` request instead of an interactive shell.
+    pub fn exec_chain(chain: HostChain, command: &str) -> Result<Self, SessionError> {
+        Self::spawn_chain(chain, Mode::Exec(command.to_string()))
+    }
+
     fn spawn(config: SessionConfig, mode: Mode) -> Result<Self, SessionError> {
         config.validate()?;
 
@@ -211,6 +267,43 @@ impl Session {
                     .build();
                 match runtime {
                     Ok(runtime) => runtime.block_on(run(config, mode, cmd_rx, event_tx)),
+                    Err(err) => {
+                        let _ = event_tx.send_blocking(SessionEvent::Error(format!(
+                            "could not start the connection runtime: {err}"
+                        )));
+                    }
+                }
+            })
+            .map_err(|err| {
+                SessionError::Connect(format!("could not spawn the connection thread: {err}"))
+            })?;
+
+        Ok(Self { commands, events })
+    }
+
+    /// The chain counterpart of [`Self::spawn`]: same thread, same bounded
+    /// channels, but the thread dials a [`HostChain`] instead of one endpoint.
+    fn spawn_chain(chain: HostChain, mode: Mode) -> Result<Self, SessionError> {
+        // Validate every hop up front, so a missing secret or an unsupported
+        // auth method is a synchronous typed error rather than an event. This is
+        // the same check the single-endpoint path runs.
+        for hop in chain.hops() {
+            hop.config().validate()?;
+        }
+
+        let (commands, cmd_rx) = async_channel::bounded(64);
+        let (event_tx, events) = async_channel::bounded(256);
+
+        let label = format!("ssh-{}", chain.target().address());
+        std::thread::Builder::new()
+            .name(label)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build();
+                match runtime {
+                    Ok(runtime) => runtime.block_on(run_chain(chain, mode, cmd_rx, event_tx)),
                     Err(err) => {
                         let _ = event_tx.send_blocking(SessionEvent::Error(format!(
                             "could not start the connection runtime: {err}"
@@ -294,17 +387,69 @@ impl Drop for Session {
     }
 }
 
-/// Verifies the server key against the user's `~/.ssh/known_hosts`.
+/// Verifies one server key against the user's `~/.ssh/known_hosts`.
 ///
-/// The check is `russh::keys::check_known_hosts` (`keys/known_hosts.rs`), which
-/// hashes hostnames, handles `[host]:port`, returns `Ok(false)` for an unknown
-/// host and `Err(KeyChanged)` for a mismatch. Anything other than `Ok(true)` is
-/// an error here, so an unknown key fails closed instead of being accepted.
+/// The check is `russh::keys::known_hosts::check_known_hosts_path` (via
+/// [`crate::known_hosts::known`]), which hashes hostnames, handles
+/// `[host]:port`, returns `Ok(false)` for an unknown host and a `KeyChanged`
+/// error for a mismatch. Anything other than "recorded with this key" is an
+/// error here, so an unknown key fails closed instead of being accepted.
+///
+/// `known_hosts` overrides the default file and exists so tests can point a hop
+/// at a throwaway file; production always passes `None`.
+fn verify_server_key(
+    host: &str,
+    port: u16,
+    server_public_key: &PublicKeyOrCertificate,
+    known_hosts: Option<&Path>,
+) -> Result<(), SessionError> {
+    let public_key = match server_public_key {
+        PublicKeyOrCertificate::PublicKey { key, .. } => key,
+        // ponytail: OpenSSH host certificates need CA-fingerprint validation
+        // (ssh_key::certificate::Certificate::validate), which is a separate
+        // trust decision. Until that exists, refuse rather than guess.
+        PublicKeyOrCertificate::Certificate(_) => {
+            return Err(SessionError::Unsupported("OpenSSH host certificate"));
+        }
+    };
+    let path = match known_hosts {
+        Some(path) => Some(path.to_path_buf()),
+        None => crate::known_hosts::default_path(),
+    };
+    let Some(path) = path else {
+        return Err(SessionError::Connect(format!(
+            "host key for {host}:{port} cannot be checked: no known_hosts path"
+        )));
+    };
+    match crate::known_hosts::known(host, port, public_key, &path) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SessionError::Connect(format!(
+            "host key for {host}:{port} is not in known_hosts"
+        ))),
+        Err(err) => Err(SessionError::Connect(format!(
+            "known_hosts check for {host}:{port} failed: {err}"
+        ))),
+    }
+}
+
+/// The handler for one hop. Every hop of a chain gets its own instance carrying
+/// that hop's `host`/`port`, so the key check is always against the hop that
+/// actually offered the key — never only the last hop.
 struct KnownHostsHandler {
     host: String,
     port: u16,
     /// Routes for running `-R` forwards, filled in by the connection thread.
     routes: forward::Routes,
+}
+
+impl KnownHostsHandler {
+    fn new(host: impl Into<String>, port: u16, routes: forward::Routes) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            routes,
+        }
+    }
 }
 
 impl client::Handler for KnownHostsHandler {
@@ -314,26 +459,8 @@ impl client::Handler for KnownHostsHandler {
         &mut self,
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let public_key = match server_public_key {
-            PublicKeyOrCertificate::PublicKey { key, .. } => key,
-            // ponytail: OpenSSH host certificates need CA-fingerprint validation
-            // (ssh_key::certificate::Certificate::validate), which is a separate
-            // trust decision. Until that exists, refuse rather than guess.
-            PublicKeyOrCertificate::Certificate(_) => {
-                return Err(SessionError::Unsupported("OpenSSH host certificate"));
-            }
-        };
-        match check_known_hosts(&self.host, self.port, public_key) {
-            Ok(true) => Ok(true),
-            Ok(false) => Err(SessionError::Connect(format!(
-                "host key for {}:{} is not in known_hosts",
-                self.host, self.port
-            ))),
-            Err(err) => Err(SessionError::Connect(format!(
-                "known_hosts check for {}:{} failed: {err}",
-                self.host, self.port
-            ))),
-        }
+        verify_server_key(&self.host, self.port, server_public_key, None)?;
+        Ok(true)
     }
 
     /// A `-R` connection arrived. Accept it and pipe it to the local target
@@ -409,22 +536,10 @@ async fn run_session(
     emit(events, SessionEvent::State(SessionState::Connecting)).await;
 
     let routes = forward::Routes::default();
-    let handler = KnownHostsHandler {
-        host: config.address().to_string(),
-        port: config.port(),
-        routes: routes.clone(),
-    };
-    // ponytail: 1 MiB window and 32 buffered channel messages, on the modest end
-    // of RUSSH-GAP.md §8's recommendation; the terminal scrollback is the only
-    // unbounded growth.
-    let client_config = Arc::new(client::Config {
-        window_size: 1 << 20,
-        channel_buffer_size: 32,
-        ..Default::default()
-    });
+    let handler = KnownHostsHandler::new(config.address(), config.port(), routes.clone());
 
     let mut handle =
-        client::connect(client_config, (config.address(), config.port()), handler).await?;
+        client::connect(client_config(), (config.address(), config.port()), handler).await?;
 
     emit(events, SessionEvent::State(SessionState::Authenticating)).await;
     authenticate(&mut handle, config).await?;
@@ -434,7 +549,128 @@ async fn run_session(
     // forwarding tasks need `&Handle`; a mutex gives them that without moving
     // the session loop off this task.
     let handle = Arc::new(tokio::sync::Mutex::new(handle));
+    drive(handle, routes, mode, commands, events).await
+}
 
+/// Drives a chain on the dedicated runtime, then reports the outcome.
+async fn run_chain(
+    chain: HostChain,
+    mode: Mode,
+    commands: Receiver<Command>,
+    events: Sender<SessionEvent>,
+) {
+    if let Err(err) = run_chain_inner(&chain, mode, commands, &events).await {
+        let message = err.to_string();
+        emit(&events, SessionEvent::Error(message.clone())).await;
+        emit(
+            &events,
+            SessionEvent::State(SessionState::Failed { message }),
+        )
+        .await;
+    }
+}
+
+/// Dial order: hop 0 goes directly, every later hop is reached over a
+/// `direct-tcpip` channel through the hop before it. Each hop is authenticated
+/// (and its host key verified against that hop's identity) before the next is
+/// opened, and every intermediate `Handle` lives until the end: the tunnel is
+/// the previous hop's channel, so dropping one would close it.
+async fn run_chain_inner(
+    chain: &HostChain,
+    mode: Mode,
+    commands: Receiver<Command>,
+    events: &Sender<SessionEvent>,
+) -> Result<(), SessionError> {
+    emit(events, SessionEvent::State(SessionState::Connecting)).await;
+
+    let routes = forward::Routes::default();
+    let client_config = client_config();
+    let hops = chain.hops();
+    let total = hops.len();
+    let mut handles: Vec<client::Handle<KnownHostsHandler>> = Vec::with_capacity(total);
+
+    for (index, hop) in hops.iter().enumerate() {
+        let handler = KnownHostsHandler::new(hop.address(), hop.port(), routes.clone());
+        let mut handle = match handles.last() {
+            None => client::connect(client_config.clone(), (hop.address(), hop.port()), handler)
+                .await
+                .map_err(|err| hop_failure(index, total, hop, err))?,
+            Some(previous) => {
+                let channel = previous
+                    .channel_open_direct_tcpip(
+                        hop.address().to_string(),
+                        u32::from(hop.port()),
+                        "127.0.0.1",
+                        0,
+                    )
+                    .await
+                    .map_err(|err| hop_failure(index, total, hop, err.into()))?;
+                // `Box::pin` makes the stream `Unpin`, so it satisfies
+                // `connect_stream`, which drives the next SSH session over it.
+                client::connect_stream(
+                    client_config.clone(),
+                    Box::pin(channel.into_stream()),
+                    handler,
+                )
+                .await
+                .map_err(|err| hop_failure(index, total, hop, err))?
+            }
+        };
+
+        if index + 1 == total {
+            emit(events, SessionEvent::State(SessionState::Authenticating)).await;
+        }
+        authenticate(&mut handle, hop.config())
+            .await
+            .map_err(|err| hop_failure(index, total, hop, err))?;
+        handles.push(handle);
+    }
+
+    emit(events, SessionEvent::Connected).await;
+
+    // The last hop is the target; the intermediates stay in `handles` until this
+    // function returns, keeping every tunnel open.
+    let target = handles
+        .pop()
+        .ok_or_else(|| SessionError::Connect("host chain is empty".into()))?;
+    let handle = Arc::new(tokio::sync::Mutex::new(target));
+    drive(handle, routes, mode, commands, events).await
+}
+
+/// Names the hop a failure happened on, the way the UI shows it.
+fn hop_failure(index: usize, total: usize, hop: &ChainHop, err: SessionError) -> SessionError {
+    let name = match hop.label() {
+        Some(label) => format!("{label} ({})", hop.endpoint()),
+        None => hop.endpoint(),
+    };
+    SessionError::Hop {
+        hop: format!("{} of {total} {name}", index + 1),
+        message: err.to_string(),
+    }
+}
+
+/// The client config every connection uses.
+///
+/// ponytail: 1 MiB window and 32 buffered channel messages, on the modest end of
+/// RUSSH-GAP.md §8's recommendation; the terminal scrollback is the only
+/// unbounded growth.
+fn client_config() -> Arc<client::Config> {
+    Arc::new(client::Config {
+        window_size: 1 << 20,
+        channel_buffer_size: 32,
+        ..Default::default()
+    })
+}
+
+/// Opens the session channel for `mode` and pumps it until it closes. Shared by
+/// the single-endpoint and chain paths so their behaviour cannot drift.
+async fn drive(
+    handle: Arc<tokio::sync::Mutex<client::Handle<KnownHostsHandler>>>,
+    routes: forward::Routes,
+    mode: Mode,
+    commands: Receiver<Command>,
+    events: &Sender<SessionEvent>,
+) -> Result<(), SessionError> {
     let channel = {
         let connection = handle.lock().await;
         connection.channel_open_session().await?
@@ -643,6 +879,7 @@ async fn authenticate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Inventory;
 
     fn host(auth: AuthMethod) -> Host {
         let mut host = Host::new("Prod", "example.com");
@@ -665,6 +902,127 @@ mod tests {
         assert_eq!(config.port(), 2222);
         assert_eq!(config.username(), "deploy");
         assert_eq!(config.auth(), &AuthMethod::Agent);
+    }
+
+    /// The keys used below are the ed25519 keys russh's own known_hosts tests
+    /// use (also quoted in `known_hosts.rs`).
+    const KEY_A: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+
+    fn public_key(base64: &str) -> russh::keys::PublicKey {
+        russh::keys::parse_public_key_base64(base64).expect("valid key")
+    }
+
+    fn server_key() -> PublicKeyOrCertificate {
+        PublicKeyOrCertificate::PublicKey {
+            key: public_key(KEY_A),
+            hash_alg: None,
+        }
+    }
+
+    #[test]
+    fn connect_chain_validates_every_hop_before_dialling() {
+        let mut target = Host::new("db", "db.internal");
+        target.username = "deploy".into();
+        target.auth = AuthMethod::Password {
+            secret_ref: "target".into(),
+        };
+        target.proxy_jump = Some("bastion".into());
+        let mut bastion = Host::new("bastion", "bastion.internal");
+        bastion.username = "ops".into();
+        bastion.auth = AuthMethod::Password {
+            secret_ref: "jump".into(),
+        };
+        let mut inventory = Inventory::default();
+        inventory.insert(bastion);
+        inventory.insert(target.clone());
+
+        let mut chain = HostChain::resolve(&target, &inventory).expect("resolves");
+        chain
+            .hop_mut(1)
+            .expect("target is the last hop")
+            .set_password("target-secret");
+
+        // The jump's secret is missing, so the chain must not dial at all.
+        let err = Session::connect_chain(chain)
+            .err()
+            .expect("must not spawn a thread without the jump secret");
+        assert!(
+            matches!(err, SessionError::MissingSecret("password")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn every_hop_of_a_chain_is_verified_against_known_hosts() {
+        let mut target = Host::new("db", "db.internal");
+        target.proxy_jump = Some("bastion".into());
+        let bastion = Host::new("bastion", "bastion.internal");
+        let mut inventory = Inventory::default();
+        inventory.insert(bastion);
+        inventory.insert(target.clone());
+
+        let chain = HostChain::resolve(&target, &inventory).expect("resolves");
+        assert_eq!(chain.len(), 2);
+
+        let dir = std::env::temp_dir().join(format!("sshdeck-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("known_hosts");
+
+        // Record only the jump's key, then run the exact check the handler runs
+        // for each hop: both hops are checked, and the unrecorded target fails
+        // closed rather than being waved through.
+        crate::known_hosts::learn("bastion.internal", 22, &public_key(KEY_A), &path)
+            .expect("learn");
+        let mut checked = 0usize;
+        let mut outcomes = Vec::new();
+        for hop in chain.hops() {
+            checked += 1;
+            outcomes.push(
+                verify_server_key(
+                    hop.address(),
+                    hop.port(),
+                    &server_key(),
+                    Some(path.as_path()),
+                )
+                .is_ok(),
+            );
+        }
+        assert_eq!(checked, 2, "a 2-hop chain verifies exactly two hops");
+        assert_eq!(outcomes, [true, false]);
+
+        // Record the target too: both hops verify now.
+        crate::known_hosts::learn("db.internal", 22, &public_key(KEY_A), &path).expect("learn");
+        for hop in chain.hops() {
+            verify_server_key(
+                hop.address(),
+                hop.port(),
+                &server_key(),
+                Some(path.as_path()),
+            )
+            .expect("every hop verifies");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hop_failures_name_the_hop_at_its_position() {
+        let mut target = Host::new("db", "db.internal");
+        target.proxy_jump = Some("ops@bastion.example.com:2222".into());
+        let inventory = Inventory::default();
+        let chain = HostChain::resolve(&target, &inventory).expect("resolves");
+        let hops = chain.hops();
+
+        let jump = hop_failure(0, 2, hops[0], SessionError::Connect("refused".into()));
+        let jump = jump.to_string();
+        assert!(jump.contains("1 of 2"), "{jump}");
+        assert!(jump.contains("ops@bastion.example.com:2222"), "{jump}");
+
+        let target = hop_failure(1, 2, hops[1], SessionError::Connect("refused".into()));
+        let target = target.to_string();
+        assert!(target.contains("2 of 2"), "{target}");
+        assert!(target.contains("db.internal"), "{target}");
     }
 
     #[test]
@@ -819,5 +1177,79 @@ mod tests {
         }
         assert_eq!(output, b"sshdeck");
         assert_eq!(status, Some(7));
+    }
+
+    /// Live check of the jump chain: dials the target through a real jump host,
+    /// verifying both host keys. The target is described by the same
+    /// `SSHDECK_TEST_*` env as the checks above; the jump host additionally needs
+    /// `SSHDECK_TEST_JUMP_HOST`, `SSHDECK_TEST_JUMP_USER`,
+    /// `SSHDECK_TEST_JUMP_PASSWORD` (optional `SSHDECK_TEST_JUMP_PORT`).
+    #[test]
+    #[ignore = "needs a live sshd and a live jump host"]
+    fn connects_through_a_live_jump_host() {
+        let (Ok(jump_host), Ok(jump_user), Ok(jump_password)) = (
+            std::env::var("SSHDECK_TEST_JUMP_HOST"),
+            std::env::var("SSHDECK_TEST_JUMP_USER"),
+            std::env::var("SSHDECK_TEST_JUMP_PASSWORD"),
+        ) else {
+            return;
+        };
+        let (Ok(address), Ok(username), Ok(password)) = (
+            std::env::var("SSHDECK_TEST_HOST"),
+            std::env::var("SSHDECK_TEST_USER"),
+            std::env::var("SSHDECK_TEST_PASSWORD"),
+        ) else {
+            return;
+        };
+        let port = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|port| port.parse().ok())
+                .unwrap_or(22)
+        };
+
+        let mut bastion = Host::new("bastion", jump_host);
+        bastion.username = jump_user;
+        bastion.port = port("SSHDECK_TEST_JUMP_PORT");
+        bastion.auth = AuthMethod::Password {
+            secret_ref: "test-jump".into(),
+        };
+        let mut target = Host::new("live", address);
+        target.username = username;
+        target.port = port("SSHDECK_TEST_PORT");
+        target.auth = AuthMethod::Password {
+            secret_ref: "test".into(),
+        };
+        target.proxy_jump = Some("bastion".into());
+
+        let mut inventory = Inventory::default();
+        inventory.insert(bastion);
+        inventory.insert(target.clone());
+
+        let mut chain = HostChain::resolve(&target, &inventory).expect("resolves");
+        assert_eq!(chain.len(), 2);
+        chain
+            .hop_mut(0)
+            .expect("jump is the first hop")
+            .set_password(jump_password);
+        chain
+            .hop_mut(1)
+            .expect("target is the last hop")
+            .set_password(password);
+
+        let session = Session::connect_chain(chain).expect("spawns the connection thread");
+        let events = session.events();
+        loop {
+            match events.recv_blocking() {
+                Ok(SessionEvent::Connected) => {
+                    session.write(b"echo sshdeck-chain\n").expect("write");
+                    return;
+                }
+                Ok(SessionEvent::Error(message)) => panic!("{message}"),
+                Ok(SessionEvent::Closed(code)) => panic!("closed before auth: {code:?}"),
+                Ok(_) => {}
+                Err(err) => panic!("event channel closed: {err}"),
+            }
+        }
     }
 }

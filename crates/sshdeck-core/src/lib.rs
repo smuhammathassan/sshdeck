@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub mod forward;
+pub mod jump;
 pub mod keys;
 pub mod known_hosts;
 pub mod session;
