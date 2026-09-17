@@ -6,8 +6,12 @@
 use gpui_kit::component::{
     button::Button,
     input::{Input, InputEvent, InputState},
-    ActiveTheme as _, Icon, IconName, Root, Theme, WindowExt,
+    notification::Notification,
+    scroll::ScrollableElement as _,
+    ActiveTheme as _, ButtonVariants as _, Disableable as _, Icon, IconName, Root, Sizable as _,
+    Theme, ThemeMode, WindowExt,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, WindowOptions,
@@ -68,7 +72,9 @@ impl SshDeck {
 
         if let Some(error) = load_error {
             let message = SharedString::from(format!("Could not load hosts: {error}"));
-            cx.defer(move |cx| cx.push_notification_error(message.clone()));
+            cx.defer_in(window, move |_, window, cx| {
+                window.push_notification(Notification::error(message), cx);
+            });
         }
 
         Self {
@@ -88,7 +94,10 @@ impl SshDeck {
         let address = self.draft_address.read(cx).value().trim().to_string();
 
         if label.is_empty() || address.is_empty() {
-            cx.push_notification_warning("A label and an address are both required");
+            window.push_notification(
+                Notification::warning("A label and an address are both required"),
+                cx,
+            );
             return;
         }
 
@@ -99,7 +108,7 @@ impl SshDeck {
         self.selected = Some(id);
 
         if let Err(error) = self.store.save() {
-            cx.push_notification_error(SharedString::from(format!("Could not save: {error}")));
+            window.push_notification(Notification::error(format!("Could not save: {error}")), cx);
         }
 
         self.draft_label
@@ -109,13 +118,13 @@ impl SshDeck {
         cx.notify();
     }
 
-    fn remove_host(&mut self, id: &HostId, cx: &mut Context<Self>) {
+    fn remove_host(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) {
         self.store.inventory_mut().remove(id);
         if self.selected.as_ref() == Some(id) {
             self.selected = None;
         }
         if let Err(error) = self.store.save() {
-            cx.push_notification_error(SharedString::from(format!("Could not save: {error}")));
+            window.push_notification(Notification::error(format!("Could not save: {error}")), cx);
         }
         cx.notify();
     }
@@ -157,8 +166,13 @@ impl SshDeck {
                             .ghost()
                             .icon(IconName::Moon)
                             .tooltip("Toggle light/dark")
-                            .on_click(|_, _, cx| {
-                                cx.update_global::<Theme, _>(|theme, cx| theme.toggle_mode(cx));
+                            .on_click(|_, window, cx| {
+                                let next = if Theme::global(cx).is_dark() {
+                                    ThemeMode::Light
+                                } else {
+                                    ThemeMode::Dark
+                                };
+                                Theme::change(next, Some(window), cx);
                             }),
                     )
                     .child(
@@ -227,8 +241,8 @@ impl SshDeck {
                         .xsmall()
                         .icon(IconName::Close)
                         .tooltip("Remove host")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.remove_host(&remove_id, cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.remove_host(&remove_id, window, cx);
                         })),
                 )
         });
@@ -271,7 +285,7 @@ impl SshDeck {
                     .gap_1()
                     .flex_1()
                     .px_2()
-                    .overflow_y_scroll()
+                    .overflow_y_scrollbar()
                     .children(rows),
             )
             .child(
