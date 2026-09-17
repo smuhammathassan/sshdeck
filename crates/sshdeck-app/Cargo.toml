@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 gpui-kit = "0.6"
 sshdeck-core = { path = "../sshdeck-core" }
+sshdeck-config = { path = "../sshdeck-config" }
 sshdeck-terminal = { path = "../sshdeck-terminal" }
 # Declared up front so that parallel workstreams can add UI modules without
 # racing on this manifest. An unused path dependency costs nothing.
