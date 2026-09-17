@@ -415,7 +415,8 @@ mod tests {
 
     #[test]
     fn native_chain_resolves_jumps_before_the_target() {
-        let target = host("app", "app.internal");
+        let mut target = host("app", "app.internal");
+        target.proxy_jump = Some("bastion".into());
         let mut middle = host("bastion", "bastion.internal");
         middle.proxy_jump = Some("edge".into());
         let edge = host("edge", "edge.internal");
