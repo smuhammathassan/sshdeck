@@ -603,10 +603,7 @@ mod tests {
     fn unbalanced_delimiter_is_a_parse_error() {
         let error = Template::parse("echo {{oops").expect_err("must fail");
         assert!(matches!(error, SnippetError::UnbalancedDelimiter { .. }));
-        assert!(matches!(
-            Snippet::new("Broken", "echo }}oops"),
-            Ok(_) // a stray closer is literal text, not a delimiter
-        ));
+        assert!(Snippet::new("Broken", "echo }}oops").is_ok());
         assert!(Snippet::new("Broken", "echo {{oops").is_err());
     }
 
