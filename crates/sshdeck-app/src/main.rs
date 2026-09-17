@@ -11,7 +11,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Root, Sizable as _, Theme, ThemeMode,
     WindowExt,
 };
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
     div, px, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, WindowOptions,
@@ -206,6 +206,10 @@ impl SshDeck {
 
             div()
                 .id(SharedString::from(format!("host-{}", id)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.selected = Some(id.clone());
+                    cx.notify();
+                }))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -215,11 +219,11 @@ impl SshDeck {
                 .py_1()
                 .rounded_sm()
                 .cursor_pointer()
-                .when(is_selected, |row| row.bg(cx.theme().muted))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.selected = Some(id.clone());
-                    cx.notify();
-                }))
+                .bg(if is_selected {
+                    cx.theme().muted
+                } else {
+                    surface
+                })
                 .child(Icon::new(IconName::Globe).small().text_color(muted))
                 .child(
                     div()
