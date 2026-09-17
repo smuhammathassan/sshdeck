@@ -21,9 +21,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, px, rgb, rgba, AnyElement, App, AppContext as _, Context, Entity, Focusable as _, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, Rgba, SharedString,
-    Styled as _, Subscription, TitlebarOptions, Window, WindowOptions,
+    div, point, px, rgb, rgba, AnyElement, App, AppContext as _, Context, Entity, Focusable as _,
+    Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render, Rgba, SharedString,
+    Styled as _, Subscription, TitlebarOptions, Window, WindowControlArea, WindowOptions,
 };
 use keys_pane::KeysPane;
 use palette::PaletteView;
