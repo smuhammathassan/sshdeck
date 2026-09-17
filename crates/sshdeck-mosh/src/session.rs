@@ -22,9 +22,7 @@ use std::path::Path;
 use std::thread::JoinHandle;
 
 use async_channel::{Receiver, Sender, TrySendError};
-use portable_pty::{
-    native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize, PtySystem, SlavePty,
-};
+use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
 use crate::{MoshBinary, MoshError, MoshInvocation};
 
