@@ -688,7 +688,7 @@ async fn upload_file(
 /// bug this closes.
 async fn download_file(
     sftp: &SftpSession,
-    remote: &str,
+    remote_path: &str,
     local: &Path,
     progress: &ProgressSink,
     cancel: &CancelToken,
@@ -697,10 +697,10 @@ async fn download_file(
     use std::io::{Seek as _, Write as _};
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    let mut source = sftp.open(remote).await.map_err(remote)?;
+    let mut source = sftp.open(remote_path).await.map_err(remote)?;
     let remote_size = source.metadata().await.ok().map(|meta| meta.len());
 
-    let offset = match partial::resume_decision(local, remote, remote_size) {
+    let offset = match partial::resume_decision(local, remote_path, remote_size) {
         ResumeDecision::Resume { offset } => offset,
         // A refused resume restarts from 0; the stale sidecar is cleared.
         ResumeDecision::Fresh | ResumeDecision::Refused(_) => {
@@ -754,7 +754,7 @@ async fn download_file(
             let _ = flushed;
             let marked = done > 0
                 && remote_size
-                    .is_some_and(|size| partial::write_sidecar(local, remote, size).is_ok());
+                    .is_some_and(|size| partial::write_sidecar(local, remote_path, size).is_ok());
             if marked {
                 progress.mark_partial(PartialDisposition::KeptResumable { done });
             } else {

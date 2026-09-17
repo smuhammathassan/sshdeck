@@ -21,7 +21,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::listing::FileKind;
-use crate::transfer::{CancelToken, ProgressSink};
+use crate::transfer::CancelToken;
 use crate::SftpError;
 
 /// Hard ceiling on how deep a recursive walk descends.
