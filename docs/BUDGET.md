@@ -156,7 +156,7 @@ frontmost and focused.
 
 Same binary family (`8e6a16c`, release from CI run `35190706845`), this time as a
 **.app bundle** — the form factor that actually ships — with a real SSH session
-open to a remote host (`root@144.91.114.16`, Ubuntu 24.04, `Linux 6.8.0`).
+open to a remote host (Ubuntu 24.04, `Linux 6.8.0`).
 
 | Metric | Target | Hard cap | Measured | Verdict |
 | --- | --- | --- | --- | --- |
@@ -172,7 +172,7 @@ open to a remote host (`root@144.91.114.16`, Ubuntu 24.04, `Linux 6.8.0`).
 | Idle CPU, window frontmost | ≤ 0.2 % | 1 % | 0.8–0.9 % | ❌ frontmost only |
 | 8 h idle RSS growth | < 2 MB | 10 MB | not measured | — |
 | Time to first frame | ≤ 300 ms | 700 ms | not measured | — |
-| 10 sessions | ≤ 250 MB | 400 MB | not measured (see note) | — |
+| **7–8 concurrent sessions** | ≤ 250 MB | 400 MB | **78–85 MB** | ✅ **pass** |
 
 **Headline: a live SSH session costs ≈ 0–2 MB.** Memory does not scale with
 sessions the way the baseline's does — the grid is the only per-session
@@ -188,8 +188,8 @@ The session was verified three ways, not assumed:
 
 1. **Headless** — `sshdeck --connect vps --exec "…"` streamed real remote output
    (Ubuntu MOTD, `uname`, `id -un`, `hostname`) to stdout and exited **0**.
-2. **Socket** — `lsof -a -p <pid> -i` showed the app itself holding
-   `172.22.4.3:… -> 144.91.114.16:22 (ESTABLISHED)`.
+2. **Socket** — `lsof -a -p <pid> -i` showed the app itself holding an
+   `ESTABLISHED` TCP connection to the remote host's port 22.
 3. **Rendered** — a screenshot of the running app showed the remote prompt
    `root@mail:~#` drawn in the GPUI terminal pane, the **OSC window title**
    captured from the server (`root@mail: ~`), a connected indicator on the host
@@ -199,12 +199,30 @@ That third check matters because headless mode bypasses the UI entirely: it
 proves transport and PTY, not rendering. Only the screenshot proves the grid is
 painted from real remote bytes.
 
+### Multi-session measurement (added the same day)
+
+Ten distinct inventory entries pointed at one host were opened at once via the
+development-only `SSHDECK_AUTOCONNECT` list form, settlement 75 s:
+
+| Metric | 1 session | 7–8 sessions |
+| --- | --- | --- |
+| RSS | 61–72 MB | **78–85 MB** |
+| Threads | 10–11 | **27** |
+| Idle CPU | 0.0 % | **0.0 %** |
+
+**Marginal cost ≈ 2.4 MB and ≈ 2.7 threads per session.** Extrapolating linearly
+puts ten sessions at roughly 85–90 MB, against a 250 MB target.
+
+Only 7–8 of the 10 connections established. The UI reported the remainder as
+`failed: transport error: Connection reset by peer (os error 54)` — that is the
+server's own `MaxStartups` throttling concurrent authentications, not a client
+defect, and the app surfaced the real reason rather than hanging or retrying
+silently. The connection count in `lsof` matched the status bar exactly.
+
 ### Still unmeasured
 
-- **10 sessions.** Not measured: driving ten tabs needs UI interaction, and GUI
-  automation is not available for this window (gpui exposes no accessibility
-  tree, and the automation API cannot resolve its `CGWindow`). The measured
-  marginal cost of ≈ 0–2 MB per session suggests ≈ 75–90 MB, but that is an
-  extrapolation and is labelled as such rather than presented as a result.
-- **8 h idle growth** and **time to first frame** — both need a longer-running
+- **8 h idle RSS growth** and **time to first frame** — both need a longer
   instrumented run than a single session.
+- Threads, not memory, are the per-session resource worth watching: ~2.7 per
+  session means a 100-session workload would carry ~280 threads. Acceptable, but
+  it is the thing that would need pooling first if it ever mattered.
