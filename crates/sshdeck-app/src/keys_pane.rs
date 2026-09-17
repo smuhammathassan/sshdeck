@@ -1584,10 +1584,11 @@ fn key_type_label(kind: &str) -> String {
 
 /// Case-insensitive substring test over the fields a row shows.
 fn matches_query(fields: &[&str], query: &str) -> bool {
+    let query = query.trim().to_lowercase();
     query.is_empty()
         || fields
             .iter()
-            .any(|field| field.to_lowercase().contains(query))
+            .any(|field| field.to_lowercase().contains(query.as_str()))
 }
 
 /// Whether a `known_hosts` host pattern covers `host:port`.
@@ -1596,9 +1597,9 @@ fn matches_query(fields: &[&str], query: &str) -> bool {
 /// names share a key; used to mark the row a pending change belongs to.
 fn hosts_pattern_matches(patterns: &str, host: &str, port: u16) -> bool {
     let bracketed = format!("[{host}]:{port}");
-    patterns
-        .split(',')
-        .any(|pattern| pattern.eq_ignore_ascii_case(host) || pattern == bracketed)
+    patterns.split(',').any(|pattern| {
+        pattern.eq_ignore_ascii_case(host) || pattern.eq_ignore_ascii_case(bracketed.as_str())
+    })
 }
 
 /// A filename safe to write into the keys directory.
