@@ -5,3 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
+thiserror.workspace = true
+# Exact version, mirroring crates/sshdeck-core/Cargo.toml. `ssh-key` (0.7.0-rc.11)
+# is reached through `russh::keys`, never as a direct dependency, so the tree
+# keeps exactly one `ssh-key`.
+russh = "=0.63.3"
+# The certificate nonce needs a CSPRNG. russh's default ssh-key features enable
+# `rand_core`, but russh neither re-exports an RNG nor enables ssh-key's
+# `getrandom` feature, so use the same rand 0.10 line russh (and sshdeck-core)
+# pin; Cargo unifies it with russh's own `rand`.
+rand = { version = "0.10", features = ["thread_rng"] }
+
+[dev-dependencies]
+serde_json.workspace = true
