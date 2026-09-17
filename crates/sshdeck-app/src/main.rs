@@ -4,12 +4,12 @@
 //! theming. Transport (russh) replaces the placeholder pane next.
 
 use gpui_kit::component::{
-    button::Button,
+    button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     notification::Notification,
     scroll::ScrollableElement as _,
-    ActiveTheme as _, ButtonVariants as _, Disableable as _, Icon, IconName, Root, Sizable as _,
-    Theme, ThemeMode, WindowExt,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Root, Sizable as _, Theme, ThemeMode,
+    WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -186,7 +186,7 @@ impl SshDeck {
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
-        let surface = cx.theme().surface;
+        let surface = cx.theme().sidebar;
         let muted = cx.theme().muted_foreground;
 
         let query = self.filter.read(cx).value().to_string();
