@@ -33,7 +33,9 @@ use std::time::{Duration, SystemTime};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _, Sizable as _,
+};
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
     div, px, Context, Div, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -368,7 +370,11 @@ impl SftpPane {
     }
 
     /// The listing body, or the state that stands in for it.
-    fn render_body(&self, cx: &mut Context<Self>) -> Div {
+    ///
+    /// Returns `impl IntoElement` rather than `Div`: the scrollable wrapper
+    /// (`ScrollableElement::overflow_y_scrollbar`) is a `Scrollable<_>`, not a
+    /// `Div`, so every branch here returns that wrapper type.
+    fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
         let danger = cx.theme().danger;

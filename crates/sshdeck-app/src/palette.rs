@@ -27,9 +27,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    actions, div, px, App, AppContext as _, Context, Entity, Hsla, InteractiveElement as _,
-    IntoElement, KeyBinding, Keystroke, ParentElement as _, Render, Role, SharedString,
-    Styled as _, Subscription, Window,
+    actions, div, px, App, AppContext as _, Context, Entity, Focusable as _, Hsla,
+    InteractiveElement as _, IntoElement, KeyBinding, Keystroke, ParentElement as _, Render, Role,
+    SharedString, Styled as _, Subscription, Window,
 };
 
 actions!(palette, [PaletteUp, PaletteDown, PaletteCancel]);
@@ -91,7 +91,7 @@ impl Category {
     fn icon(self) -> IconName {
         match self {
             Category::Appearance => IconName::Moon,
-            Category::Hosts => IconName::Server,
+            Category::Hosts => IconName::Globe,
             Category::Panes => IconName::Folder,
         }
     }
@@ -143,7 +143,7 @@ impl Command {
         }
     }
 
-    const fn shortcut(mut self, shortcut: &'static str) -> Self {
+    const fn with_shortcut(mut self, shortcut: &'static str) -> Self {
         self.shortcut = Some(shortcut);
         self
     }
@@ -206,7 +206,7 @@ fn registry() -> Vec<Command> {
             "Toggle Light / Dark Theme",
             &["theme", "dark", "light", "appearance", "mode"],
         )
-        .shortcut("cmd-shift-t")
+        .with_shortcut("cmd-shift-t")
         .kind(Kind::Builtin(Builtin::ToggleTheme)),
         Command::new(
             CommandId::AddHost,
@@ -253,7 +253,7 @@ fn registry() -> Vec<Command> {
             "Open Settings",
             &["preferences", "config"],
         )
-        .shortcut("cmd-,")
+        .with_shortcut("cmd-,")
         .kind(Kind::Unavailable(
             "Settings screen is not wired into the shell yet",
         )),
