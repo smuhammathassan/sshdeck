@@ -5,3 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Pinned exactly: the API was verified against this version on docs.rs.
+# Terminal escape parsing; no UI, no async, no network.
+vt100 = "=0.16.2"
