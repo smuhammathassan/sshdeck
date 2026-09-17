@@ -65,10 +65,11 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _};
-use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rgb, Context, Div, Entity, FocusHandle, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
+    div, px, rgb, App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable as _, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    Subscription, Window,
 };
 
 /// Cap for the in-memory ring buffer. `docs/BUDGET.md` treats unbounded growth as
@@ -397,7 +398,7 @@ impl LogsPane {
             )
     }
 
-    fn render_row(&self, entry: &LogEntry, cx: &mut Context<Self>) -> Div {
+    fn render_row(&self, entry: &LogEntry, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
         let hover = cx.theme().muted;

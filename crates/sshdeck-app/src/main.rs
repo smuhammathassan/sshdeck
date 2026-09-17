@@ -6,11 +6,11 @@
 
 mod forward_pane;
 mod keys_pane;
+mod logs_pane;
 mod palette;
 mod settings;
-mod snippets_pane;
-mod logs_pane;
 mod sftp_pane;
+mod snippets_pane;
 mod terminal;
 
 use gpui_kit::component::{
