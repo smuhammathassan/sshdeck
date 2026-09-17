@@ -21,6 +21,7 @@ use russh::keys::{
 use russh::{ChannelMsg, Disconnect};
 
 use crate::forward::{self, Forward, ForwardConfig};
+use crate::sftp::{self, SftpChannel};
 use crate::{AuthMethod, Host, SessionState};
 
 /// Caps how many keyboard-interactive rounds we will answer, so a misbehaving
@@ -32,6 +33,8 @@ enum Command {
     Write(Bytes),
     Resize { cols: u32, rows: u32 },
     Forward(forward::ForwardSetup),
+    // Opens the `sftp` subsystem and bridges it to the caller's handle.
+    Sftp(sftp::SftpSetup),
     AgentForward,
     Close,
 }
@@ -224,6 +227,16 @@ impl Session {
         Ok(forward)
     }
 
+    /// Opens the `sftp` subsystem on this connection. Returns an opaque,
+    /// executor-agnostic [`SftpChannel`]; progress is reported by the channel
+    /// itself and the subsystem is started on the connection's runtime. The
+    /// channel is not usable until [`SftpChannel::opened`] resolves.
+    pub fn open_sftp(&self) -> Result<SftpChannel, SessionError> {
+        let (channel, setup) = SftpChannel::open();
+        self.send(Command::Sftp(setup))?;
+        Ok(channel)
+    }
+
     /// Asks the server to allow agent forwarding on this connection. Incoming
     /// `auth-agent@openssh.com` channels are piped to the local `SSH_AUTH_SOCK`.
     pub fn request_agent_forwarding(&self) -> Result<(), SessionError> {
@@ -414,6 +427,9 @@ async fn run_session(
                 }
                 Ok(Command::Forward(setup)) => {
                     tokio::spawn(forward::serve(handle.clone(), setup, routes.clone()));
+                }
+                Ok(Command::Sftp(setup)) => {
+                    tokio::spawn(sftp::serve(handle.clone(), setup));
                 }
                 Ok(Command::AgentForward) => {
                     write.agent_forward(true).await?;

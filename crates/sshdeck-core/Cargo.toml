@@ -15,4 +15,4 @@ bytes = "1"
 # russh pins (Cargo unifies it with russh's own `rand`).
 rand = { version = "0.10", features = ["thread_rng"] }
 russh = { version = "=0.63.3", features = ["des"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
