@@ -174,21 +174,6 @@ fn init_theme(cx: &mut App) {
     Theme::change(ThemeMode::Dark, None, cx);
 }
 
-/// The script `--exec` writes once the shell is ready: the command, then an
-/// explicit `exit` so the session closes and the process returns the moment the
-/// command finishes, the way `ssh host cmd` does.
-///
-/// ponytail: the transport always opens an interactive login shell with a PTY
-/// (`Session::connect` -> `request_shell`), and it emits no "command finished"
-/// event, so completion is detected by the shell exiting. Ceiling: a command
-/// that replaces the shell or leaves a background job writing to the PTY will
-/// not close cleanly, and the PTY echoes the command/prompt into stdout.
-/// Upgrade path: add an exec-channel mode (request `exec`, no PTY) to
-/// `sshdeck-core::session` and close on its exit-status event.
-fn exec_script(command: &str) -> String {
-    format!("{command}\nexit\n")
-}
-
 /// Splits the `SSHDECK_AUTOCONNECT` value into individual targets.
 ///
 /// Development and test affordance only: a comma-separated list opens one
@@ -221,25 +206,14 @@ fn parse_port(raw: &str) -> Result<u16, String> {
     }
 }
 
-/// How long `--exec` waits after the first output before writing the command.
-///
-/// The first [`SessionEvent::Data`] is the honest "the shell has produced
-/// output" signal; this short settle covers a MOTD that arrives in pieces.
-/// It is a supplement, never the primary mechanism.
-const EXEC_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
-
 /// Runs one command over SSH with no window, no gpui, and no async runtime.
 ///
-/// This is the same transport the terminal pane uses: `Session::connect` owns
-/// the connection thread and, exactly as in the GUI, requests the PTY and login
-/// shell, so the bytes are what a pane would have fed to its grid. `events()` is
-/// an `async_channel::Receiver`; `recv_blocking` (verified on the pinned
+/// This is the same transport the terminal pane uses, but on the SSH `exec`
+/// request instead of a PTY + login shell: the command is sent once, the
+/// server's stdout and stderr stream back verbatim, and nothing is echoed, so
+/// the bytes are exactly what the command wrote. `events()` is an
+/// `async_channel::Receiver`; `recv_blocking` (verified on the pinned
 /// async-channel 2.5.0) lets that stream be drained on the main thread.
-///
-/// The command is not written until the first [`SessionEvent::Data`] arrives.
-/// `Session::connect` returns as soon as the shell has been requested, not when
-/// the shell is reading input, so writing immediately lands during the MOTD and
-/// is echoed a second time at the prompt.
 ///
 /// Returns the process exit code: the remote exit status when the server sends
 /// one (like `ssh host cmd`), otherwise 0 on a clean close, or 1 on a connect
@@ -273,7 +247,9 @@ fn run_headless(target: &str, command: &str) -> i32 {
         }
     }
 
-    let session = match SshSession::connect(config) {
+    // No PTY and no login shell: the command is the whole session, so it is
+    // never echoed and stdout is not polluted by a prompt.
+    let session = match SshSession::exec(config, command) {
         Ok(session) => session,
         Err(error) => {
             eprintln!("sshdeck: {error}");
@@ -287,7 +263,6 @@ fn run_headless(target: &str, command: &str) -> i32 {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut failed = false;
-    let mut sent = false;
     let mut exit_code = 0;
     while let Ok(event) = events.recv_blocking() {
         match event {
@@ -295,25 +270,12 @@ fn run_headless(target: &str, command: &str) -> i32 {
             SessionEvent::Data(bytes) => {
                 let _ = out.write_all(&bytes);
                 let _ = out.flush();
-                // The shell has produced output, so it is no longer mid-setup.
-                // Write the command exactly once, after a short settle, then
-                // let the loop keep streaming until the shell exits.
-                if !sent {
-                    sent = true;
-                    std::thread::sleep(EXEC_SETTLE);
-                    if let Err(error) = session.write(exec_script(command).as_bytes()) {
-                        eprintln!("sshdeck: could not send the command: {error}");
-                        failed = true;
-                        break;
-                    }
-                }
             }
             SessionEvent::Error(message) => {
                 eprintln!("sshdeck: {message}");
                 failed = true;
             }
-            // The remote status is the command's own: the appended `exit`
-            // returns the last command's code, like `ssh host cmd`.
+            // The remote status is the command's own.
             SessionEvent::Closed(code) => exit_code = code.unwrap_or(0),
             // Other lifecycle events carry no bytes or status.
             _ => {}
@@ -1560,12 +1522,5 @@ mod tests {
         );
         assert!(autoconnect_targets("").is_empty());
         assert!(autoconnect_targets(" , ").is_empty());
-    }
-
-    #[test]
-    fn exec_script_runs_the_command_then_exits() {
-        // The trailing `exit` is what closes the session once the command is
-        // done; without it the caller had to append it by hand.
-        assert_eq!(exec_script("uptime"), "uptime\nexit\n");
     }
 }

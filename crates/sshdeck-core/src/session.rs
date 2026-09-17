@@ -18,7 +18,7 @@ use russh::keys::agent::AgentIdentity;
 use russh::keys::{
     check_known_hosts, load_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate,
 };
-use russh::{ChannelMsg, Disconnect};
+use russh::{ChannelMsg, Disconnect, Sig};
 
 use crate::forward::{self, Forward, ForwardConfig};
 use crate::sftp::{self, SftpChannel};
@@ -39,12 +39,22 @@ enum Command {
     Close,
 }
 
+/// What the session channel is opened for.
+enum Mode {
+    /// An interactive login shell over a PTY, for the terminal pane.
+    Shell,
+    /// One command via the SSH `exec` request: no PTY and no login shell.
+    Exec(String),
+}
+
 /// Everything the UI sees from a session.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-    /// Auth succeeded and the shell channel is open.
+    /// Auth succeeded and the session channel is being opened.
     Connected,
-    /// Bytes from the remote shell (stdout and stderr are merged).
+    /// Bytes from the remote session (stdout and stderr are merged): shell
+    /// output for [`Session::connect`], the command's output for
+    /// [`Session::exec`].
     Data(Vec<u8>),
     /// Lifecycle change, mirroring [`SessionState`].
     State(SessionState),
@@ -159,9 +169,23 @@ pub struct Session {
 }
 
 impl Session {
-    /// Spawns a dedicated connection thread and returns immediately. Progress
-    /// and failure arrive as [`SessionEvent`]s on [`Session::events`].
+    /// Spawns a dedicated connection thread that serves an interactive login
+    /// shell. Returns immediately; progress and failure arrive as
+    /// [`SessionEvent`]s on [`Session::events`].
     pub fn connect(config: SessionConfig) -> Result<Self, SessionError> {
+        Self::spawn(config, Mode::Shell)
+    }
+
+    /// Spawns a dedicated connection thread that runs exactly one command with
+    /// the SSH `exec` request: no PTY and no login shell, so the command is
+    /// never echoed back and stdout carries nothing but the command's own
+    /// output. Output arrives as [`SessionEvent::Data`] (stdout and stderr
+    /// merged) and the remote exit status as [`SessionEvent::Closed`].
+    pub fn exec(config: SessionConfig, command: &str) -> Result<Self, SessionError> {
+        Self::spawn(config, Mode::Exec(command.to_string()))
+    }
+
+    fn spawn(config: SessionConfig, mode: Mode) -> Result<Self, SessionError> {
         config.validate()?;
 
         // ponytail: bounded both ways so a fast server cannot balloon memory.
@@ -186,7 +210,7 @@ impl Session {
                     .enable_all()
                     .build();
                 match runtime {
-                    Ok(runtime) => runtime.block_on(run(config, cmd_rx, event_tx)),
+                    Ok(runtime) => runtime.block_on(run(config, mode, cmd_rx, event_tx)),
                     Err(err) => {
                         let _ = event_tx.send_blocking(SessionEvent::Error(format!(
                             "could not start the connection runtime: {err}"
@@ -359,8 +383,13 @@ async fn emit(tx: &Sender<SessionEvent>, event: SessionEvent) {
 }
 
 /// Drives one connection on the dedicated runtime, then reports the outcome.
-async fn run(config: SessionConfig, commands: Receiver<Command>, events: Sender<SessionEvent>) {
-    if let Err(err) = run_session(&config, commands, &events).await {
+async fn run(
+    config: SessionConfig,
+    mode: Mode,
+    commands: Receiver<Command>,
+    events: Sender<SessionEvent>,
+) {
+    if let Err(err) = run_session(&config, mode, commands, &events).await {
         let message = err.to_string();
         emit(&events, SessionEvent::Error(message.clone())).await;
         emit(
@@ -373,6 +402,7 @@ async fn run(config: SessionConfig, commands: Receiver<Command>, events: Sender<
 
 async fn run_session(
     config: &SessionConfig,
+    mode: Mode,
     commands: Receiver<Command>,
     events: &Sender<SessionEvent>,
 ) -> Result<(), SessionError> {
@@ -410,12 +440,19 @@ async fn run_session(
         connection.channel_open_session().await?
     };
     let (mut read, write) = channel.split();
-    // A real PTY + shell so interactive terminal bytes flow. The initial size is
-    // a placeholder; the UI sends the first real size via `resize`.
-    write
-        .request_pty(true, "xterm-256color", 80, 24, 0, 0, &[])
-        .await?;
-    write.request_shell(true).await?;
+    match &mode {
+        // A real PTY + shell so interactive terminal bytes flow. The initial
+        // size is a placeholder; the UI sends the first real size via `resize`.
+        Mode::Shell => {
+            write
+                .request_pty(true, "xterm-256color", 80, 24, 0, 0, &[])
+                .await?;
+            write.request_shell(true).await?;
+        }
+        // Direct execution: the server runs `command` with no shell and no PTY,
+        // so there is nothing to echo and no prompt in the byte stream.
+        Mode::Exec(command) => write.exec(true, command.as_bytes().to_vec()).await?,
+    }
 
     let mut exit_code: Option<i32> = None;
     loop {
@@ -448,6 +485,11 @@ async fn run_session(
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                     exit_code = Some(exit_status as i32);
                 }
+                // A command killed by a signal sends no exit status; report the
+                // shell convention rather than a misleading success.
+                Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
+                    exit_code.get_or_insert_with(|| signal_exit_code(&signal_name));
+                }
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
                 // Other channel messages are not needed for a login shell.
                 Some(_) => {}
@@ -463,6 +505,30 @@ async fn run_session(
     }
     emit(events, SessionEvent::Closed(exit_code)).await;
     Ok(())
+}
+
+/// The status to report when the server says a command died from a signal
+/// ([`ChannelMsg::ExitSignal`], which carries no exit status of its own),
+/// following the shell convention of `128 + signal number`. A signal russh
+/// does not model by name reports 128, so a signalled command is never mistaken
+/// for a successful one.
+fn signal_exit_code(signal: &Sig) -> i32 {
+    let number = match signal {
+        Sig::HUP => 1,
+        Sig::INT => 2,
+        Sig::QUIT => 3,
+        Sig::ILL => 4,
+        Sig::ABRT => 6,
+        Sig::FPE => 8,
+        Sig::KILL => 9,
+        Sig::USR1 => 10,
+        Sig::SEGV => 11,
+        Sig::PIPE => 13,
+        Sig::ALRM => 14,
+        Sig::TERM => 15,
+        Sig::Custom(_) => return 128,
+    };
+    128 + number
 }
 
 async fn authenticate(
@@ -659,6 +725,16 @@ mod tests {
         assert!(!err.to_string().is_empty());
     }
 
+    #[test]
+    fn signal_exit_codes_follow_the_shell_convention() {
+        assert_eq!(signal_exit_code(&Sig::TERM), 143);
+        assert_eq!(signal_exit_code(&Sig::KILL), 137);
+        assert_eq!(signal_exit_code(&Sig::INT), 130);
+        assert_eq!(signal_exit_code(&Sig::PIPE), 141);
+        // A signal russh does not model by name still fails, never succeeds.
+        assert_eq!(signal_exit_code(&Sig::Custom("PWR".into())), 128);
+    }
+
     /// Live check. Skipped by default; run with
     /// `cargo test -p sshdeck-core -- --ignored` and
     /// `SSHDECK_TEST_HOST`, `SSHDECK_TEST_USER`, `SSHDECK_TEST_PASSWORD`
@@ -699,5 +775,49 @@ mod tests {
                 Err(err) => panic!("event channel closed: {err}"),
             }
         }
+    }
+
+    /// Live check of the exec path. Same env as the shell check above. Proves
+    /// the command is not echoed (no PTY) and that the remote status survives.
+    #[test]
+    #[ignore = "needs a live sshd"]
+    fn exec_runs_one_command_without_a_pty() {
+        let (Ok(address), Ok(username), Ok(password)) = (
+            std::env::var("SSHDECK_TEST_HOST"),
+            std::env::var("SSHDECK_TEST_USER"),
+            std::env::var("SSHDECK_TEST_PASSWORD"),
+        ) else {
+            return;
+        };
+
+        let mut target = Host::new("live", address);
+        target.username = username;
+        target.port = std::env::var("SSHDECK_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(22);
+        target.auth = AuthMethod::Password {
+            secret_ref: "test".into(),
+        };
+
+        let session = Session::exec(
+            SessionConfig::from_host(&target).with_password(password),
+            "printf sshdeck; exit 7",
+        )
+        .expect("spawns the connection thread");
+
+        let events = session.events();
+        let mut output = Vec::new();
+        let mut status = None;
+        while let Ok(event) = events.recv_blocking() {
+            match event {
+                SessionEvent::Data(bytes) => output.extend_from_slice(&bytes),
+                SessionEvent::Error(message) => panic!("{message}"),
+                SessionEvent::Closed(code) => status = code,
+                _ => {}
+            }
+        }
+        assert_eq!(output, b"sshdeck");
+        assert_eq!(status, Some(7));
     }
 }
