@@ -1175,13 +1175,6 @@ impl SshDeck {
             palette::CommandId::OpenSftp
             | palette::CommandId::ManageKeys
             | palette::CommandId::OpenSettings => {}
-            // A `CommandId` added by the palette compiles here instead of
-            // breaking this match; it says so rather than silently doing
-            // nothing, so an enabled-but-unwired command is visible.
-            other => window.push_notification(
-                Notification::warning(format!("{} is not wired up yet", other.as_str())),
-                cx,
-            ),
         }
         cx.notify();
     }

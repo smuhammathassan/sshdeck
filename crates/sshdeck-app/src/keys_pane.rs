@@ -1539,13 +1539,15 @@ fn load_identities() -> Vec<IdentityEntry> {
         }
     }
 
-    let store = HostStore::at_default_path();
-    for host in store.list() {
+    let mut store = HostStore::at_default_path();
+    let _ = store.load();
+    for host in store.inventory().hosts() {
         if !host.username.is_empty() && seen.insert(host.username.clone()) {
             let auth_str = match &host.auth {
-                sshdeck_core::AuthMethod::Password(_) => "Auth password",
-                sshdeck_core::AuthMethod::Key(_) => "Auth key",
+                sshdeck_core::AuthMethod::Password { .. } => "Auth password",
+                sshdeck_core::AuthMethod::Key { .. } => "Auth key",
                 sshdeck_core::AuthMethod::Agent => "Auth agent",
+                _ => "Auth password",
             };
             entries.push(IdentityEntry {
                 name: host.username.clone(),

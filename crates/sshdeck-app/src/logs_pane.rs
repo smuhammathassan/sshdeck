@@ -65,7 +65,6 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, rgb, AnyElement, App, AppContext as _, Context, Div, Entity, FocusHandle,
     Focusable as _, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
