@@ -54,15 +54,17 @@ All screenshots from `/Users/muhammadhassan/Desktop/termius-ui/`, 2560×1600 (�
 
 26. `Screenshot 2026-09-17 at 3.11.51 PM.png` — Vaults/Hosts (full-window) — Hosts grid / details variant. — **Verify detail against image.**
 
-27. `Screenshot 2026-09-17 at 3.13.24 PM.png` — Vaults/Hosts (full-window) — Hosts grid / details variant. — **Verify detail against image.**
+27. `Screenshot 2026-09-17 at 3.13.24 PM.png` — **Keychain** (full-window, verified by direct inspection) — rail `Keychain` active. Toolbar `+ New key` (split) · `Certificate` · `Touch ID` · `FIDO2`; right: search, grid/list, calendar. Two **three-column** card sections: **Keys** (`docker.pem`, `demo-aws.pem`, `Google-Cloud-VPS`, each `Type RSA`, dark-blue rounded-square key glyph) and **Identities** (`xrdpuser`, `RedgeVPS`, `rege-new`, `chatwoot`, `+-`, each `Auth password`).
 
-28. `Screenshot 2026-09-17 at 3.13.29 PM.png` — Vaults/Hosts (full-window) — Hosts grid / details variant. — **Verify detail against image.**
+28. `Screenshot 2026-09-17 at 3.13.29 PM.png` — **Port Forwarding** (full-window, identified by the port-forwarding agent) — `+ New forwarding` toolbar with caret; centred empty state: grey rounded glyph tile, `Set up port forwarding`, subtitle.
 
-29. `Screenshot 2026-09-17 at 3.13.33 PM.png` — Vaults/Hosts (full-window) — Hosts grid / details variant. — **Verify detail against image.**
+29. `Screenshot 2026-09-17 at 3.13.33 PM.png` — **Snippets** (full-window) — identified by the agent that read it; rail `Snippets` active.
 
-30. `Screenshot 2026-09-17 at 3.13.37 PM.png` — Vaults/Hosts (full-window) — Hosts grid / details variant. — **Verify detail against image.**
+30. `Screenshot 2026-09-17 at 3.13.37 PM.png` — **Known Hosts** (full-window) — identified by the agent that read it; rail `Known Hosts` active.
 
-31. `Screenshot 2026-09-17 at 3.13.42 PM.png` — Vaults/Hosts (full-window) — Hosts grid / details variant. — **Verify detail against image.**
+31. `Screenshot 2026-09-17 at 3.13.42 PM.png` — **Logs** (full-window) — identified by the agent that read it; rail `Logs` active.
+
+> **Correction.** #27–#31 were previously labelled "Vaults/Hosts … verify detail". That was wrong: they are the five left-rail panes, one screenshot each. #27 is verified by direct inspection, #28 by the agent implementing that pane, and #29–#31 by the agent that read them. Any "Vaults/Hosts" label on a late screenshot is superseded by this block. The remaining "Verify detail against image" markers are all on the early #16–#26 range.
 
 ## Coverage map
 
