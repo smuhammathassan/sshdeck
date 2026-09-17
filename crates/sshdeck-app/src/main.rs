@@ -67,22 +67,28 @@ fn main() {
 /// The window shape: frameless, with the native traffic lights still present.
 ///
 /// Termius is a 10px-rounded frameless window. `WindowOptions` has **no**
-/// corner-radius field, so that exact radius cannot be expressed and the native
-/// macOS window radius stands. `appears_transparent` is the part GPUI does
-/// express: it hides the system title bar and draws the content under it, while
-/// the window is still created with the closable / minimizable / resizable
-/// style masks (because `titlebar` is `Some`), so the traffic lights and the
-/// close button stay. There is no titlebar-height option either, so the lights
-/// keep their native position near the top; [`render_header`] reserves the left
-/// inset for them. `traffic_light_position: None` means "GPUI's default", not
-/// "hide them".
+/// corner-radius field, so that exact radius cannot be expressed by GPUI and
+/// the native macOS window radius stands. `appears_transparent` is the part
+/// GPUI does express: it hides the system title bar and draws the content under
+/// it, while the window is still created with the closable / minimizable /
+/// resizable style masks (because `titlebar` is `Some`), so the traffic lights
+/// and the close button stay — the window always has a way to close.
+///
+/// `traffic_light_position` is set explicitly so the lights sit level with the
+/// 51px tab row inside the 56px header (the [gpui-component `TitleBar`] uses
+/// `(9, 9)` for its 34px bar; `(9, 20)` centres a ~14px light group in 56px).
+/// The header marks itself as `WindowControlArea::Drag`, so the window can be
+/// dragged from the whole header even though the system title bar is hidden.
+///
+/// [gpui-component `TitleBar`]: https://docs.rs/gpui-component
 fn window_options() -> WindowOptions {
     WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: None,
             appears_transparent: true,
-            traffic_light_position: None,
+            traffic_light_position: Some(point(px(9.), px(20.))),
         }),
+        app_owns_titlebar_drag: false,
         ..WindowOptions::default()
     }
 }
@@ -371,20 +377,45 @@ struct Session {
     status: PaneStatus,
 }
 
+/// Which surface the main region shows: the fixed tabs are Vaults and SFTP,
+/// followed by one session tab per open terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainTab {
+    /// The host inventory (the sidebar surface, shown full-region).
+    Vaults,
+    /// The SFTP browser for the focused session.
+    Sftp,
+    /// The terminal for `sessions[index]`.
+    Session(usize),
+}
+
+/// The placeholder tab to show after the session at `closed` is removed.
+///
+/// Pure so the tab bookkeeping can be checked without a window.
+fn tab_after_close(tab: MainTab, closed: usize) -> MainTab {
+    match tab {
+        MainTab::Session(index) if index == closed => MainTab::Vaults,
+        MainTab::Session(index) if index > closed => MainTab::Session(index - 1),
+        other => other,
+    }
+}
+
 /// A full-region pane that shows over the session content while it is open.
 ///
 /// Each variant is created on demand and dropped when it closes, so a pane that
-/// holds a transport (SFTP) never outlives its own visibility.
+/// holds a transport never outlives its own visibility.
 enum Overlay {
     Settings(Entity<SettingsView>),
     Keys(Entity<KeysPane>),
-    Sftp(Entity<SftpPane>),
 }
 
 struct SshDeck {
     store: HostStore,
     selected: Option<HostId>,
-    /// The tab the terminal pane is showing.
+    /// Which main-region tab is showing.
+    tab: MainTab,
+    /// The focused session, if any: the SFTP tab and the Reconnect action follow
+    /// it even while another tab is showing.
     active: Option<usize>,
     sessions: Vec<Session>,
     filter: Entity<InputState>,
@@ -396,8 +427,11 @@ struct SshDeck {
     secret: Option<(HostId, Entity<InputState>)>,
     /// The command palette while it is open, if at all.
     palette: Option<Entity<PaletteView>>,
-    /// The settings, keys or SFTP pane showing over the session, if at all.
+    /// The settings or keys pane showing over the session, if at all.
     overlay: Option<Overlay>,
+    /// The SFTP pane, created when the SFTP tab is first selected so a transport
+    /// is not opened until then.
+    sftp_pane: Option<Entity<SftpPane>>,
     /// Whether the host sidebar is collapsed to its narrow rail.
     sidebar_collapsed: bool,
     /// Whether the add-host sheet is open. Host creation lives behind the
@@ -443,6 +477,7 @@ impl SshDeck {
         let view = Self {
             store,
             selected: None,
+            tab: MainTab::Vaults,
             active: None,
             sessions: Vec::new(),
             filter,
@@ -453,6 +488,7 @@ impl SshDeck {
             secret: None,
             palette: None,
             overlay: None,
+            sftp_pane: None,
             sidebar_collapsed: false,
             add_host_open: false,
             sftp_attached: None,
@@ -567,6 +603,8 @@ impl SshDeck {
         // connection to the same place.
         if let Some(index) = self.sessions.iter().position(|s| s.host == host.id) {
             self.active = Some(index);
+            self.tab = MainTab::Session(index);
+            self.overlay = None;
             let pane = self.sessions[index].pane.clone();
             pane.update(cx, |pane, cx| pane.focus(window, cx));
             cx.notify();
@@ -661,7 +699,10 @@ impl SshDeck {
             pane: pane.clone(),
             status,
         });
-        self.active = Some(self.sessions.len() - 1);
+        let index = self.sessions.len() - 1;
+        self.active = Some(index);
+        self.tab = MainTab::Session(index);
+        self.overlay = None;
         pane.update(cx, |pane, cx| pane.focus(window, cx));
         // The new tab is active now; the SFTP pane must follow it even before the
         // session reaches `Connected` (it detaches until then).
@@ -688,70 +729,100 @@ impl SshDeck {
             .count()
     }
 
-    /// Replaces the session area with `overlay` (or restores it with `None`).
+    /// Replaces the main region with `overlay` (or restores it with `None`).
     ///
-    /// A pane that is being replaced is dropped, closing any transport it held;
-    /// the SFTP bookkeeping is cleared and any in-flight connect is invalidated.
-    fn show_overlay(&mut self, overlay: Option<Overlay>, cx: &mut Context<Self>) {
-        self.sftp_attached = None;
-        self.sftp_generation = self.sftp_generation.wrapping_add(1);
+    /// A pane that is being replaced is dropped, closing any transport it held.
+    fn show_overlay(
+        &mut self,
+        overlay: Option<Overlay>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.overlay = overlay;
+        self.reconcile_sftp(window, cx);
         cx.notify();
     }
 
-    fn close_overlay(&mut self, cx: &mut Context<Self>) {
-        self.show_overlay(None, cx);
+    fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_overlay(None, window, cx);
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.overlay, Some(Overlay::Settings(_))) {
-            self.close_overlay(cx);
+            self.close_overlay(window, cx);
             return;
         }
         let view = cx.new(|cx| SettingsView::new(window, cx));
         view.update(cx, |view, cx| view.focus(window, cx));
-        self.show_overlay(Some(Overlay::Settings(view)), cx);
+        self.show_overlay(Some(Overlay::Settings(view)), window, cx);
     }
 
     fn open_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.overlay, Some(Overlay::Keys(_))) {
-            self.close_overlay(cx);
+            self.close_overlay(window, cx);
             return;
         }
         let view = cx.new(|cx| KeysPane::new(window, cx));
-        self.show_overlay(Some(Overlay::Keys(view)), cx);
+        self.show_overlay(Some(Overlay::Keys(view)), window, cx);
     }
 
-    fn open_sftp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.overlay, Some(Overlay::Sftp(_))) {
-            self.close_overlay(cx);
+    /// Switches the main region to `tab`, creating the SFTP pane on first use.
+    fn select_tab(&mut self, tab: MainTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.overlay = None;
+        self.tab = tab;
+        if matches!(tab, MainTab::Sftp) && self.sftp_pane.is_none() {
+            self.sftp_pane = Some(cx.new(|cx| SftpPane::new(window, cx)));
+        }
+        if let MainTab::Session(index) = tab {
+            self.active = Some(index);
+            if let Some(session) = self.sessions.get(index) {
+                let pane = session.pane.clone();
+                pane.update(cx, |pane, cx| pane.focus(window, cx));
+            }
+        }
+        self.reconcile_sftp(window, cx);
+        cx.notify();
+    }
+
+    /// Closes one session tab and repairs the focused-tab bookkeeping.
+    fn close_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.sessions.len() {
             return;
         }
-        let pane = cx.new(|cx| SftpPane::new(window, cx));
-        self.show_overlay(Some(Overlay::Sftp(pane)), cx);
-        // `show_overlay` cleared the bookkeeping, so this is a fresh attach.
+        self.sessions.remove(index);
+        self.tab = tab_after_close(self.tab, index);
+        self.active = match self.active {
+            Some(active) if active == index => None,
+            Some(active) if active > index => Some(active - 1),
+            other => other,
+        };
         self.reconcile_sftp(window, cx);
+        cx.notify();
     }
 
-    /// Attaches the SFTP pane to the active session's transport, or detaches it.
+    /// Attaches the SFTP pane to the focused session's transport, or detaches it.
     ///
     /// Called whenever the tab selection or a session's state changes. At most
-    /// one SFTP session is live: a client is opened only while a session is
-    /// authenticated, and dropped as soon as that session ends or another tab
-    /// becomes active (docs/BUDGET.md: no connection per tab).
+    /// one SFTP session is live: a client is opened only while the SFTP tab is
+    /// showing a session that is authenticated, and dropped as soon as that
+    /// session ends, another tab becomes active, or a settings/keys pane opens
+    /// (docs/BUDGET.md: no connection per tab).
     fn reconcile_sftp(&mut self, window: &Window, cx: &mut Context<Self>) {
-        // Only a visible SFTP pane can hold a client. When it is closed its
-        // entity, and the transport with it, is already gone.
-        let pane = match &self.overlay {
-            Some(Overlay::Sftp(pane)) => pane.clone(),
-            _ => return,
+        // The pane only exists once the SFTP tab has been opened.
+        let Some(pane) = self.sftp_pane.clone() else {
+            return;
         };
 
-        let target = self.active.filter(|&index| {
-            self.sessions
-                .get(index)
-                .is_some_and(|session| matches!(session.status.state, SessionState::Connected))
-        });
+        let visible = self.overlay.is_none() && matches!(self.tab, MainTab::Sftp);
+        let target = if visible {
+            self.active.filter(|&index| {
+                self.sessions
+                    .get(index)
+                    .is_some_and(|session| matches!(session.status.state, SessionState::Connected))
+            })
+        } else {
+            None
+        };
         if self.sftp_attached == target {
             return;
         }
@@ -920,12 +991,40 @@ impl SshDeck {
         let muted = cx.theme().muted_foreground;
         let active = self.connected_count();
         let collapsed = self.sidebar_collapsed;
+        // A tab being open means reconnect it; otherwise connect what is selected.
+        let connect_host = self
+            .active_session()
+            .and_then(|session| self.store.inventory().get(&session.host).cloned())
+            .or_else(|| {
+                self.selected
+                    .as_ref()
+                    .and_then(|id| self.store.inventory().get(id).cloned())
+            });
+        let connect_label = if self.active_session().is_some() {
+            "Reconnect"
+        } else {
+            "Connect"
+        };
 
         let actions = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_1()
+            .flex_shrink_0()
+            .child(
+                Button::new("connect")
+                    .small()
+                    .primary()
+                    .label(connect_label)
+                    .disabled(connect_host.is_none())
+                    .tooltip("Open a session to the selected host")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(host) = connect_host.clone() {
+                            this.connect(host, window, cx);
+                        }
+                    })),
+            )
             .child(
                 Button::new("palette")
                     .ghost()
@@ -942,15 +1041,6 @@ impl SshDeck {
                     .tooltip("SSH keys & known hosts")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_keys(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("sftp")
-                    .ghost()
-                    .icon(IconName::Folder)
-                    .tooltip("SFTP browser")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_sftp(window, cx);
                     })),
             )
             .child(
@@ -989,18 +1079,31 @@ impl SshDeck {
             // left of the content now that the title bar is transparent, so the
             // sidebar toggle starts clear of them. Termius keeps the lights
             // level with the tab row, which this 56px header contains.
-            .pl(px(80.))
+            .pl(if cfg!(target_os = "macos") {
+                px(80.)
+            } else {
+                px(12.)
+            })
             .pr_3()
+            // `--border-basic`: the chrome's translucent hairline, not the
+            // opaque surface border (`#32364a`). No theme token carries it.
             .border_b_1()
-            .border_color(cx.theme().border)
+            .border_color(rgba(0x8d91a540))
+            // The whole header drags the window; child hitboxes still win, so
+            // the tabs and buttons keep their clicks.
+            .window_control_area(WindowControlArea::Drag)
             .child(
                 Button::new("sidebar-toggle")
                     .ghost()
-                    .icon(IconName::Frame)
-                    .tooltip(if collapsed {
-                        "Show sidebar"
+                    .icon(if collapsed {
+                        IconName::PanelLeftOpen
                     } else {
-                        "Hide sidebar"
+                        IconName::PanelLeftClose
+                    })
+                    .tooltip(if collapsed {
+                        "Expand sidebar"
+                    } else {
+                        "Collapse sidebar"
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_collapsed = !this.sidebar_collapsed;
@@ -1009,23 +1112,18 @@ impl SshDeck {
             )
             .child(self.render_tabs(cx))
             .child(
-                Button::new("add-host")
-                    .ghost()
-                    .icon(IconName::Plus)
-                    .tooltip("Add host")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_add_host(window, cx);
-                    })),
+                div()
+                    .flex_shrink_0()
+                    .when(active > 0, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("{active} connected")),
+                        )
+                    })
+                    .child(div().text_xs().text_color(muted).child(self.status_line())),
             )
-            .child(div().text_xs().text_color(muted).child(self.status_line()))
-            .when(active > 0, |el| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(format!("{active} connected")),
-                )
-            })
             .child(actions)
     }
 
@@ -1047,17 +1145,89 @@ impl SshDeck {
         cx.notify();
     }
 
+    /// One host card: `--entity-item-background` at rest, `--list-hover` on
+    /// hover, `--list-select` when selected. The icon is tinted with the host's
+    /// OS brand colour when a group or tag names a known platform; otherwise it
+    /// keeps `--text-secondary` (`Host` has no OS field yet).
+    ///
+    /// `prefix` namespaces the element ids: the same host can be on screen in
+    /// both the sidebar and the Vaults tab, and ids must be unique.
+    fn render_host_row(&mut self, host: &Host, prefix: &str, cx: &mut Context<Self>) -> AnyElement {
+        let id = host.id.clone();
+        let is_selected = self.selected.as_ref() == Some(&id);
+        let is_open = self.sessions.iter().any(|s| s.host == id);
+        let remove_id = id.clone();
+        let connect_host = host.clone();
+        let muted = cx.theme().muted_foreground;
+        // `--entity-item-background`.
+        let card = cx.theme().muted;
+        // `--list-select` / `--list-hover`. The selected value maps to
+        // `list.active.background`; the hover token currently equals the card
+        // background, so the recovered hex is used directly (AGENTS.md errata).
+        let card_selected = cx.theme().list_active;
+        let card_hover = rgb(0x3e4257);
+        let tint = host_os_tint(host, muted);
+
+        div()
+            .id(SharedString::from(format!("{prefix}-host-{id}")))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.selected = Some(id.clone());
+                cx.notify();
+            }))
+            .on_double_click(cx.listener(move |this, _, window, cx| {
+                this.connect(connect_host.clone(), window, cx);
+            }))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_2()
+            .py_2()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(if is_selected { card_selected } else { card })
+            // `--list-hover`: the card highlight, via the hover style
+            // refinement (`StatefulInteractiveElement::hover`).
+            .hover(|style| style.bg(card_hover))
+            .child(Icon::new(IconName::Globe).small().text_color(tint))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(SharedString::from(host.label.clone()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(SharedString::from(host.endpoint())),
+                    ),
+            )
+            .when(is_open, |el| {
+                el.child(
+                    Icon::new(IconName::Check)
+                        .small()
+                        .text_color(cx.theme().success),
+                )
+            })
+            .child(
+                Button::new(SharedString::from(format!("{prefix}-remove-{remove_id}")))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip("Remove host")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.remove_host(&remove_id, window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
         let surface = cx.theme().sidebar;
         let muted = cx.theme().muted_foreground;
-        // Host cards: `--entity-item-background` default, `--list-hover` on
-        // hover, `--list-select` when selected. Only the default maps to a
-        // gpui-kit token (`muted.background`); the other two are the recovered
-        // hex values, since the theme exposes no token for them.
-        let card: Hsla = cx.theme().muted;
-        let card_selected: Hsla = rgb(0x32364a).into();
-        let card_hover: Hsla = rgb(0x3e4257).into();
 
         let query = self.filter.read(cx).value().to_string();
         let visible: Vec<Host> = self
@@ -1068,70 +1238,10 @@ impl SshDeck {
             .cloned()
             .collect();
         let total = self.store.inventory().len();
-
-        let rows = visible.into_iter().map(|host| {
-            let id = host.id.clone();
-            let is_selected = self.selected.as_ref() == Some(&id);
-            let is_open = self.sessions.iter().any(|s| s.host == id);
-            let remove_id = id.clone();
-            let connect_host = host.clone();
-            let tint = host_os_tint(&host, muted);
-
-            div()
-                .id(SharedString::from(format!("host-{}", id)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.selected = Some(id.clone());
-                    cx.notify();
-                }))
-                .on_double_click(cx.listener(move |this, _, window, cx| {
-                    this.connect(connect_host.clone(), window, cx);
-                }))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .w_full()
-                .px_2()
-                .py_2()
-                .rounded_sm()
-                .cursor_pointer()
-                .bg(if is_selected { card_selected } else { card })
-                // `--list-hover`: the card highlight, via the hover style
-                // refinement (`StatefulInteractiveElement::hover`).
-                .hover(|style| style.bg(card_hover))
-                .child(Icon::new(IconName::Globe).small().text_color(tint))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .overflow_hidden()
-                        .child(SharedString::from(host.label.clone()))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(SharedString::from(host.endpoint())),
-                        ),
-                )
-                .when(is_open, |el| {
-                    el.child(
-                        Icon::new(IconName::Check)
-                            .small()
-                            .text_color(cx.theme().success),
-                    )
-                })
-                .child(
-                    Button::new(SharedString::from(format!("remove-{}", remove_id)))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
-                        .tooltip("Remove host")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.remove_host(&remove_id, window, cx);
-                        })),
-                )
-        });
+        let mut rows = Vec::with_capacity(visible.len());
+        for host in &visible {
+            rows.push(self.render_host_row(host, "side", cx));
+        }
 
         div()
             .flex()
@@ -1145,7 +1255,8 @@ impl SshDeck {
             })
             .h_full()
             .border_r_1()
-            .border_color(border)
+            // `--border-light`, the chrome's translucent hairline.
+            .border_color(rgba(0x8d91a51a))
             .bg(surface)
             .child(
                 div()
@@ -1175,6 +1286,7 @@ impl SshDeck {
                     .flex_col()
                     .gap_1()
                     .flex_1()
+                    .min_h(px(0.))
                     .px_2()
                     .overflow_y_scrollbar()
                     .children(rows),
@@ -1256,58 +1368,66 @@ impl SshDeck {
         )
     }
 
-    /// The session tabs, drawn as 6px cards inside the 56px header.
+    /// One fixed header tab (Vaults or SFTP): 51px tall inside the 56px header,
+    /// 6px radius, transparent until selected.
+    fn render_fixed_tab(
+        &mut self,
+        label: &'static str,
+        icon: IconName,
+        target: MainTab,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_active = self.tab == target;
+        let muted = cx.theme().muted_foreground;
+        let selected_bg = cx.theme().muted;
+        let selected_fg = cx.theme().foreground;
+        // `--list-hover`. The theme's `list.hover.background` token currently
+        // equals the card background, so the recovered value is used directly
+        // (see AGENTS.md errata).
+        let hover_bg = rgb(0x3e4257);
+
+        div()
+            .id(SharedString::from(format!("tab-{label}")))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .h(px(51.))
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(if is_active { selected_fg } else { muted })
+            .when(is_active, |el| el.bg(selected_bg))
+            .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
+            .child(Icon::new(icon).small())
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_tab(target, window, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// The tab row: the two fixed tabs (Vaults, SFTP), then one tab per open
+    /// session, then the add control.
     ///
-    /// `--horizontal-tabs-height` is 51px; the selected tab uses the
-    /// `--surface-high` accent surface (`#282b3d`, the theme's `muted`
-    /// background) with primary text, while unselected tabs are transparent
-    /// with the secondary `#8d91a5` text. The tab carries the session state
-    /// that the removed status bar used to show.
+    /// `--horizontal-tabs-height` is 51px, centred in the 56px header. The
+    /// selected tab is one step lighter (`--surface-high`, the theme's `muted`
+    /// background, `#282b3d`) with primary text; unselected tabs are transparent
+    /// with the secondary `#8d91a5` text and stay 6px-rounded. A session tab
+    /// carries its state as a dot and folds in what the removed status bar
+    /// showed.
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let selected_bg = cx.theme().muted;
         let selected_fg = cx.theme().foreground;
+        let hover_bg = rgb(0x3e4257);
         let active = self.active;
 
-        let tabs = self.sessions.iter().enumerate().map(|(index, session)| {
-            let label = session.status.title.clone().unwrap_or_else(|| {
-                self.store
-                    .inventory()
-                    .get(&session.host)
-                    .map(|host| host.label.clone())
-                    .unwrap_or_else(|| session.host.to_string())
-            });
-            let state = session.status.state.label();
-            let is_active = active == Some(index);
+        let vaults =
+            self.render_fixed_tab("Vaults", IconName::LayoutDashboard, MainTab::Vaults, cx);
+        let sftp = self.render_fixed_tab("SFTP", IconName::FolderOpen, MainTab::Sftp, cx);
 
-            div()
-                .id(SharedString::from(format!("tab-{}", session.host)))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .h(px(36.))
-                .rounded_sm()
-                .cursor_pointer()
-                .text_color(if is_active { selected_fg } else { muted })
-                .when(is_active, |el| el.bg(selected_bg))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(SharedString::from(state)),
-                )
-                .child(SharedString::from(label))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.active = Some(index);
-                    // The SFTP pane follows the active tab.
-                    this.reconcile_sftp(window, cx);
-                    cx.notify();
-                }))
-        });
-
-        div()
+        let mut strip = div()
             .id("tab-strip")
             .flex()
             .flex_row()
@@ -1315,8 +1435,73 @@ impl SshDeck {
             .gap_1()
             .h(px(51.))
             .flex_1()
+            .min_w(px(0.))
             .overflow_x_scrollbar()
-            .children(tabs)
+            .child(vaults)
+            .child(sftp);
+
+        for (index, session) in self.sessions.iter().enumerate() {
+            let label = session.status.title.clone().unwrap_or_else(|| {
+                self.store
+                    .inventory()
+                    .get(&session.host)
+                    .map(|host| host.label.clone())
+                    .unwrap_or_else(|| session.host.to_string())
+            });
+            // A session tab is only selected while no pane overlay covers it.
+            let is_active = self.overlay.is_none() && active == Some(index);
+            let dot = match &session.status.state {
+                SessionState::Connected => cx.theme().success,
+                SessionState::Connecting | SessionState::Authenticating => cx.theme().warning,
+                SessionState::Failed { .. } => cx.theme().danger,
+                SessionState::Disconnected | SessionState::Closed { .. } => {
+                    cx.theme().muted_foreground
+                }
+            };
+            let id = session.host.clone();
+
+            strip = strip.child(
+                div()
+                    .id(SharedString::from(format!("tab-{id}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .h(px(51.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(if is_active { selected_fg } else { muted })
+                    .when(is_active, |el| el.bg(selected_bg))
+                    .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
+                    .child(div().size(px(6.)).rounded_full().bg(dot))
+                    .child(SharedString::from(label))
+                    .child(
+                        Button::new(SharedString::from(format!("close-tab-{id}")))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Close session")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_session(index, window, cx);
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_tab(MainTab::Session(index), window, cx);
+                    })),
+            );
+        }
+
+        strip.child(
+            Button::new("add-host-tab")
+                .ghost()
+                .icon(IconName::Plus)
+                .tooltip("Add host")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_add_host(window, cx);
+                })),
+        )
     }
 
     /// The password prompt, rendered while a secret is missing.
@@ -1377,13 +1562,83 @@ impl SshDeck {
 
     fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.overlay.is_some() {
-            self.render_overlay(cx)
-        } else {
-            self.render_session(cx)
+            return self.render_overlay(cx);
+        }
+        match self.tab {
+            MainTab::Vaults => self.render_vault(cx),
+            MainTab::Sftp => self.render_sftp(cx),
+            MainTab::Session(_) => self.render_session(cx),
         }
     }
 
-    /// The settings, keys or SFTP pane, with a header that closes it.
+    /// The Vaults tab: the stored hosts as cards in the main region.
+    fn render_vault(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let hosts: Vec<Host> = self.store.inventory().hosts().to_vec();
+        let mut rows = Vec::with_capacity(hosts.len());
+        for host in &hosts {
+            rows.push(self.render_host_row(host, "vault", cx));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .min_h(px(0.))
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px_4()
+                    .py_3()
+                    .text_color(muted)
+                    .child(format!("VAULTS ({})", hosts.len())),
+            )
+            .child(
+                div()
+                    .id("vault-list")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .px_4()
+                    .pb_4()
+                    .overflow_y_scrollbar()
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// The SFTP tab: the browser, attached to the focused session.
+    fn render_sftp(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        match self.sftp_pane.clone() {
+            Some(pane) => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .size_full()
+                .overflow_hidden()
+                .child(pane)
+                .into_any_element(),
+            None => {
+                let muted = cx.theme().muted_foreground;
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .size_full()
+                    .child(Icon::new(IconName::FolderOpen).large().text_color(muted))
+                    .child(div().text_color(muted).child("SFTP is not open"))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// The settings or keys pane, with a header that closes it.
     ///
     /// `render_main` calls this only while an overlay is present; the `None`
     /// arm exists so the match is total and the borrow of `self.overlay` ends
@@ -1395,7 +1650,6 @@ impl SshDeck {
             Some(Overlay::Keys(view)) => {
                 ("SSH keys & known hosts", view.clone().into_any_element())
             }
-            Some(Overlay::Sftp(view)) => ("SFTP", view.clone().into_any_element()),
             None => ("", div().into_any_element()),
         };
 
@@ -1422,7 +1676,9 @@ impl SshDeck {
                             .small()
                             .ghost()
                             .label("Close")
-                            .on_click(cx.listener(|this, _, _, cx| this.close_overlay(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
+                            ),
                     ),
             )
             .child(
@@ -1437,30 +1693,14 @@ impl SshDeck {
             .into_any_element()
     }
 
-    /// The tab strip, session header and live terminal.
+    /// The live terminal (or the empty state) for the focused session.
     fn render_session(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
 
         // Bring the focused pane's status onto the tab before rendering chrome.
         if let Some(session) = self.active.and_then(|index| self.sessions.get_mut(index)) {
             session.status = session.pane.read(cx).status();
         }
-
-        let connect_label = if self.active_session().is_some() {
-            "Reconnect"
-        } else {
-            "Connect"
-        };
-        // A tab being open means reconnect it; otherwise connect what is selected.
-        let connect_host = self
-            .active_session()
-            .and_then(|session| self.store.inventory().get(&session.host).cloned())
-            .or_else(|| {
-                self.selected
-                    .as_ref()
-                    .and_then(|id| self.store.inventory().get(id).cloned())
-            });
 
         let content = match self.active_session().map(|session| session.pane.clone()) {
             Some(pane) => div()
@@ -1508,20 +1748,6 @@ impl SshDeck {
             }
         };
 
-        let header = match self.active_session() {
-            Some(session) => {
-                let label = self
-                    .store
-                    .inventory()
-                    .get(&session.host)
-                    .map(|host| format!("{} · {}", host.label, host.endpoint()))
-                    .unwrap_or_else(|| session.host.to_string());
-                format!("{} · {}", label, session.status.state.label())
-            }
-            None => "no session".to_string(),
-        };
-
-        let tabs = self.render_tabs(cx);
         let secret = self.render_secret_prompt(cx);
 
         div()
@@ -1529,35 +1755,9 @@ impl SshDeck {
             .flex_col()
             .flex_1()
             .h_full()
+            .min_h(px(0.))
             .overflow_hidden()
-            .child(tabs)
             .when_some(secret, |el, prompt| el.child(prompt))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .flex_shrink_0()
-                    .h(px(38.))
-                    .px_3()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(SharedString::from(header))
-                    .child(
-                        Button::new("connect")
-                            .small()
-                            .primary()
-                            .label(connect_label)
-                            .disabled(connect_host.is_none())
-                            .tooltip("Open a session to the selected host")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(host) = connect_host.clone() {
-                                    this.connect(host, window, cx);
-                                }
-                            })),
-                    ),
-            )
             .child(content)
             .into_any_element()
     }
@@ -1590,7 +1790,6 @@ impl SshDeck {
 
 impl Render for SshDeck {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let background = cx.theme().background;
         let foreground = cx.theme().foreground;
 
         let header = self.render_header(cx);
@@ -1603,8 +1802,13 @@ impl Render for SshDeck {
             .flex()
             .flex_col()
             .size_full()
-            .bg(background)
+            // `--main-bg` is `#1d2033` (the theme's `sidebar` token); the
+            // window's `background` token is the darker `--surface-lowest`.
+            .bg(cx.theme().sidebar)
             .text_color(foreground)
+            // `--default-font-size` is 14px; the theme's `font.size` is 13, so
+            // the body size is set explicitly here.
+            .text_size(px(14.))
             // The palette's navigation actions are bound in its own context. The
             // context is only active while the palette is open, so these keys are
             // never stolen from the terminal or an input.
@@ -1714,6 +1918,15 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_session_repairs_the_selected_tab() {
+        assert_eq!(tab_after_close(MainTab::Session(2), 2), MainTab::Vaults);
+        assert_eq!(tab_after_close(MainTab::Session(3), 1), MainTab::Session(2));
+        assert_eq!(tab_after_close(MainTab::Session(1), 3), MainTab::Session(1));
+        assert_eq!(tab_after_close(MainTab::Sftp, 0), MainTab::Sftp);
+        assert_eq!(tab_after_close(MainTab::Vaults, 0), MainTab::Vaults);
+    }
+
+    #[test]
     fn os_brand_colours_are_known_or_absent() {
         assert_eq!(os_brand_color("ubuntu"), Some(rgb(0xe95420)));
         assert_eq!(os_brand_color(" Ubuntu "), Some(rgb(0xe95420)));
@@ -1724,16 +1937,11 @@ mod tests {
 
         let fallback: Hsla = rgb(0x8d91a5).into();
         let mut host = Host::new("box", "10.0.0.1");
-        assert_eq!(
-            Rgba::from(host_os_tint(&host, fallback)),
-            Rgba::from(fallback)
-        );
+        assert_eq!(host_os_tint(&host, fallback), fallback);
 
         host.tags.push("debian".into());
-        // Same Rgba→Hsla→Rgba path as the tint, so the round-trip is identical.
-        assert_eq!(
-            Rgba::from(host_os_tint(&host, fallback)),
-            Rgba::from(os_brand_color("debian").unwrap_or_default())
-        );
+        // Compare in `Hsla` space: an `Hsla -> Rgba -> Hsla` round trip loses a
+        // least-significant bit (0xce0056 renders as 0xce0055 on the way back).
+        assert_eq!(host_os_tint(&host, fallback), Hsla::from(rgb(0xce0056)));
     }
 }
