@@ -222,6 +222,49 @@ fn autoconnect_targets(value: &str) -> Vec<&str> {
         .collect()
 }
 
+/// A surface `SSHDECK_START_PANE` can open at startup: a left-rail pane, or the
+/// SFTP tab.
+///
+/// Development and test affordance only — it names an existing destination, so
+/// it can select a pane and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartPane {
+    Nav(LeftNav),
+    Sftp,
+}
+
+/// The pane names `SSHDECK_START_PANE` accepts, in the order they are listed to
+/// a user when one is not recognised.
+const START_PANE_VALUES: &str =
+    "hosts, keychain, forward/port-forwarding, snippets, known-hosts, logs, sftp";
+
+/// Parses an `SSHDECK_START_PANE` value.
+///
+/// Case-insensitive, and `-`/`_`/spaces are tolerated so `port-forwarding`,
+/// `port_forwarding` and `Port Forwarding` all mean the same pane. `None` means
+/// the value is not a known pane; the caller warns and keeps the default rather
+/// than refusing to start.
+fn parse_start_pane(value: &str) -> Option<StartPane> {
+    let normalized = value
+        .trim()
+        .to_lowercase()
+        .replace('-', "")
+        .replace('_', "")
+        .replace(' ', "");
+    match normalized.as_str() {
+        "hosts" => Some(StartPane::Nav(LeftNav::Hosts)),
+        "keychain" => Some(StartPane::Nav(LeftNav::Keychain)),
+        "forward" | "forwarding" | "portforward" | "portforwarding" => {
+            Some(StartPane::Nav(LeftNav::PortForwarding))
+        }
+        "snippets" => Some(StartPane::Nav(LeftNav::Snippets)),
+        "knownhosts" => Some(StartPane::Nav(LeftNav::KnownHosts)),
+        "logs" => Some(StartPane::Nav(LeftNav::Logs)),
+        "sftp" => Some(StartPane::Sftp),
+        _ => None,
+    }
+}
+
 /// Parses the optional port field of the add-host form.
 ///
 /// An empty field means the SSH default (22). A non-numeric or out-of-range
@@ -528,6 +571,27 @@ impl SshDeck {
                 }
             });
         }
+
+        // Development and test affordance, not a user feature: with
+        // `SSHDECK_START_PANE` set to a pane name, open that pane as soon as the
+        // view exists, exactly as its rail button or tab does, so each pane can
+        // be inspected without a click. It selects a pane and nothing else. An
+        // unknown name warns and leaves the default (Hosts) showing; startup
+        // never fails.
+        if let Ok(value) = std::env::var("SSHDECK_START_PANE") {
+            cx.defer_in(window, move |this, window, cx| {
+                match parse_start_pane(&value) {
+                    Some(StartPane::Nav(nav)) => this.select_left_nav(nav, cx),
+                    Some(StartPane::Sftp) => this.select_tab(MainTab::Sftp, window, cx),
+                    None => window.push_notification(
+                        Notification::warning(format!(
+                        "SSHDECK_START_PANE: unknown pane \"{value}\"; expected {START_PANE_VALUES}"
+                    )),
+                        cx,
+                    ),
+                }
+            });
+        }
         view
     }
 
@@ -785,6 +849,14 @@ impl SshDeck {
         self.show_overlay(Some(Overlay::Keys(view)), window, cx);
     }
 
+    /// Selects a left-rail pane. The single path both the rail buttons and
+    /// `SSHDECK_START_PANE` go through, so the startup affordance cannot drift
+    /// from a real click.
+    fn select_left_nav(&mut self, nav: LeftNav, cx: &mut Context<Self>) {
+        self.left_nav = nav;
+        cx.notify();
+    }
+
     /// Switches the main region to `tab`, creating the SFTP pane on first use.
     fn select_tab(&mut self, tab: MainTab, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay = None;
@@ -960,6 +1032,13 @@ impl SshDeck {
             palette::CommandId::OpenSftp
             | palette::CommandId::ManageKeys
             | palette::CommandId::OpenSettings => {}
+            // A `CommandId` added by the palette compiles here instead of
+            // breaking this match; it says so rather than silently doing
+            // nothing, so an enabled-but-unwired command is visible.
+            other => window.push_notification(
+                Notification::warning(format!("{} is not wired up yet", other.as_str())),
+                cx,
+            ),
         }
         cx.notify();
     }
@@ -1253,8 +1332,7 @@ impl SshDeck {
                     hosts_active,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.left_nav = LeftNav::Hosts;
-                    cx.notify();
+                    this.select_left_nav(LeftNav::Hosts, cx);
                 })),
             )
             .child(
@@ -1265,8 +1343,7 @@ impl SshDeck {
                     keychain_active,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.left_nav = LeftNav::Keychain;
-                    cx.notify();
+                    this.select_left_nav(LeftNav::Keychain, cx);
                 })),
             )
             .child(
@@ -1277,8 +1354,7 @@ impl SshDeck {
                     pf_active,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.left_nav = LeftNav::PortForwarding;
-                    cx.notify();
+                    this.select_left_nav(LeftNav::PortForwarding, cx);
                 })),
             )
             .child(
@@ -1289,8 +1365,7 @@ impl SshDeck {
                     snippets_active,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.left_nav = LeftNav::Snippets;
-                    cx.notify();
+                    this.select_left_nav(LeftNav::Snippets, cx);
                 })),
             )
             .child(
@@ -1301,15 +1376,13 @@ impl SshDeck {
                     known_active,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.left_nav = LeftNav::KnownHosts;
-                    cx.notify();
+                    this.select_left_nav(LeftNav::KnownHosts, cx);
                 })),
             )
             .child(
                 nav_item("Logs", IconName::Inbox, LeftNav::Logs, logs_active).on_click(
                     cx.listener(|this, _, _, cx| {
-                        this.left_nav = LeftNav::Logs;
-                        cx.notify();
+                        this.select_left_nav(LeftNav::Logs, cx);
                     }),
                 ),
             )
@@ -2513,6 +2586,52 @@ mod tests {
         );
         assert!(autoconnect_targets("").is_empty());
         assert!(autoconnect_targets(" , ").is_empty());
+    }
+
+    #[test]
+    fn start_pane_accepts_every_spelling_and_rejects_unknowns() {
+        for spelling in ["hosts", "HOSTS", " hosts ", "Hosts"] {
+            assert_eq!(
+                parse_start_pane(spelling),
+                Some(StartPane::Nav(LeftNav::Hosts))
+            );
+        }
+        assert_eq!(
+            parse_start_pane("Keychain"),
+            Some(StartPane::Nav(LeftNav::Keychain))
+        );
+        for spelling in [
+            "forward",
+            "Forward",
+            "port-forwarding",
+            "port_forwarding",
+            "Port Forwarding",
+        ] {
+            assert_eq!(
+                parse_start_pane(spelling),
+                Some(StartPane::Nav(LeftNav::PortForwarding))
+            );
+        }
+        assert_eq!(
+            parse_start_pane("snippets"),
+            Some(StartPane::Nav(LeftNav::Snippets))
+        );
+        for spelling in ["known-hosts", "known_hosts", "Known Hosts", "KNOWN-HOSTS"] {
+            assert_eq!(
+                parse_start_pane(spelling),
+                Some(StartPane::Nav(LeftNav::KnownHosts))
+            );
+        }
+        assert_eq!(
+            parse_start_pane("logs"),
+            Some(StartPane::Nav(LeftNav::Logs))
+        );
+        assert_eq!(parse_start_pane("sftp"), Some(StartPane::Sftp));
+
+        // Unknown and empty values fall back to the default instead of panicking.
+        assert_eq!(parse_start_pane("keycahin"), None);
+        assert_eq!(parse_start_pane(""), None);
+        assert_eq!(parse_start_pane("   "), None);
     }
 
     #[test]
