@@ -764,13 +764,28 @@ impl SftpPane {
 
         let mut crumbs: Vec<AnyElement> = Vec::new();
         let mut path_accum = PathBuf::from("/");
-        for comp in self.local_cwd.components() {
+        let valid_comps: Vec<_> = self
+            .local_cwd
+            .components()
+            .filter(|comp| {
+                let name = comp.as_os_str().to_string_lossy();
+                !name.is_empty() && name != "/"
+            })
+            .collect();
+
+        for (idx, comp) in valid_comps.into_iter().enumerate() {
             let name = comp.as_os_str().to_string_lossy().to_string();
-            if name.is_empty() || name == "/" {
-                continue;
-            }
             path_accum.push(&name);
             let target_path = path_accum.clone();
+
+            if idx > 0 {
+                crumbs.push(
+                    Icon::new(IconName::ChevronRight)
+                        .xsmall()
+                        .text_color(muted)
+                        .into_any_element(),
+                );
+            }
 
             crumbs.push(
                 div()
@@ -798,7 +813,6 @@ impl SftpPane {
                             this.navigate_local(target_path.clone(), cx);
                         })),
                     )
-                    .child(Icon::new(IconName::ChevronRight).xsmall().text_color(muted))
                     .into_any_element(),
             );
         }
