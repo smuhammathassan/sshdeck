@@ -28,7 +28,7 @@ use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
     actions, div, point, px, rgb, rgba, AnyElement, App, AppContext as _, ClipboardItem, Context,
     Entity, Focusable as _, Hsla, InteractiveElement as _, IntoElement, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render, Rgba,
+    MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point, Render, Rgba,
     SharedString, Styled as _, Subscription, TitlebarOptions, Window, WindowControlArea, WindowOptions,
 };
 use keys_pane::KeysPane;
@@ -3698,7 +3698,7 @@ impl SshDeck {
                     Icon::default()
                         .data(glyph::SPLIT_HORIZONTAL)
                         .size(px(14.))
-                        .text_color(if is_ws_active { rgb(0x10b981) } else { muted }),
+                        .text_color(if is_ws_active { Hsla::from(rgb(0x10b981)) } else { muted }),
                 )
                 .child(
                     div()
