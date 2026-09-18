@@ -272,7 +272,7 @@ pub fn parse_quick_connect(raw: &str) -> Option<Host> {
     }
 
     let mut username = String::new();
-    let mut address;
+    let address;
     let mut port = 22u16;
 
     if let Some(rest) = raw.strip_prefix("ssh ") {

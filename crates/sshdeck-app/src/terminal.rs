@@ -1008,6 +1008,7 @@ impl TerminalPane {
     }
 
     /// Current terminal font size in pixels.
+    #[allow(dead_code)]
     pub fn font_size(&self) -> f32 {
         self.options.font_size()
     }
