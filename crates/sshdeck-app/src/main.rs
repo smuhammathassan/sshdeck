@@ -3972,21 +3972,21 @@ impl SshDeck {
         let filter_val = self.filter.read(cx).value().trim().to_string();
         let quick_connect_host = parse_quick_connect(&filter_val);
 
-        // Top search row: the Connect pill lives inside the search field's
+        // Top search row: the Connect pill lives inside the search container's
         // right edge. When a quick-connect string is typed, it illuminates
         // as an active primary blue "Quick Connect" button. Otherwise it is
         // grey and disabled-looking until a saved host is selected.
         let mut connect_pill = div()
             .id("vault-connect")
-            .absolute()
-            .right(px(6.))
-            .top(px(2.))
             .h(px(28.))
             .px_3()
-            .rounded(px(7.))
+            .rounded(px(6.))
             .flex()
             .items_center()
-            .text_size(px(13.));
+            .justify_center()
+            .flex_shrink_0()
+            .text_size(px(13.))
+            .font_weight(gpui_kit::FontWeight::MEDIUM);
 
         if let Some(quick_host) = quick_connect_host {
             connect_pill = connect_pill
@@ -4002,7 +4002,7 @@ impl SshDeck {
             let connect_target = selected_id.clone();
             connect_pill = connect_pill
                 .bg(rgb(0xdfe5e7))
-                .text_color(rgb(0x9aa5ab))
+                .text_color(rgb(0x475569))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(0xd5dde0)))
                 .child("Connect")
@@ -4016,17 +4016,45 @@ impl SshDeck {
                 }));
         } else {
             connect_pill = connect_pill
-                .bg(rgb(0xdfe5e7))
+                .bg(rgb(0xe8edf0))
                 .text_color(rgb(0x9aa5ab))
                 .child("Connect");
         }
-        let search_row = div().flex().flex_row().items_center().w_full().p_2().child(
-            div()
-                .relative()
-                .flex_1()
-                .child(Input::new(&self.filter).small())
-                .child(connect_pill),
-        );
+
+        let search_bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .h(px(38.))
+            .pl_3()
+            .pr(px(5.))
+            .rounded(px(8.))
+            .bg(rgb(0xffffff))
+            .border_1()
+            .border_color(rgb(0xd5dde0))
+            .shadow_xs()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(
+                        Input::new(&self.filter)
+                            .small()
+                            .bordered(false),
+                    ),
+            )
+            .child(connect_pill);
+
+        let search_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .px_2()
+            .pt_2()
+            .pb_1()
+            .child(search_bar);
 
         // Toolbar row: + New host (merged split), Terminal; right view toggles + MH avatar.
         // Termius tokens: split-button bg #e6ebed, hairline border #d5dde0,
