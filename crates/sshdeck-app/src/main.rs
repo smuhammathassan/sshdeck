@@ -3983,7 +3983,11 @@ impl SshDeck {
                         Icon::default()
                             .data(glyph::TERMINAL_PROMPT)
                             .size(px(11.))
-                            .text_color(if is_active { selected_fg } else { glyph_color }),
+                            .text_color(if is_active {
+                                selected_fg
+                            } else {
+                                glyph_color.into()
+                            }),
                     )
             };
 
