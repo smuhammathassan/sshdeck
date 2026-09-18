@@ -7846,6 +7846,7 @@ impl SshDeck {
 
         let header_left = if let Some((sess_idx, label, username, tint)) = single_session_info {
             div()
+                .id(SharedString::from(format!("pane-hdr-{pane_index}")))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -8653,7 +8654,7 @@ impl Render for SshDeck {
                     }
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
                 this.tab_drag_start = None;
             }))
             .child(header)
