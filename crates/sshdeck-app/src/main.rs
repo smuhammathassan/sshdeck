@@ -1829,10 +1829,12 @@ impl SshDeck {
             });
         }
 
+        let initial_selected = store.inventory().hosts().first().map(|h| h.id.clone());
+
         let view = Self {
             store,
             vault,
-            selected: None,
+            selected: initial_selected.clone(),
             tab: MainTab::Vaults,
             left_nav: LeftNav::Hosts,
             active: None,
@@ -1892,6 +1894,16 @@ impl SshDeck {
             hist_what,
             _subscriptions: subscriptions,
         };
+
+        if initial_selected.is_some() {
+            cx.defer_in(window, move |this, window, cx| {
+                if this.selected.is_some() {
+                    this.details_open = true;
+                    this.sync_details_inputs(window, cx);
+                    cx.notify();
+                }
+            });
+        }
 
         // Development and test affordance, not a user feature: with
         // `SSHDECK_AUTOCONNECT` set to a comma-separated list of host ids or
@@ -3814,53 +3826,40 @@ impl SshDeck {
                 this.select_tab(MainTab::Sftp, window, cx);
             }));
 
-        // 3. [ ⚏ Workspace ] tab button with 2x2 grid icon (always present!)
+        // 3. [ ⚏ Workspace ] tab button (only when workspace is active or has panes)
         let is_ws_active = self.tab == MainTab::Workspace && self.overlay.is_none();
         let ws_panes = workspace_panes_count(&self.workspace);
+        let show_ws_tab = ws_panes > 0 || is_ws_active;
         let ws_title = if ws_panes > 1 {
             format!("Workspace ({ws_panes})")
         } else {
             "Workspace".to_string()
         };
-        let ws_btn =
-            div()
-                .id("tab-workspace")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1p5()
-                .h(px(28.))
-                .px_2p5()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .flex_shrink_0()
-                .text_color(if is_ws_active {
-                    rgb(0x10b981)
-                } else {
-                    unselected_fg
-                })
-                .when(is_ws_active, |el| {
-                    el.bg(selected_bg).border_1().border_color(rgba(0x10b98160))
-                })
-                .when(!is_ws_active, |el| el.hover(move |s| s.bg(hover_bg)))
-                .child(Icon::default().data(glyph::GRID).size(px(13.)).text_color(
-                    if is_ws_active {
+        let ws_btn = if show_ws_tab {
+            Some(
+                div()
+                    .id("tab-workspace")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .h(px(28.))
+                    .px_2p5()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .flex_shrink_0()
+                    .text_color(if is_ws_active {
                         rgb(0x10b981)
                     } else {
                         unselected_fg
-                    },
-                ))
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .child(ws_title),
-                )
-                .when(is_ws_active, |el| {
-                    el.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)))
-                })
-                .when(is_ws_active, |el| {
-                    el.child(
+                    })
+                    .when(is_ws_active, |el| {
+                        el.bg(rgb(0x0e3a2f))
+                            .border_1()
+                            .border_color(rgba(0x10b98160))
+                    })
+                    .when(!is_ws_active, |el| el.hover(move |s| s.bg(hover_bg)))
+                    .child(
                         Button::new("close-workspace-tab")
                             .ghost()
                             .xsmall()
@@ -3874,16 +3873,20 @@ impl SshDeck {
                                 this.select_tab(fallback, window, cx);
                             })),
                     )
-                })
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if workspace_panes_count(&this.workspace) <= 1 && this.sessions.len() >= 2 {
-                        let active = this.active.unwrap_or(0);
-                        let other = if active == 0 { 1 } else { 0 };
-                        this.tile_sessions_side_by_side(other, window, cx);
-                    } else {
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .child(ws_title),
+                    )
+                    .child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)))
+                    .on_click(cx.listener(|this, _, window, cx| {
                         this.select_tab(MainTab::Workspace, window, cx);
-                    }
-                }));
+                    })),
+            )
+        } else {
+            None
+        };
 
         let mut strip = div()
             .id("tab-strip")
@@ -3896,7 +3899,7 @@ impl SshDeck {
             .overflow_x_scrollbar()
             .child(vaults_btn)
             .child(sftp_btn)
-            .child(ws_btn);
+            .when_some(ws_btn, |el, btn| el.child(btn));
 
         // 4. Session tabs
         let has_multi = self.sessions.len() > 1;
@@ -4088,61 +4091,47 @@ impl SshDeck {
             })));
         }
 
-        // 5. [ + New Tab ] tab (with + icon badge and text New Tab, matching Termius)
-        let is_new_tab_active = self.tab == MainTab::NewTab && self.overlay.is_none();
-        let new_tab_item = div()
-            .id("tab-new-tab")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1p5()
-            .h(px(28.))
-            .px_2p5()
-            .rounded(px(6.))
-            .cursor_pointer()
-            .flex_shrink_0()
-            .text_color(if is_new_tab_active {
-                selected_fg
-            } else {
-                unselected_fg
-            })
-            .when(is_new_tab_active, |el| {
-                el.bg(selected_bg).border_1().border_color(selected_border)
-            })
-            .when(!is_new_tab_active, |el| el.hover(move |s| s.bg(hover_bg)))
-            .child(
-                div()
-                    .size(px(15.))
-                    .rounded(px(3.))
-                    .bg(if is_new_tab_active {
-                        rgba(0xffffff28)
-                    } else {
-                        rgba(0xffffff18)
-                    })
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(Icon::new(IconName::Plus).size(px(10.)).text_color(
-                        if is_new_tab_active {
-                            selected_fg
-                        } else {
-                            unselected_fg
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .min_w(px(0.))
-                    .truncate()
-                    .child("New Tab"),
-            )
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.select_tab(MainTab::NewTab, window, cx);
-            }));
+        // 5. [ ✕ New Tab ] tab (only shown when on New Tab screen, matching Termius Screenshot 12)
+        if self.tab == MainTab::NewTab && self.overlay.is_none() {
+            let new_tab_item = div()
+                .id("tab-new-tab")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .h(px(28.))
+                .px_2p5()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .flex_shrink_0()
+                .bg(selected_bg)
+                .border_1()
+                .border_color(selected_border)
+                .text_color(selected_fg)
+                .child(
+                    Button::new("close-new-tab")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip("Close tab")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            let fallback =
+                                this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
+                            this.select_tab(fallback, window, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .min_w(px(0.))
+                        .truncate()
+                        .child("New Tab"),
+                );
 
-        strip = strip.child(new_tab_item);
+            strip = strip.child(new_tab_item);
+        }
 
         // 6. Quick add tab `+` button right next to `New Tab`
         let add_btn = Button::new("add-tab-btn")
@@ -4445,9 +4434,9 @@ impl SshDeck {
         // grey and disabled-looking until a saved host is selected.
         let mut connect_pill = div()
             .id("vault-connect")
-            .h(px(28.))
-            .px_3()
-            .rounded(px(6.))
+            .h(px(32.))
+            .px_4()
+            .rounded(px(8.))
             .flex()
             .items_center()
             .justify_center()
@@ -4468,10 +4457,10 @@ impl SshDeck {
         } else if has_selection {
             let connect_target = selected_id.clone();
             connect_pill = connect_pill
-                .bg(rgb(0xdfe5e7))
-                .text_color(rgb(0x475569))
+                .bg(rgb(0x2091f6))
+                .text_color(rgb(0xffffff))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(0xd5dde0)))
+                .hover(|s| s.bg(rgb(0x1976d2)))
                 .child("Connect")
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if let Some(host) = connect_target
@@ -4483,8 +4472,8 @@ impl SshDeck {
                 }));
         } else {
             connect_pill = connect_pill
-                .bg(rgb(0xe8edf0))
-                .text_color(rgb(0x9aa5ab))
+                .bg(rgb(0xeef2f4))
+                .text_color(rgb(0x8d9ba3))
                 .child("Connect");
         }
 
@@ -4493,13 +4482,13 @@ impl SshDeck {
             .flex_row()
             .items_center()
             .w_full()
-            .h(px(38.))
-            .pl_3()
+            .h(px(42.))
+            .pl_4()
             .pr(px(5.))
-            .rounded(px(8.))
+            .rounded(px(10.))
             .bg(rgb(0xffffff))
             .border_1()
-            .border_color(rgb(0xd5dde0))
+            .border_color(rgb(0xe2e8f0))
             .shadow_xs()
             .child(
                 div()
@@ -4514,13 +4503,13 @@ impl SshDeck {
             .flex_row()
             .items_center()
             .w_full()
-            .px_2()
-            .pt_2()
-            .pb_1()
+            .px_6()
+            .pt_4()
+            .pb_2()
             .child(search_bar);
 
         // Toolbar row: + New host (merged split), Terminal; right view toggles + MH avatar.
-        // Termius tokens: split-button bg #e6ebed, hairline border #d5dde0,
+        // Termius tokens: split-button bg #ffffff, hairline border #d5dde0,
         // accent #2091f6, avatar orange #e67e22.
         let toolbar = div()
             .flex()
@@ -4528,7 +4517,7 @@ impl SshDeck {
             .items_center()
             .gap_2()
             .w_full()
-            .px_2()
+            .px_6()
             .py_1()
             .child(
                 div()
@@ -4536,22 +4525,24 @@ impl SshDeck {
                     .flex_row()
                     .items_center()
                     .gap_0()
+                    .h(px(32.))
                     .rounded(px(8.))
                     .border_1()
                     .border_color(rgb(0xd5dde0))
-                    .bg(rgb(0xe6ebed))
+                    .bg(rgb(0xffffff))
                     .child(
                         div()
                             .id("vault-new-host")
                             .flex()
                             .flex_row()
                             .items_center()
-                            .px_2()
-                            .py_1()
-                            .text_sm()
-                            .text_color(cx.theme().foreground)
+                            .px_2p5()
+                            .h_full()
+                            .text_size(px(13.))
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .text_color(rgb(0x1d2033))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0xd5dde0)))
+                            .hover(|s| s.bg(rgb(0xf1f5f9)))
                             .child("+ New host")
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.open_add_host(window, cx)),
@@ -4563,14 +4554,14 @@ impl SshDeck {
                             .id("vault-new-host-caret")
                             .flex()
                             .items_center()
-                            .px_1p5()
-                            .py_1()
+                            .px_2()
+                            .h_full()
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0xd5dde0)))
+                            .hover(|s| s.bg(rgb(0xf1f5f9)))
                             .child(
                                 Icon::new(IconName::ChevronDown)
-                                    .size(px(18.))
-                                    .text_color(cx.theme().muted_foreground),
+                                    .size(px(14.))
+                                    .text_color(muted),
                             )
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.open_add_host(window, cx)),
@@ -4578,12 +4569,43 @@ impl SshDeck {
                     ),
             )
             .child(
-                Button::new("vault-terminal")
-                    .small()
-                    .ghost()
-                    .icon(Icon::default().data(glyph::TERMINAL_PROMPT).size(px(18.)))
-                    .label("Terminal")
-                    .tooltip("Open Local Terminal")
+                div()
+                    .id("vault-terminal")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(32.))
+                    .px_2p5()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(0xd5dde0))
+                    .bg(rgb(0xffffff))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0xf1f5f9)))
+                    .child(
+                        div()
+                            .size(px(18.))
+                            .rounded(px(4.))
+                            .bg(rgb(0x1d2033))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .child(">_"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .text_color(rgb(0x1d2033))
+                            .child("Terminal"),
+                    )
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_local_terminal(window, cx);
                     })),
@@ -4732,7 +4754,13 @@ impl SshDeck {
                 row_cards.push(self.render_host_card(host, window, cx));
             }
             for _ in chunk.len()..chunk_size {
-                row_cards.push(div().flex_1().min_w(px(0.)).into_any_element());
+                row_cards.push(
+                    div()
+                        .flex_1()
+                        .max_w(px(380.))
+                        .min_w(px(0.))
+                        .into_any_element(),
+                );
             }
             rows.push(
                 div()
@@ -4755,13 +4783,13 @@ impl SshDeck {
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scrollbar()
-            .px_3()
-            .py_2()
+            .px_6()
+            .py_3()
             .child(
                 div()
-                    .text_size(px(15.))
-                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().foreground)
+                    .text_size(px(16.))
+                    .font_weight(gpui_kit::FontWeight::BOLD)
+                    .text_color(rgb(0x1d2033))
                     .child("Hosts"),
             )
             .children(rows);
@@ -4785,23 +4813,6 @@ impl SshDeck {
         let details_open = self.details_open;
         let details = if details_open {
             Some(self.render_host_details_panel(details_w, window, cx))
-        } else {
-            None
-        };
-
-        let reopen_button = if !details_open {
-            Some(
-                div().flex().flex_col().justify_start().p_2().child(
-                    Button::new("reopen-details")
-                        .ghost()
-                        .icon(Icon::default().data(glyph::COLLAPSE_DRAWER).size(px(16.)))
-                        .tooltip("Show host details")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.details_open = true;
-                            cx.notify();
-                        })),
-                ),
-            )
         } else {
             None
         };
@@ -4896,7 +4907,6 @@ impl SshDeck {
                     el.child(panel)
                 }
             })
-            .when_some(reopen_button, |el, btn| el.child(btn))
             .when_some(vault_info_modal, |el, modal| el.child(modal))
             .into_any_element()
     }
@@ -4911,11 +4921,11 @@ impl SshDeck {
         let connect_host = host.clone();
         let select_id = host.id.clone();
         let id = host.id.clone();
-        let muted = cx.theme().muted_foreground;
-        let fg = cx.theme().foreground;
-        let card_bg = cx.theme().popover;
-        let border_selected = cx.theme().primary;
-        let border_default = cx.theme().border;
+        let muted = rgb(0x8d9ba3);
+        let fg = rgb(0x1d2033);
+        let card_bg = rgb(0xffffff);
+        let border_selected = rgb(0x2091f6);
+        let border_default = rgb(0xe2e8f0);
         let orange = rgb(0xe95420);
         let is_list = self.view_mode == ViewMode::List;
         let win_w = f32::from(window.bounds().size.width);
@@ -4932,10 +4942,11 @@ impl SshDeck {
             .items_center()
             .gap_3()
             .flex_1()
+            .max_w(px(380.))
             .min_w(px(0.))
             .overflow_hidden()
             .h(px(card_h))
-            .px_3()
+            .px_3p5()
             .rounded(px(12.))
             .bg(card_bg)
             .border_1()
@@ -4958,7 +4969,7 @@ impl SshDeck {
             }))
             .child(
                 div()
-                    .size(if is_list { px(32.) } else { px(42.) })
+                    .size(if is_list { px(32.) } else { px(40.) })
                     .rounded(px(10.))
                     .bg(tint)
                     .flex()
@@ -4967,7 +4978,7 @@ impl SshDeck {
                     .child(
                         Icon::default()
                             .data(glyph::UBUNTU_SOLID)
-                            .size(if is_list { px(18.) } else { px(24.) })
+                            .size(if is_list { px(18.) } else { px(22.) })
                             .text_color(rgb(0xffffff)),
                     ),
             )
@@ -4980,25 +4991,20 @@ impl SshDeck {
                     .overflow_hidden()
                     .child(
                         div()
-                            .text_size(px(15.))
-                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .text_size(px(14.))
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                             .text_color(fg)
                             .truncate()
                             .child(SharedString::from(host.label.clone())),
                     )
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(12.))
                             .text_color(muted)
                             .truncate()
                             .child(SharedString::from(tags_str)),
                     ),
             )
-            // ponytail: the pencil affordance is hidden, not hover-revealed —
-            // GPUI has no group-hover, so per-card hover tracking would need a
-            // hovered-card state field plus mouse listeners on every card.
-            // Ceiling: add that state and render the affordance only for the
-            // hovered card; editing stays one click away via Host Details.
             .into_any_element()
     }
 
@@ -5180,6 +5186,7 @@ impl SshDeck {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.details_open = false;
                                         this.details_menu_open = false;
+                                        this.selected = None;
                                         cx.notify();
                                     })),
                             ),
