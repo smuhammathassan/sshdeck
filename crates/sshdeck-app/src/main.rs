@@ -27,9 +27,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
     actions, div, point, px, rgb, rgba, AnyElement, App, AppContext as _, ClipboardItem, Context,
-    Entity, Focusable as _, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
-    ParentElement as _, Render, Rgba, SharedString, Styled as _, Subscription, TitlebarOptions,
-    Window, WindowControlArea, WindowOptions,
+    Entity, Focusable as _, Hsla, InteractiveElement as _, IntoElement, KeyBinding, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render, Rgba,
+    SharedString, Styled as _, Subscription, TitlebarOptions, Window, WindowControlArea, WindowOptions,
 };
 use keys_pane::KeysPane;
 use logs_pane::LogsPane;
@@ -1185,6 +1185,61 @@ fn workspace_move_tab(
     insert(&without_tab, to_pane, to_pos, session, &mut insert_counter)
 }
 
+/// Inserts a session as a new tab into `target_pane`.
+fn workspace_insert_tab_into_pane(
+    node: &WorkspaceNode,
+    target_pane: usize,
+    session: usize,
+) -> WorkspaceNode {
+    let clean = remove_session_no_renumber(node, session).unwrap_or(WorkspaceNode::Empty);
+    if clean == WorkspaceNode::Empty {
+        return WorkspaceNode::Pane {
+            tabs: vec![session],
+            active: 0,
+        };
+    }
+    let mut counter = 0;
+    fn rec(node: &WorkspaceNode, target: usize, sess: usize, counter: &mut usize) -> WorkspaceNode {
+        match node {
+            WorkspaceNode::Empty => WorkspaceNode::Pane {
+                tabs: vec![sess],
+                active: 0,
+            },
+            WorkspaceNode::Pane { tabs, .. } => {
+                let cur = *counter;
+                *counter += 1;
+                if cur == target {
+                    let mut next_tabs = tabs.clone();
+                    next_tabs.push(sess);
+                    let active_idx = next_tabs.len() - 1;
+                    WorkspaceNode::Pane {
+                        tabs: next_tabs,
+                        active: active_idx,
+                    }
+                } else {
+                    node.clone()
+                }
+            }
+            WorkspaceNode::Split {
+                dir,
+                weights,
+                children,
+            } => {
+                let next_ch = children
+                    .iter()
+                    .map(|c| rec(c, target, sess, counter))
+                    .collect();
+                WorkspaceNode::Split {
+                    dir: *dir,
+                    weights: weights.clone(),
+                    children: next_ch,
+                }
+            }
+        }
+    }
+    rec(&clean, target_pane, session, &mut counter)
+}
+
 /// Splits `target_pane` with `session` across `dir` (before or after).
 fn workspace_split_pane_with_session(
     node: &WorkspaceNode,
@@ -1530,6 +1585,10 @@ struct SshDeck {
     broadcast_mode: bool,
     /// Dragged tab state `(from_pane_leaf_index, from_tab_index)` when moving/splitting.
     dragged_tab: Option<(usize, usize)>,
+    /// Session index currently being dragged (from top tab bar or pane).
+    dragged_session: Option<usize>,
+    /// Initial mouse down position on a tab to detect drag threshold.
+    tab_drag_start: Option<(usize, Point<Pixels>)>,
     /// Sidebar suggestion history (bounded by [`MAX_HISTORY_ENTRIES`]) and its
     /// inline form: three inputs plus a visibility flag.
     history: Vec<String>,
@@ -1819,6 +1878,8 @@ impl SshDeck {
             workspace_maximized: false,
             broadcast_mode: false,
             dragged_tab: None,
+            dragged_session: None,
+            tab_drag_start: None,
             history: crate::snippets_pane::read_recent_shell_history(),
             history_form_open: false,
             autocomplete_enabled: sshdeck_config::Settings::load().autocomplete_enabled(),
@@ -2762,7 +2823,7 @@ impl SshDeck {
                     self.workspace_focus = 0;
                 }
             }
-            self.set_workspace_chrome(true, cx);
+            self.set_workspace_chrome(false, cx);
             if let Some(&index) = workspace_leaves(&self.workspace).get(self.workspace_focus) {
                 self.active = Some(index);
                 if let Some(session) = self.sessions.get(index) {
@@ -2857,8 +2918,103 @@ impl SshDeck {
         self.select_tab(MainTab::Workspace, window, cx);
     }
 
+    /// Tiles two sessions side-by-side (active session and `other_index`) in a 2-pane workspace.
+    fn tile_sessions_side_by_side(
+        &mut self,
+        other_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let current_active = self.active.unwrap_or(0);
+        let left = current_active;
+        let right = if other_index != current_active && other_index < self.sessions.len() {
+            other_index
+        } else if self.sessions.len() > 1 {
+            (0..self.sessions.len())
+                .find(|&i| i != current_active)
+                .unwrap_or(0)
+        } else {
+            current_active
+        };
+
+        if left == right {
+            self.workspace = WorkspaceNode::Pane {
+                tabs: vec![left],
+                active: 0,
+            };
+            self.workspace_focus = 0;
+        } else {
+            self.workspace = WorkspaceNode::Split {
+                dir: SplitDir::Row,
+                weights: vec![1.0, 1.0],
+                children: vec![
+                    WorkspaceNode::Pane {
+                        tabs: vec![left],
+                        active: 0,
+                    },
+                    WorkspaceNode::Pane {
+                        tabs: vec![right],
+                        active: 0,
+                    },
+                ],
+            };
+            self.workspace_focus = 1;
+        }
+        self.workspace_maximized = false;
+        self.dragged_session = None;
+        self.dragged_tab = None;
+        self.tab_drag_start = None;
+        self.select_tab(MainTab::Workspace, window, cx);
+    }
+
+    /// Splits the current view or workspace with `dragged_session` in direction `dir`.
+    fn split_with_dragged_session(
+        &mut self,
+        dragged: usize,
+        dir: SplitDir,
+        place_after: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let current_active = self.active.unwrap_or(0);
+        let (first, second) = if place_after {
+            (current_active, dragged)
+        } else {
+            (dragged, current_active)
+        };
+        self.workspace = WorkspaceNode::Split {
+            dir,
+            weights: vec![1.0, 1.0],
+            children: vec![
+                WorkspaceNode::Pane {
+                    tabs: vec![first],
+                    active: 0,
+                },
+                WorkspaceNode::Pane {
+                    tabs: vec![second],
+                    active: 0,
+                },
+            ],
+        };
+        self.workspace_focus = if place_after { 1 } else { 0 };
+        self.workspace_maximized = false;
+        self.dragged_session = None;
+        self.dragged_tab = None;
+        self.tab_drag_start = None;
+        self.select_tab(MainTab::Workspace, window, cx);
+    }
+
     /// Closes one session tab and repairs the focused-tab bookkeeping.
     fn close_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.dragged_session = None;
+        self.dragged_tab = None;
+        self.tab_drag_start = None;
         if index >= self.sessions.len() {
             return;
         }
@@ -3520,6 +3676,65 @@ impl SshDeck {
             .child(vaults)
             .child(sftp);
 
+        let is_ws_active = self.tab == MainTab::Workspace;
+        let ws_panes = workspace_panes_count(&self.workspace);
+        if ws_panes > 1 || is_ws_active {
+            let ws_tab = div()
+                .id("tab-workspace")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .px_3()
+                .h(px(30.))
+                .rounded_md()
+                .cursor_pointer()
+                .min_w(px(0.))
+                .flex_shrink_0()
+                .text_color(if is_ws_active { selected_fg } else { muted })
+                .when(is_ws_active, |el| el.bg(selected_bg))
+                .when(!is_ws_active, |el| el.hover(move |s| s.bg(hover_bg)))
+                .child(
+                    Icon::default()
+                        .data(glyph::SPLIT_HORIZONTAL)
+                        .size(px(14.))
+                        .text_color(if is_ws_active { rgb(0x10b981) } else { muted }),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .child(format!("Workspace ({ws_panes})")),
+                )
+                .child(
+                    div()
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(rgb(0x10b981)),
+                )
+                .when(is_ws_active, |el| {
+                    el.child(
+                        Button::new("close-workspace-tab")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Close workspace")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.workspace = WorkspaceNode::Empty;
+                                let fallback = this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
+                                this.select_tab(fallback, window, cx);
+                            })),
+                    )
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.select_tab(MainTab::Workspace, window, cx);
+                }));
+            strip = strip.child(ws_tab);
+        }
+
+        let has_multi = self.sessions.len() > 1;
+
         for (index, session) in self.sessions.iter().enumerate() {
             let host_label = self
                 .store
@@ -3537,7 +3752,8 @@ impl SshDeck {
                 }
             });
             // A session tab is only selected while no pane overlay covers it.
-            let is_active = self.overlay.is_none() && active == Some(index);
+            let is_active = self.overlay.is_none() && active == Some(index) && !is_ws_active;
+            let is_this_dragged = self.dragged_session == Some(index);
             // Glyph tint carries connection state (connected #21b568 via
             // `success`, connecting #f2c94c via `warning`, failed #f25e61 via
             // `danger`, idle #8d91a5 via `muted_foreground`).
@@ -3585,54 +3801,114 @@ impl SshDeck {
                     )
             };
 
+            let split_btn = Button::new(SharedString::from(format!("split-tab-{index}")))
+                .ghost()
+                .xsmall()
+                .icon(Icon::default().data(glyph::SPLIT_HORIZONTAL).size(px(12.)))
+                .tooltip("Tile side-by-side with active session")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.tile_sessions_side_by_side(index, window, cx);
+                }));
+
+            let drag_btn = Button::new(SharedString::from(format!("drag-tab-header-{index}")))
+                .ghost()
+                .xsmall()
+                .label("⋮⋮")
+                .tooltip(if is_this_dragged {
+                    "Cancel tiling"
+                } else {
+                    "Drag to tile side-by-side"
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if this.dragged_session == Some(index) {
+                        this.dragged_session = None;
+                        this.dragged_tab = None;
+                        this.tab_drag_start = None;
+                    } else {
+                        this.dragged_session = Some(index);
+                        this.dragged_tab = None;
+                    }
+                    cx.notify();
+                }));
+
+            let mut tab_div = div()
+                .id(SharedString::from(format!("tab-{index}-{id}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .h(px(30.))
+                .rounded_md()
+                .cursor_pointer()
+                .min_w(px(0.))
+                .flex_shrink_1()
+                .overflow_hidden()
+                .text_color(if is_active { selected_fg } else { muted })
+                .when(is_active, |el| el.bg(selected_bg))
+                .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
+                .when(is_this_dragged, |el| {
+                    el.bg(rgba(0x2091f630))
+                        .border_1()
+                        .border_color(rgb(0x2091f6))
+                })
+                .tooltip({
+                    let tip = state_label.clone();
+                    move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        this.tab_drag_start = Some((index, event.position));
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    if let Some((start_idx, start_pos)) = this.tab_drag_start {
+                        if event.dragging() && start_idx == index {
+                            let dx = (f32::from(event.position.x) - f32::from(start_pos.x)).abs();
+                            let dy = (f32::from(event.position.y) - f32::from(start_pos.y)).abs();
+                            if dx > 4.0 || dy > 4.0 {
+                                this.dragged_session = Some(index);
+                                this.dragged_tab = None;
+                                cx.notify();
+                            }
+                        }
+                    }
+                }))
+                .child(drag_btn)
+                .child(os_tile)
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .flex_shrink_1()
+                        .truncate()
+                        .child(SharedString::from(label)),
+                );
+
+            if has_multi {
+                tab_div = tab_div.child(split_btn);
+            }
+
+            if is_active {
+                tab_div = tab_div.child(
+                    Button::new(SharedString::from(format!("close-tab-{index}-{close_id}")))
+                        .ghost()
+                        .icon(IconName::Close)
+                        .tooltip("Close session")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_session(index, window, cx);
+                        })),
+                );
+            }
+
             strip = strip.child(
-                div()
-                    .id(SharedString::from(format!("tab-{index}-{id}")))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .h(px(30.))
-                    .rounded_md()
-                    .cursor_pointer()
-                    .min_w(px(0.))
-                    .flex_shrink_1()
-                    .overflow_hidden()
-                    .text_color(if is_active { selected_fg } else { muted })
-                    .when(is_active, |el| el.bg(selected_bg))
-                    .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
-                    .tooltip({
-                        let tip = state_label.clone();
-                        move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
-                    })
-                    .child(os_tile)
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .flex_shrink_1()
-                            .truncate()
-                            .child(SharedString::from(label)),
-                    )
-                    // ponytail: idle tabs show no X; the selected tab keeps its
-                    // X. Hover-reveal would need per-tab hover state, so hover
-                    // alone does not reveal it. Ceiling: a hovered-tab field
-                    // wired to mouse listeners, checked alongside `is_active`.
-                    .when(is_active, |el| {
-                        el.child(
-                            Button::new(SharedString::from(format!("close-tab-{index}-{close_id}")))
-                                .ghost()
-                                .icon(IconName::Close)
-                                .tooltip("Close session")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.close_session(index, window, cx);
-                                })),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_tab(MainTab::Session(index), window, cx);
-                    })),
+                tab_div.on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_tab(MainTab::Session(index), window, cx);
+                })),
             );
         }
 
@@ -5986,6 +6262,211 @@ impl SshDeck {
             }
         };
 
+        let drop_overlay: Option<AnyElement> = if let Some(dragged_sess) = self.dragged_session {
+            let dragged_label = if let Some(session) = self.sessions.get(dragged_sess) {
+                let host_opt = self.store.inventory().get(&session.host);
+                host_opt
+                    .map(|h| h.label.clone())
+                    .or_else(|| session.status.title.clone())
+                    .unwrap_or_else(|| session.host.to_string())
+            } else {
+                format!("Session {dragged_sess}")
+            };
+
+            let cancel_bar = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .px_4()
+                .py_1p5()
+                .bg(rgb(0x1d2033))
+                .border_b_1()
+                .border_color(rgb(0x2091f6))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(rgb(0xffffff))
+                        .child(div().size(px(8.)).rounded_full().bg(rgb(0x2091f6)))
+                        .child(SharedString::from(format!(
+                            "Tiling \"{dragged_label}\" — Drop or click a zone to run side-by-side"
+                        ))),
+                )
+                .child(
+                    Button::new("cancel-session-drag")
+                        .ghost()
+                        .small()
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.dragged_session = None;
+                            this.dragged_tab = None;
+                            this.tab_drag_start = None;
+                            cx.notify();
+                        })),
+                );
+
+            let drop_left = div()
+                .id("session-drop-left")
+                .flex_1()
+                .h_full()
+                .bg(rgba(0x2091f625))
+                .border_r_2()
+                .border_color(rgb(0x2091f6))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0x2091f655)))
+                .child(
+                    Icon::default()
+                        .data(glyph::SPLIT_HORIZONTAL)
+                        .size(px(28.))
+                        .text_color(rgb(0xffffff)),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xffffff))
+                        .child("Split Left"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x93c5fd))
+                        .child(SharedString::from(format!("Run \"{dragged_label}\" on left"))),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.split_with_dragged_session(dragged_sess, SplitDir::Row, false, window, cx);
+                }));
+
+            let drop_right = div()
+                .id("session-drop-right")
+                .flex_1()
+                .h_full()
+                .bg(rgba(0x2091f625))
+                .border_l_2()
+                .border_color(rgb(0x2091f6))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0x2091f655)))
+                .child(
+                    Icon::default()
+                        .data(glyph::SPLIT_HORIZONTAL)
+                        .size(px(28.))
+                        .text_color(rgb(0xffffff)),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xffffff))
+                        .child("Split Right (Side by Side)"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x93c5fd))
+                        .child(SharedString::from(format!("Run \"{dragged_label}\" on right"))),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.split_with_dragged_session(dragged_sess, SplitDir::Row, true, window, cx);
+                }));
+
+            let drop_top = div()
+                .id("session-drop-top")
+                .w_full()
+                .h(px(60.))
+                .bg(rgba(0x2091f620))
+                .border_b_2()
+                .border_color(rgb(0x2091f6))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0x2091f650)))
+                .child(
+                    Icon::default()
+                        .data(glyph::SPLIT_VERTICAL)
+                        .size(px(20.))
+                        .text_color(rgb(0xffffff)),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(rgb(0xffffff))
+                        .child("Split Top (Stacked)"),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.split_with_dragged_session(dragged_sess, SplitDir::Col, false, window, cx);
+                }));
+
+            let drop_bottom = div()
+                .id("session-drop-bottom")
+                .w_full()
+                .h(px(60.))
+                .bg(rgba(0x2091f620))
+                .border_t_2()
+                .border_color(rgb(0x2091f6))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0x2091f650)))
+                .child(
+                    Icon::default()
+                        .data(glyph::SPLIT_VERTICAL)
+                        .size(px(20.))
+                        .text_color(rgb(0xffffff)),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(rgb(0xffffff))
+                        .child("Split Bottom (Stacked)"),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.split_with_dragged_session(dragged_sess, SplitDir::Col, true, window, cx);
+                }));
+
+            Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .bg(rgba(0x0f172a80))
+                    .child(cancel_bar)
+                    .child(drop_top)
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_row()
+                            .child(drop_left)
+                            .child(drop_right),
+                    )
+                    .child(drop_bottom)
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
         let secret = self.render_secret_prompt(cx);
         let sidebar = self.render_session_sidebar(window, cx);
 
@@ -6007,12 +6488,14 @@ impl SshDeck {
                     .overflow_hidden()
                     .child(
                         div()
+                            .relative()
                             .flex()
                             .flex_col()
                             .flex_1()
                             .min_w(px(0.))
                             .overflow_hidden()
-                            .child(content),
+                            .child(content)
+                            .when_some(drop_overlay, |el, overlay| el.child(overlay)),
                     )
                     .child(sidebar),
             )
@@ -6933,7 +7416,7 @@ impl SshDeck {
                     .text_color(muted)
                     .child("Workspace"),
             )
-            .when(self.dragged_tab.is_some(), |el| {
+            .when(self.dragged_tab.is_some() || self.dragged_session.is_some(), |el| {
                 el.child(
                     div()
                         .flex()
@@ -6954,6 +7437,8 @@ impl SshDeck {
                                 .label("Cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.dragged_tab = None;
+                                    this.dragged_session = None;
+                                    this.tab_drag_start = None;
                                     cx.notify();
                                 })),
                         ),
@@ -7159,6 +7644,7 @@ impl SshDeck {
                 .tooltip("Drag tab to move or split")
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.dragged_tab = Some((pane_index, tab_idx));
+                    this.dragged_session = Some(session_idx);
                     cx.notify();
                 }));
 
@@ -7189,6 +7675,26 @@ impl SshDeck {
                 .text_size(px(12.))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(0x32364c)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        this.tab_drag_start = Some((session_idx, event.position));
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    if let Some((start_idx, start_pos)) = this.tab_drag_start {
+                        if event.dragging() && start_idx == session_idx {
+                            let dx = (f32::from(event.position.x) - f32::from(start_pos.x)).abs();
+                            let dy = (f32::from(event.position.y) - f32::from(start_pos.y)).abs();
+                            if dx > 4.0 || dy > 4.0 {
+                                this.dragged_tab = Some((pane_index, tab_idx));
+                                this.dragged_session = Some(session_idx);
+                                cx.notify();
+                            }
+                        }
+                    }
+                }))
                 .child(div().size(px(6.)).rounded_full().bg(if is_connected {
                     cx.theme().success
                 } else {
@@ -7348,143 +7854,188 @@ impl SshDeck {
         };
 
         // 4. Drop zones when dragging
-        let drop_overlay = if let Some((from_pane, from_tab)) = self.dragged_tab {
-            let from_session = if from_pane == pane_index {
-                tabs.get(from_tab).copied()
-            } else {
-                let leaves = workspace_leaves(&self.workspace);
-                leaves.get(from_tab).copied()
-            };
+        let moving_session_opt = self.dragged_session.or_else(|| {
+            self.dragged_tab.and_then(|(from_pane, from_tab)| {
+                if from_pane == pane_index {
+                    tabs.get(from_tab).copied()
+                } else {
+                    let leaves = workspace_leaves(&self.workspace);
+                    leaves.get(from_tab).copied()
+                }
+            })
+        });
 
-            if let Some(moving_session) = from_session {
-                let drop_left = div()
-                    .id(SharedString::from(format!("ws-drop-left-{pane_index}")))
-                    .w(px(56.))
-                    .bg(rgba(0x2091f630))
-                    .border_r_2()
-                    .border_color(cx.theme().primary)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgba(0x2091f660)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xffffff))
-                            .child("Split Left"),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.workspace = workspace_split_pane_with_session(
-                            &this.workspace,
-                            pane_index,
-                            moving_session,
-                            SplitDir::Row,
-                            false,
-                        );
-                        this.dragged_tab = None;
-                        cx.notify();
-                    }));
+        let drop_overlay = if let Some(moving_session) = moving_session_opt {
+            let from_pane_opt = self.dragged_tab;
+            let drop_left = div()
+                .id(SharedString::from(format!("ws-drop-left-{pane_index}")))
+                .w(px(72.))
+                .bg(rgba(0x2091f630))
+                .border_r_2()
+                .border_color(cx.theme().primary)
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0x2091f660)))
+                .child(
+                    Icon::default()
+                        .data(glyph::SPLIT_HORIZONTAL)
+                        .size(px(20.))
+                        .text_color(rgb(0xffffff)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(rgb(0xffffff))
+                        .child("Split Left"),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.workspace = workspace_split_pane_with_session(
+                        &this.workspace,
+                        pane_index,
+                        moving_session,
+                        SplitDir::Row,
+                        false,
+                    );
+                    this.dragged_tab = None;
+                    this.dragged_session = None;
+                    this.tab_drag_start = None;
+                    cx.notify();
+                }));
 
-                let drop_right = div()
-                    .id(SharedString::from(format!("ws-drop-right-{pane_index}")))
-                    .w(px(56.))
-                    .bg(rgba(0x2091f630))
-                    .border_l_2()
-                    .border_color(cx.theme().primary)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgba(0x2091f660)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xffffff))
-                            .child("Split Right"),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.workspace = workspace_split_pane_with_session(
-                            &this.workspace,
-                            pane_index,
-                            moving_session,
-                            SplitDir::Row,
-                            true,
-                        );
-                        this.dragged_tab = None;
-                        cx.notify();
-                    }));
+            let drop_right = div()
+                .id(SharedString::from(format!("ws-drop-right-{pane_index}")))
+                .w(px(72.))
+                .bg(rgba(0x2091f630))
+                .border_l_2()
+                .border_color(cx.theme().primary)
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0x2091f660)))
+                .child(
+                    Icon::default()
+                        .data(glyph::SPLIT_HORIZONTAL)
+                        .size(px(20.))
+                        .text_color(rgb(0xffffff)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(rgb(0xffffff))
+                        .child("Split Right"),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.workspace = workspace_split_pane_with_session(
+                        &this.workspace,
+                        pane_index,
+                        moving_session,
+                        SplitDir::Row,
+                        true,
+                    );
+                    this.dragged_tab = None;
+                    this.dragged_session = None;
+                    this.tab_drag_start = None;
+                    cx.notify();
+                }));
 
-                let drop_top = div()
-                    .id(SharedString::from(format!("ws-drop-top-{pane_index}")))
-                    .h(px(36.))
-                    .bg(rgba(0x2091f630))
-                    .border_b_2()
-                    .border_color(cx.theme().primary)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgba(0x2091f660)))
-                    .child(div().text_xs().text_color(rgb(0xffffff)).child("Split Top"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.workspace = workspace_split_pane_with_session(
-                            &this.workspace,
-                            pane_index,
-                            moving_session,
-                            SplitDir::Col,
-                            false,
-                        );
-                        this.dragged_tab = None;
-                        cx.notify();
-                    }));
+            let drop_top = div()
+                .id(SharedString::from(format!("ws-drop-top-{pane_index}")))
+                .h(px(40.))
+                .bg(rgba(0x2091f630))
+                .border_b_2()
+                .border_color(cx.theme().primary)
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0x2091f660)))
+                .child(
+                    Icon::default()
+                        .data(glyph::SPLIT_VERTICAL)
+                        .size(px(16.))
+                        .text_color(rgb(0xffffff)),
+                )
+                .child(div().text_xs().text_color(rgb(0xffffff)).child("Split Top"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.workspace = workspace_split_pane_with_session(
+                        &this.workspace,
+                        pane_index,
+                        moving_session,
+                        SplitDir::Col,
+                        false,
+                    );
+                    this.dragged_tab = None;
+                    this.dragged_session = None;
+                    this.tab_drag_start = None;
+                    cx.notify();
+                }));
 
-                let drop_bottom = div()
-                    .id(SharedString::from(format!("ws-drop-bottom-{pane_index}")))
-                    .h(px(36.))
-                    .bg(rgba(0x2091f630))
-                    .border_t_2()
-                    .border_color(cx.theme().primary)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgba(0x2091f660)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xffffff))
-                            .child("Split Bottom"),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.workspace = workspace_split_pane_with_session(
-                            &this.workspace,
-                            pane_index,
-                            moving_session,
-                            SplitDir::Col,
-                            true,
-                        );
-                        this.dragged_tab = None;
-                        cx.notify();
-                    }));
+            let drop_bottom = div()
+                .id(SharedString::from(format!("ws-drop-bottom-{pane_index}")))
+                .h(px(40.))
+                .bg(rgba(0x2091f630))
+                .border_t_2()
+                .border_color(cx.theme().primary)
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0x2091f660)))
+                .child(
+                    Icon::default()
+                        .data(glyph::SPLIT_VERTICAL)
+                        .size(px(16.))
+                        .text_color(rgb(0xffffff)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xffffff))
+                        .child("Split Bottom"),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.workspace = workspace_split_pane_with_session(
+                        &this.workspace,
+                        pane_index,
+                        moving_session,
+                        SplitDir::Col,
+                        true,
+                    );
+                    this.dragged_tab = None;
+                    this.dragged_session = None;
+                    this.tab_drag_start = None;
+                    cx.notify();
+                }));
 
-                let tabs_len = tabs.len();
-                let drop_center = div()
-                    .id(SharedString::from(format!("ws-drop-center-{pane_index}")))
-                    .flex_1()
-                    .bg(rgba(0x2091f615))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgba(0x2091f640)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xffffff))
-                            .child("Move Tab Here"),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
+            let tabs_len = tabs.len();
+            let drop_center = div()
+                .id(SharedString::from(format!("ws-drop-center-{pane_index}")))
+                .flex_1()
+                .bg(rgba(0x2091f615))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0x2091f640)))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xffffff))
+                        .child("Move Tab Here"),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some((from_pane, from_tab)) = from_pane_opt {
                         this.workspace = workspace_move_tab(
                             &this.workspace,
                             from_pane,
@@ -7492,31 +8043,37 @@ impl SshDeck {
                             pane_index,
                             tabs_len,
                         );
-                        this.dragged_tab = None;
-                        cx.notify();
-                    }));
+                    } else {
+                        this.workspace = workspace_insert_tab_into_pane(
+                            &this.workspace,
+                            pane_index,
+                            moving_session,
+                        );
+                    }
+                    this.dragged_tab = None;
+                    this.dragged_session = None;
+                    this.tab_drag_start = None;
+                    cx.notify();
+                }));
 
-                Some(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .flex_col()
-                        .child(drop_top)
-                        .child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .flex_row()
-                                .child(drop_left)
-                                .child(drop_center)
-                                .child(drop_right),
-                        )
-                        .child(drop_bottom),
-                )
-            } else {
-                None
-            }
+            Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .child(drop_top)
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_row()
+                            .child(drop_left)
+                            .child(drop_center)
+                            .child(drop_right),
+                    )
+                    .child(drop_bottom),
+            )
         } else {
             None
         };
@@ -8187,6 +8744,19 @@ mod tests {
         // A stale focus splits the last tile rather than panicking.
         let (tree, focus) = workspace_insert(&pane(0), 9, 1);
         assert_eq!((workspace_leaves(&tree), focus), (vec![0, 1], 1));
+    }
+
+    #[test]
+    fn workspace_insert_tab_into_pane_works() {
+        let tree = pane(0);
+        let updated = workspace_insert_tab_into_pane(&tree, 0, 1);
+        assert_eq!(
+            updated,
+            WorkspaceNode::Pane {
+                tabs: vec![0, 1],
+                active: 1,
+            }
+        );
     }
 
     #[test]
