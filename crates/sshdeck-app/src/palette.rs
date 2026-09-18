@@ -315,7 +315,7 @@ fn registry() -> Vec<Command> {
         .kind(Kind::Host),
         Command::new(
             CommandId::OpenLocalTerminal,
-            Category::Navigation,
+            Category::Panes,
             "Open Local Terminal",
             &["terminal", "local", "shell", "bash", "zsh", "prompt"],
         )

@@ -3418,28 +3418,13 @@ impl SshDeck {
         let header_bg = rgb(0x1a1d2d);
         let header_fg = rgb(0xffffff);
 
-        let update_btn = div()
-            .id("header-update-btn")
-            .flex()
-            .items_center()
-            .h(px(26.))
-            .px_2p5()
-            .rounded(px(6.))
-            .border_1()
-            .border_color(rgba(0xffffff20))
-            .bg(rgb(0x25293d))
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x2d3148)).border_color(rgba(0xffffff30)))
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .text_color(rgb(0xffffff))
-                    .child("Update"),
-            )
+        let update_btn = Button::new("header-update-btn")
+            .ghost()
+            .small()
+            .label("Update")
             .tooltip("Check for updates")
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.push_notification(Notification::info("SshDeck is up to date (v0.1.0)"), cx);
+            .on_click(cx.listener(|_this, _, window, cx| {
+                window.push_notification(Notification::info("SshDeck is up to date (v0.1.0)"), cx);
             }));
 
         let actions = div()
@@ -3998,11 +3983,7 @@ impl SshDeck {
                         Icon::default()
                             .data(glyph::TERMINAL_PROMPT)
                             .size(px(11.))
-                            .text_color(if is_active {
-                                selected_fg
-                            } else {
-                                unselected_fg
-                            }),
+                            .text_color(if is_active { selected_fg } else { glyph_color }),
                     )
             };
 
