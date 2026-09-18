@@ -36,6 +36,7 @@ jobs:
           cp target/release/sshdeck "$APP/Contents/MacOS/sshdeck"
           sed "s/__VERSION__/$VERSION/" packaging/Info.plist > "$APP/Contents/Info.plist"
           plutil -lint "$APP/Contents/Info.plist"
+          codesign -s - --force --deep "$APP"
           tar -czf sshdeck-macos-arm64.tar.gz -C target/release sshdeck.app
           echo "--- bundle ---"; find "$APP" -type f
           echo "--- sizes ---"; du -h target/release/sshdeck; ls -lh sshdeck-macos-arm64.tar.gz

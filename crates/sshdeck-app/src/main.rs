@@ -4598,9 +4598,9 @@ impl SshDeck {
         // grey and disabled-looking until a saved host is selected.
         let mut connect_pill = div()
             .id("vault-connect")
-            .h(px(32.))
-            .px_4()
-            .rounded(px(8.))
+            .h(px(30.))
+            .px_3p5()
+            .rounded(px(6.))
             .flex()
             .items_center()
             .justify_center()
@@ -4636,7 +4636,7 @@ impl SshDeck {
                 }));
         } else {
             connect_pill = connect_pill
-                .bg(rgb(0xeef2f4))
+                .bg(rgb(0xe4e7ec))
                 .text_color(rgb(0x8d9ba3))
                 .child("Connect");
         }
@@ -4646,14 +4646,13 @@ impl SshDeck {
             .flex_row()
             .items_center()
             .w_full()
-            .h(px(42.))
-            .pl_4()
-            .pr(px(5.))
+            .h(px(38.))
+            .pl_3p5()
+            .pr(px(4.))
             .rounded(px(10.))
-            .bg(rgb(0xffffff))
+            .bg(rgb(0xf0f2f5))
             .border_1()
-            .border_color(rgb(0xe2e8f0))
-            .shadow_xs()
+            .border_color(rgb(0xe2e5e9))
             .child(
                 div()
                     .flex_1()
@@ -5099,6 +5098,31 @@ impl SshDeck {
 
         let tint = host_os_tint(host, orange.into());
 
+        let edit_id = host.id.clone();
+        let edit_btn = div()
+            .id(SharedString::from(format!("card-edit-{}", host.id)))
+            .p_1()
+            .rounded(px(6.))
+            .hover(|s| s.bg(rgb(0xf0f2f5)))
+            .cursor_pointer()
+            .child(
+                Icon::default()
+                    .data(glyph::PENCIL)
+                    .size(px(14.))
+                    .text_color(if is_selected {
+                        border_selected
+                    } else {
+                        rgb(0x8d9ba3)
+                    }),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.selected = Some(edit_id.clone());
+                this.details_open = true;
+                this.sync_details_inputs(window, cx);
+                cx.notify();
+            }));
+
         div()
             .id(SharedString::from(format!("vault-card-{id}")))
             .flex()
@@ -5169,6 +5193,7 @@ impl SshDeck {
                             .child(SharedString::from(tags_str)),
                     ),
             )
+            .child(edit_btn)
             .into_any_element()
     }
 
@@ -8001,6 +8026,8 @@ impl SshDeck {
             );
 
         let sidebar = self.render_session_sidebar(window, cx);
+        let show_toolbar =
+            self.dragged_tab.is_some() || self.dragged_session.is_some() || self.broadcast_mode;
 
         div()
             .flex()
@@ -8009,7 +8036,7 @@ impl SshDeck {
             .h_full()
             .min_h(px(0.))
             .overflow_hidden()
-            .child(toolbar)
+            .when(show_toolbar, |el| el.child(toolbar))
             .child(
                 div()
                     .relative()
@@ -8244,7 +8271,12 @@ impl SshDeck {
         let split_h_btn = Button::new(SharedString::from(format!("pane-splith-{pane_index}")))
             .ghost()
             .xsmall()
-            .icon(Icon::default().data(glyph::SPLIT_HORIZONTAL).size(px(13.)))
+            .icon(
+                Icon::default()
+                    .data(glyph::SPLIT_HORIZONTAL)
+                    .size(px(13.))
+                    .text_color(rgb(0x10b981)),
+            )
             .tooltip("Split side by side")
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(active_sess) = this.active {
@@ -8262,7 +8294,12 @@ impl SshDeck {
         let split_v_btn = Button::new(SharedString::from(format!("pane-splitv-{pane_index}")))
             .ghost()
             .xsmall()
-            .icon(Icon::default().data(glyph::SPLIT_VERTICAL).size(px(13.)))
+            .icon(
+                Icon::default()
+                    .data(glyph::SPLIT_VERTICAL)
+                    .size(px(13.))
+                    .text_color(rgb(0x10b981)),
+            )
             .tooltip("Split stacked")
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(active_sess) = this.active {
@@ -8280,7 +8317,12 @@ impl SshDeck {
         let max_btn = Button::new(SharedString::from(format!("pane-max-{pane_index}")))
             .ghost()
             .xsmall()
-            .icon(IconName::Maximize)
+            .icon(
+                Icon::default()
+                    .data(glyph::EXPAND)
+                    .size(px(13.))
+                    .text_color(rgb(0x10b981)),
+            )
             .tooltip(if self.workspace_maximized {
                 "Tile all"
             } else {
@@ -8849,10 +8891,12 @@ impl SshDeck {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .rounded(px(6.))
-            .when(is_focused, |el| el.border_2().border_color(rgb(0x10b981)))
-            .when(!is_focused, |el| {
-                el.border_1().border_color(rgba(0x8d91a530))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(if is_focused {
+                rgb(0x10b981)
+            } else {
+                rgba(0xffffff14)
             })
             .child(tab_bar)
             .child(
