@@ -927,31 +927,37 @@ fn empty_state(cx: &gpui_kit::App) -> Div {
         .flex_col()
         .items_center()
         .justify_center()
-        .gap_3()
+        .gap_2()
         .flex_1()
         .min_h(px(0.))
         .p_6()
         .child(
             div()
-                .size(px(72.))
+                .size(px(56.))
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(16.))
-                .bg(cx.theme().muted)
-                .child(Icon::new(IconName::Inbox).large().text_color(foreground)),
+                .rounded(px(14.))
+                .bg(rgba(0x0000000d))
+                .child(
+                    Icon::new(IconName::Inbox)
+                        .size(px(22.))
+                        .text_color(foreground),
+                ),
         )
         .child(
             div()
-                .text_size(px(20.))
+                .pt_2()
+                .text_size(px(18.))
+                .font_weight(gpui_kit::FontWeight::BOLD)
                 .text_color(foreground)
                 .child("No activity yet"),
         )
         .child(
             div()
-                .max_w(px(420.))
+                .max_w(px(400.))
                 .text_center()
-                .text_size(px(14.))
+                .text_size(px(13.))
                 .text_color(muted)
                 .child("Connections, forwards and transfers will appear here once you use them."),
         )

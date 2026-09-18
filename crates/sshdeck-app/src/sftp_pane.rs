@@ -156,6 +156,8 @@ pub struct SftpPane {
     selected: Option<usize>,
     loading: bool,
     error: Option<String>,
+    remote_history: Vec<String>,
+    remote_history_idx: usize,
     transfers: Vec<TransferRow>,
     load_generation: u64,
     watch_generation: u64,
@@ -235,6 +237,8 @@ impl SftpPane {
             selected: None,
             loading: false,
             error: None,
+            remote_history: Vec::new(),
+            remote_history_idx: 0,
             transfers: Vec::new(),
             load_generation: 0,
             watch_generation: 0,
@@ -350,6 +354,8 @@ impl SftpPane {
                 self.selected = None;
                 self.error = None;
                 self.transfers.clear();
+                self.remote_history.clear();
+                self.remote_history_idx = 0;
                 self.watch_transfers(events, cx);
                 self.refresh(cx);
             }
@@ -362,6 +368,8 @@ impl SftpPane {
                 self.selected = None;
                 self.loading = false;
                 self.error = None;
+                self.remote_history.clear();
+                self.remote_history_idx = 0;
                 self.transfers.clear();
             }
         }
@@ -428,15 +436,36 @@ impl SftpPane {
         self.load(path, cx);
     }
 
-    /// Navigates to an absolute remote path.
+    /// Navigates to an absolute remote path, recording history.
     fn navigate(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.remote_history_idx + 1 < self.remote_history.len() {
+            self.remote_history.truncate(self.remote_history_idx + 1);
+        }
+        self.remote_history.push(path.clone());
+        self.remote_history_idx = self.remote_history.len() - 1;
         self.load(path, cx);
+    }
+
+    fn go_remote_back(&mut self, cx: &mut Context<Self>) {
+        if self.remote_history_idx > 0 {
+            self.remote_history_idx -= 1;
+            let path = self.remote_history[self.remote_history_idx].clone();
+            self.load(path, cx);
+        }
+    }
+
+    fn go_remote_forward(&mut self, cx: &mut Context<Self>) {
+        if self.remote_history_idx + 1 < self.remote_history.len() {
+            self.remote_history_idx += 1;
+            let path = self.remote_history[self.remote_history_idx].clone();
+            self.load(path, cx);
+        }
     }
 
     /// Enters the named child directory on the remote server.
     fn activate(&mut self, name: &str, cx: &mut Context<Self>) {
         match sshdeck_sftp::join(&self.cwd, name) {
-            Ok(path) => self.load(path, cx),
+            Ok(path) => self.navigate(path, cx),
             Err(error) => {
                 self.error = Some(format!("Cannot open {name}: {error}"));
                 cx.notify();
@@ -447,7 +476,7 @@ impl SftpPane {
     /// Jumps to the parent remote directory.
     fn go_up(&mut self, cx: &mut Context<Self>) {
         if let Some(parent) = parent_path(&self.cwd) {
-            self.load(parent, cx);
+            self.navigate(parent, cx);
         }
     }
 
@@ -477,7 +506,11 @@ impl SftpPane {
                 pane.loading = false;
                 match result {
                     Ok((canonical, entries)) => {
-                        pane.cwd = canonical;
+                        pane.cwd = canonical.clone();
+                        if pane.remote_history.is_empty() {
+                            pane.remote_history.push(canonical);
+                            pane.remote_history_idx = 0;
+                        }
                         pane.set_entries(entries);
                         pane.error = None;
                     }
@@ -1201,24 +1234,25 @@ impl SftpPane {
         let border = cx.theme().table_row_border;
         let muted = cx.theme().muted_foreground;
         let folder_tint = rgb(0x5aa9ff);
-        let has_parent = parent_path(&self.cwd).is_some();
         let connected = self.client.is_some();
+        let can_back = connected && self.remote_history_idx > 0;
+        let can_forward = connected && self.remote_history_idx + 1 < self.remote_history.len();
 
-        let up = Button::new("sftp-up")
+        let back_btn = Button::new("remote-nav-back")
             .ghost()
             .xsmall()
             .icon(IconName::ChevronLeft)
-            .tooltip("Parent folder")
-            .disabled(!connected || !has_parent)
-            .on_click(cx.listener(|this, _, _, cx| this.go_up(cx)));
+            .tooltip("Back")
+            .disabled(!can_back)
+            .on_click(cx.listener(|this, _, _, cx| this.go_remote_back(cx)));
 
-        let refresh = Button::new("sftp-refresh")
+        let forward_btn = Button::new("remote-nav-forward")
             .ghost()
             .xsmall()
             .icon(IconName::ChevronRight)
-            .tooltip("Refresh")
-            .disabled(!connected)
-            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)));
+            .tooltip("Forward")
+            .disabled(!can_forward)
+            .on_click(cx.listener(|this, _, _, cx| this.go_remote_forward(cx)));
 
         let mut trail: Vec<AnyElement> = Vec::new();
         for (index, (label, path)) in breadcrumb_crumbs(&self.cwd).into_iter().enumerate() {
@@ -1260,8 +1294,8 @@ impl SftpPane {
             .flex_shrink_0()
             .border_b_1()
             .border_color(border)
-            .child(up)
-            .child(refresh)
+            .child(back_btn)
+            .child(forward_btn)
             .child(
                 div()
                     .flex()

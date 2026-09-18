@@ -105,7 +105,7 @@ fn card_cols(win_w: f32) -> usize {
 }
 /// Termius' navy identity tile, RGBA (the alpha byte is part of the literal:
 /// `rgba` reads `0xRRGGBBAA`). The one literal in this pane.
-const TILE_BG: u32 = 0x1c4774ff;
+const TILE_BG: u32 = 0x0a477bff;
 
 /// Glyphs the bundled default icon set does not carry.
 ///
@@ -717,7 +717,6 @@ impl KeysPane {
     /// The single toolbar row: section switch, contextual actions, icon controls.
     /// Wraps on narrow windows instead of clipping.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
         div()
             .flex()
             .flex_row()
@@ -725,12 +724,10 @@ impl KeysPane {
             .items_center()
             .gap_3()
             .min_h(px(56.))
-            .px_3()
+            .px_6()
             .py_1()
             .flex_shrink_0()
-            .bg(cx.theme().popover)
-            .border_b_1()
-            .border_color(border)
+            .bg(cx.theme().background)
             .child(self.render_actions(cx))
             .child(div().flex_1())
             .child(self.render_controls(cx))
@@ -738,7 +735,7 @@ impl KeysPane {
 
     /// The section's own actions, mirroring the reference's left cluster.
     fn render_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut row = div().flex().flex_row().items_center().gap_1();
+        let mut row = div().flex().flex_row().items_center().gap_2();
         match self.section {
             KeysSection::Keys => {
                 row = row
@@ -747,9 +744,16 @@ impl KeysPane {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_0()
+                            .h(px(32.))
+                            .rounded(px(8.))
+                            .bg(rgb(0xffffff))
+                            .border_1()
+                            .border_color(rgb(0xd5dde0))
+                            .shadow_xs()
                             .child(
                                 Button::new("generate-ed25519")
+                                    .ghost()
+                                    .small()
                                     .icon(IconName::Plus)
                                     .label("New key")
                                     .tooltip("Generate an ed25519 key")
@@ -758,9 +762,11 @@ impl KeysPane {
                                         this.generate(KeyKind::Ed25519, window, cx);
                                     })),
                             )
+                            .child(div().w(px(1.)).h(px(16.)).bg(rgb(0xd5dde0)))
                             .child(
                                 Button::new("generate-rsa")
                                     .ghost()
+                                    .small()
                                     .icon(IconName::ChevronDown)
                                     .tooltip("Generate an RSA key")
                                     .disabled(self.busy)
@@ -793,7 +799,7 @@ impl KeysPane {
                 row = row
                     .child(
                         Button::new("import-known-hosts")
-                            .ghost()
+                            .small()
                             .icon(IconName::Inbox)
                             .label("Import")
                             .tooltip("Import known_hosts file")
@@ -2087,19 +2093,22 @@ fn card(
         .items_center()
         .gap_3()
         .p_2p5()
-        .h(px(60.))
+        .h(px(64.))
         .flex_basis(px(CARD_BASIS))
+        .max_w(px(380.))
         .flex_grow_1()
         .flex_shrink_0()
         .min_w(px(220.))
-        .rounded(px(10.))
-        .bg(cx.theme().popover)
+        .rounded(px(12.))
+        .bg(rgb(0xffffff))
+        .border_1()
+        .border_color(rgba(0x0000000c))
         .shadow_xs()
         .cursor_pointer()
         .when(danger, |el| el.border_1().border_color(danger_color))
         .when(selected, |el| el.border_1().border_color(primary))
         .hover(move |el| el.bg(accent))
-        .child(glyph_tile(glyph, 40., cx))
+        .child(glyph_tile(glyph, 38., cx))
         .child(
             div()
                 .flex()
@@ -2110,6 +2119,7 @@ fn card(
                 .child(
                     div()
                         .text_size(px(14.))
+                        .font_weight(FontWeight::SEMIBOLD)
                         .truncate()
                         .child(SharedString::from(title)),
                 )

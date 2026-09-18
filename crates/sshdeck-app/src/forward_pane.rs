@@ -453,8 +453,6 @@ impl ForwardPane {
     /// right. `New forwarding` is disabled without a session, because a forward
     /// cannot exist off one.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
-        let border = cx.theme().border;
-
         div()
             .flex()
             .flex_row()
@@ -462,23 +460,27 @@ impl ForwardPane {
             .items_center()
             .justify_between()
             .min_h(px(56.))
-            .px_3()
+            .px_6()
             .py_1()
             .flex_shrink_0()
-            .bg(cx.theme().popover)
-            .border_b_1()
-            .border_color(border)
+            .bg(cx.theme().background)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_0()
+                    .h(px(32.))
+                    .rounded(px(8.))
+                    .bg(rgb(0xffffff))
+                    .border_1()
+                    .border_color(rgb(0xd5dde0))
+                    .shadow_xs()
                     .child(
                         Button::new("forward-new")
+                            .ghost()
+                            .small()
                             .icon(IconName::Plus)
                             .label("New forwarding")
-                            .small()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.form_open = !this.form_open;
                                 if !this.form_open {
@@ -487,10 +489,12 @@ impl ForwardPane {
                                 cx.notify();
                             })),
                     )
+                    .child(div().w(px(1.)).h(px(16.)).bg(rgb(0xd5dde0)))
                     .child(
                         Button::new("forward-new-caret")
-                            .icon(IconName::ChevronDown)
+                            .ghost()
                             .small()
+                            .icon(IconName::ChevronDown)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.form_open = !this.form_open;
                                 if !this.form_open {
@@ -1014,37 +1018,38 @@ fn empty_state(cx: &App, title: &str, detail: &str) -> Div {
         .flex_col()
         .items_center()
         .justify_center()
-        .gap_3()
+        .gap_2()
         .flex_1()
         .min_h(px(0.))
         .p_6()
         .child(
             div()
-                .size(px(72.))
+                .size(px(56.))
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(16.))
-                .bg(cx.theme().muted)
+                .rounded(px(14.))
+                .bg(rgba(0x0000000d))
                 .child(
                     Icon::default()
                         .data(glyph::FORWARD)
-                        .size(px(32.))
+                        .size(px(22.))
                         .text_color(foreground),
                 ),
         )
         .child(
             div()
-                .text_size(px(20.))
+                .pt_2()
+                .text_size(px(18.))
                 .font_weight(FontWeight::BOLD)
                 .text_color(foreground)
                 .child(SharedString::from(title.to_string())),
         )
         .child(
             div()
-                .max_w(px(420.))
+                .max_w(px(400.))
                 .text_center()
-                .text_size(px(14.))
+                .text_size(px(13.))
                 .text_color(muted)
                 .child(SharedString::from(detail.to_string())),
         )

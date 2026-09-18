@@ -3863,7 +3863,13 @@ impl SshDeck {
                         Button::new("close-workspace-tab")
                             .ghost()
                             .xsmall()
-                            .icon(IconName::Close)
+                            .icon(Icon::new(IconName::Close).size(px(12.)).text_color(
+                                if is_ws_active {
+                                    rgb(0x10b981)
+                                } else {
+                                    unselected_fg
+                                },
+                            ))
                             .tooltip("Close workspace")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 cx.stop_propagation();
@@ -3942,17 +3948,25 @@ impl SshDeck {
 
             let is_active = self.overlay.is_none() && active == Some(index) && !is_ws_active;
             let is_this_dragged = self.dragged_session == Some(index);
-            let glyph_color = match &session.status.state {
-                SessionState::Connected => cx.theme().success,
-                SessionState::Connecting | SessionState::Authenticating => cx.theme().warning,
-                SessionState::Failed { .. } => cx.theme().danger,
-                SessionState::Disconnected | SessionState::Closed { .. } => {
-                    cx.theme().muted_foreground
-                }
-            };
             let state_label = session.status.state.label();
             let id = session.host.clone();
             let close_id = id.clone();
+
+            let tab_bg = if is_active {
+                rgb(0x0e3a2f)
+            } else {
+                rgb(0x222638)
+            };
+            let tab_border = if is_active {
+                rgba(0x10b98160)
+            } else {
+                rgba(0xffffff14)
+            };
+            let tab_fg = if is_active {
+                rgb(0x10b981)
+            } else {
+                unselected_fg
+            };
 
             let host_opt = self.store.inventory().get(&session.host);
             let os_tile = if let Some(host) = host_opt {
@@ -3975,7 +3989,7 @@ impl SshDeck {
                     .size(px(18.))
                     .rounded(px(4.))
                     .bg(if is_active {
-                        rgba(0xffffff28)
+                        rgba(0x10b98124)
                     } else {
                         rgba(0xffffff14)
                     })
@@ -3986,18 +4000,23 @@ impl SshDeck {
                         Icon::default()
                             .data(glyph::TERMINAL_PROMPT)
                             .size(px(11.))
-                            .text_color(if is_active {
-                                selected_fg
-                            } else {
-                                glyph_color.into()
-                            }),
+                            .text_color(tab_fg),
                     )
             };
 
             let split_btn = Button::new(SharedString::from(format!("split-tab-{index}")))
                 .ghost()
                 .xsmall()
-                .icon(Icon::default().data(glyph::SPLIT_HORIZONTAL).size(px(12.)))
+                .icon(
+                    Icon::default()
+                        .data(glyph::SPLIT_HORIZONTAL)
+                        .size(px(12.))
+                        .text_color(if is_active {
+                            rgb(0x10b981)
+                        } else {
+                            unselected_fg
+                        }),
+                )
                 .tooltip("Tile side-by-side with active session")
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
@@ -4016,14 +4035,10 @@ impl SshDeck {
                 .cursor_pointer()
                 .min_w(px(0.))
                 .flex_shrink_0()
-                .text_color(if is_active {
-                    selected_fg
-                } else {
-                    unselected_fg
-                })
-                .when(is_active, |el| {
-                    el.bg(selected_bg).border_1().border_color(selected_border)
-                })
+                .bg(tab_bg)
+                .border_1()
+                .border_color(tab_border)
+                .text_color(tab_fg)
                 .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
                 .when(is_this_dragged, |el| {
                     el.bg(rgba(0x2091f630))
@@ -4057,33 +4072,45 @@ impl SshDeck {
                             }
                         }
                     }),
-                )
-                .child(os_tile)
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .min_w(px(0.))
-                        .truncate()
-                        .child(SharedString::from(label)),
                 );
 
-            if has_multi {
-                tab_div = tab_div.child(split_btn);
-            }
-
+            // Close button on the LEFT for active tab (matching Termius Screenshot 13, 22),
+            // and host/terminal icon on the left for inactive tabs (matching Termius Screenshot 1, 12).
             if is_active {
                 tab_div = tab_div.child(
                     Button::new(SharedString::from(format!("close-tab-{index}-{close_id}")))
                         .ghost()
                         .xsmall()
-                        .icon(IconName::Close)
+                        .icon(
+                            Icon::new(IconName::Close)
+                                .size(px(12.))
+                                .text_color(rgb(0x10b981)),
+                        )
                         .tooltip("Close session")
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.close_session(index, window, cx);
                         })),
                 );
+            } else {
+                tab_div = tab_div.child(os_tile);
+            }
+
+            tab_div = tab_div.child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .min_w(px(0.))
+                    .truncate()
+                    .child(SharedString::from(label)),
+            );
+
+            if is_active {
+                tab_div = tab_div.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)));
+            }
+
+            if has_multi {
+                tab_div = tab_div.child(split_btn);
             }
 
             strip = strip.child(tab_div.on_click(cx.listener(move |this, _, window, cx| {
@@ -4091,8 +4118,10 @@ impl SshDeck {
             })));
         }
 
-        // 5. [ ✕ New Tab ] tab (only shown when on New Tab screen, matching Termius Screenshot 12)
-        if self.tab == MainTab::NewTab && self.overlay.is_none() {
+        // 5. [ ✕ New Tab ] / [ + New Tab ] tab pill (matching Termius Screenshot 12, 19, 22, 27)
+        let is_new_tab_active = self.tab == MainTab::NewTab && self.overlay.is_none();
+        let show_new_tab_pill = is_new_tab_active || !self.sessions.is_empty() || show_ws_tab;
+        if show_new_tab_pill {
             let new_tab_item = div()
                 .id("tab-new-tab")
                 .flex()
@@ -4104,23 +4133,45 @@ impl SshDeck {
                 .rounded(px(6.))
                 .cursor_pointer()
                 .flex_shrink_0()
-                .bg(selected_bg)
+                .bg(if is_new_tab_active {
+                    selected_bg
+                } else {
+                    rgb(0x222638)
+                })
                 .border_1()
-                .border_color(selected_border)
-                .text_color(selected_fg)
-                .child(
-                    Button::new("close-new-tab")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
-                        .tooltip("Close tab")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            cx.stop_propagation();
-                            let fallback =
-                                this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
-                            this.select_tab(fallback, window, cx);
-                        })),
-                )
+                .border_color(if is_new_tab_active {
+                    selected_border
+                } else {
+                    rgba(0xffffff14)
+                })
+                .text_color(if is_new_tab_active {
+                    selected_fg
+                } else {
+                    unselected_fg
+                })
+                .when(!is_new_tab_active, |el| el.hover(move |s| s.bg(hover_bg)))
+                .when(is_new_tab_active, |el| {
+                    el.child(
+                        Button::new("close-new-tab")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Close tab")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                let fallback =
+                                    this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
+                                this.select_tab(fallback, window, cx);
+                            })),
+                    )
+                })
+                .when(!is_new_tab_active, |el| {
+                    el.child(
+                        Icon::new(IconName::Plus)
+                            .size(px(12.))
+                            .text_color(unselected_fg),
+                    )
+                })
                 .child(
                     div()
                         .text_size(px(12.))
@@ -4128,7 +4179,10 @@ impl SshDeck {
                         .min_w(px(0.))
                         .truncate()
                         .child("New Tab"),
-                );
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.select_tab(MainTab::NewTab, window, cx);
+                }));
 
             strip = strip.child(new_tab_item);
         }
@@ -7892,12 +7946,12 @@ impl SshDeck {
             };
 
             let tab_bg = if is_active {
-                rgb(0x282b3d)
+                rgb(0x0e3a2f)
             } else {
                 rgb(0x1d2033)
             };
             let tab_fg = if is_active {
-                rgb(0xffffff)
+                rgb(0x10b981)
             } else {
                 rgb(0x8d91a5)
             };
@@ -7918,13 +7972,21 @@ impl SshDeck {
             )))
             .ghost()
             .xsmall()
-            .label("×")
+            .icon(
+                Icon::new(IconName::Close)
+                    .size(px(11.))
+                    .text_color(if is_active {
+                        rgb(0x10b981)
+                    } else {
+                        rgb(0x8d91a5)
+                    }),
+            )
             .tooltip("Close tab")
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.close_session(session_idx, window, cx);
             }));
 
-            let tab_item = div()
+            let mut tab_item = div()
                 .id(SharedString::from(format!(
                     "pane-{pane_index}-tab-{tab_idx}"
                 )))
@@ -7963,24 +8025,33 @@ impl SshDeck {
                             }
                         }
                     }),
-                )
-                .child(div().size(px(6.)).rounded_full().bg(if is_connected {
-                    cx.theme().success
-                } else {
-                    cx.theme().muted_foreground
-                }))
-                .child(drag_btn)
+                );
+
+            if is_active {
+                tab_item = tab_item.child(close_btn);
+            } else {
+                tab_item = tab_item.child(drag_btn);
+            }
+
+            tab_item = tab_item
                 .child(div().max_w(px(140.)).overflow_hidden().child(label))
-                .child(close_btn)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.workspace = workspace_switch_tab(&this.workspace, pane_index, tab_idx);
-                    this.workspace_focus = pane_index;
-                    this.active = Some(session_idx);
-                    if let Some(session) = this.sessions.get(session_idx) {
-                        session.pane.update(cx, |pane, cx| pane.focus(window, cx));
-                    }
-                    cx.notify();
-                }));
+                .when(is_connected, |el| {
+                    el.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)))
+                });
+
+            if !is_active {
+                tab_item = tab_item.child(close_btn);
+            }
+
+            tab_item = tab_item.on_click(cx.listener(move |this, _, window, cx| {
+                this.workspace = workspace_switch_tab(&this.workspace, pane_index, tab_idx);
+                this.workspace_focus = pane_index;
+                this.active = Some(session_idx);
+                if let Some(session) = this.sessions.get(session_idx) {
+                    session.pane.update(cx, |pane, cx| pane.focus(window, cx));
+                }
+                cx.notify();
+            }));
 
             tab_elements.push(tab_item.into_any_element());
         }
@@ -8050,7 +8121,11 @@ impl SshDeck {
         let close_pane_btn = Button::new(SharedString::from(format!("pane-close-{pane_index}")))
             .ghost()
             .xsmall()
-            .icon(IconName::Close)
+            .icon(
+                Icon::new(IconName::Close)
+                    .size(px(12.))
+                    .text_color(rgb(0x10b981)),
+            )
             .tooltip("Close pane")
             .on_click(cx.listener(move |this, _, window, cx| {
                 for &s in close_pane_tabs.iter().rev() {
@@ -8060,39 +8135,121 @@ impl SshDeck {
 
         let single_session_info = if tabs.len() == 1 {
             let session_idx = tabs[0];
-            let (label, username, host_opt) = if let Some(session) = self.sessions.get(session_idx)
-            {
-                let host_opt = self.store.inventory().get(&session.host).cloned();
-                let title = host_opt
-                    .as_ref()
-                    .map(|h| h.label.clone())
-                    .or_else(|| session.status.title.clone())
-                    .unwrap_or_else(|| session.host.to_string());
-                let user = host_opt
-                    .as_ref()
-                    .map(|h| {
-                        if h.username.is_empty() {
-                            "root".to_string()
-                        } else {
-                            h.username.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| "root".to_string());
-                (title, user, host_opt)
-            } else {
-                (format!("Session {session_idx}"), "root".to_string(), None)
-            };
+            let (label, username, host_opt, is_local, is_connected) =
+                if let Some(session) = self.sessions.get(session_idx) {
+                    let is_local = session.host == "local-terminal"
+                        || session.host.starts_with("local-terminal-")
+                        || session.is_local;
+                    let host_opt = self.store.inventory().get(&session.host).cloned();
+                    let title = host_opt
+                        .as_ref()
+                        .map(|h| h.label.clone())
+                        .or_else(|| session.status.title.clone())
+                        .unwrap_or_else(|| {
+                            if is_local {
+                                let num = session
+                                    .host
+                                    .as_str()
+                                    .strip_prefix("local-terminal-")
+                                    .unwrap_or("1");
+                                if num == "1" || num.is_empty() {
+                                    "Local Terminal".to_string()
+                                } else {
+                                    format!("Local Terminal ({num})")
+                                }
+                            } else {
+                                session.host.to_string()
+                            }
+                        });
+                    let user = host_opt
+                        .as_ref()
+                        .map(|h| {
+                            if h.username.is_empty() {
+                                "root".to_string()
+                            } else {
+                                h.username.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            if is_local {
+                                "~".to_string()
+                            } else {
+                                "root".to_string()
+                            }
+                        });
+                    let connected = matches!(session.status.state, SessionState::Connected);
+                    (title, user, host_opt, is_local, connected)
+                } else {
+                    (
+                        format!("Session {session_idx}"),
+                        "root".to_string(),
+                        None,
+                        false,
+                        false,
+                    )
+                };
             let orange = rgb(0xe95420);
-            let tint = host_opt
-                .as_ref()
-                .map(|h| host_os_tint(h, orange.into()))
-                .unwrap_or_else(|| orange.into());
-            Some((session_idx, label, username, tint))
+            let tint = if is_local {
+                rgb(0x282c3f)
+            } else {
+                host_opt
+                    .as_ref()
+                    .map(|h| host_os_tint(h, orange.into()))
+                    .unwrap_or_else(|| orange.into())
+            };
+            Some((session_idx, label, username, tint, is_local, is_connected))
         } else {
             None
         };
 
-        let header_left = if let Some((sess_idx, label, username, tint)) = single_session_info {
+        let header_left = if let Some((sess_idx, label, username, tint, is_local, is_connected)) =
+            single_session_info
+        {
+            let title_color = if is_focused {
+                rgb(0x10b981)
+            } else {
+                rgb(0xd0d4e4)
+            };
+            let icon_element = if is_local {
+                div()
+                    .size(px(18.))
+                    .rounded(px(5.))
+                    .bg(rgb(0x282c3f))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .data(glyph::TERMINAL_PROMPT)
+                            .size(px(11.))
+                            .text_color(if is_focused {
+                                rgb(0x10b981)
+                            } else {
+                                rgb(0x8d91a5)
+                            }),
+                    )
+            } else {
+                div()
+                    .size(px(18.))
+                    .rounded(px(5.))
+                    .bg(tint)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .data(glyph::UBUNTU_SOLID)
+                            .size(px(12.))
+                            .text_color(rgb(0xffffff)),
+                    )
+            };
+
+            let subtitle_text = if is_local {
+                "~".to_string()
+            } else {
+                format!("ssh, {username}")
+            };
+
             div()
                 .id(SharedString::from(format!("pane-hdr-{pane_index}")))
                 .flex()
@@ -8111,26 +8268,12 @@ impl SshDeck {
                     }
                     cx.notify();
                 }))
-                .child(
-                    div()
-                        .size(px(18.))
-                        .rounded(px(5.))
-                        .bg(tint)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            Icon::default()
-                                .data(glyph::UBUNTU_SOLID)
-                                .size(px(12.))
-                                .text_color(rgb(0xffffff)),
-                        ),
-                )
+                .child(icon_element)
                 .child(
                     div()
                         .text_size(px(13.))
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .text_color(rgb(0xffffff))
+                        .text_color(title_color)
                         .truncate()
                         .child(SharedString::from(label)),
                 )
@@ -8138,8 +8281,11 @@ impl SshDeck {
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(0x8d91a5))
-                        .child(SharedString::from(format!("ssh, {username}"))),
+                        .child(SharedString::from(subtitle_text)),
                 )
+                .when(is_connected, |el| {
+                    el.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)))
+                })
                 .into_any_element()
         } else {
             div()
@@ -8158,10 +8304,8 @@ impl SshDeck {
             .flex_row()
             .items_center()
             .h(px(32.))
-            .bg(rgb(0x181b28))
-            .px_2()
-            .border_b_1()
-            .border_color(rgba(0x8d91a530))
+            .bg(rgb(0x131722))
+            .px_3()
             .child(header_left)
             .child(
                 div()
@@ -8187,10 +8331,12 @@ impl SshDeck {
                         )
                     })
                     .when(tabs.len() > 1, |el| el.child(add_btn))
-                    .child(split_h_btn)
-                    .child(split_v_btn)
-                    .child(max_btn)
-                    .child(close_pane_btn),
+                    .when(is_focused, |el| {
+                        el.child(split_h_btn)
+                            .child(split_v_btn)
+                            .child(max_btn)
+                            .child(close_pane_btn)
+                    }),
             );
 
         // 3. Active session pane
