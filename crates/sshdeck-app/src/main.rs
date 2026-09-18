@@ -58,7 +58,16 @@ actions!(
         OpenSettingsAction,
         ZoomInAction,
         ZoomOutAction,
-        ResetZoomAction
+        ResetZoomAction,
+        SelectTab1,
+        SelectTab2,
+        SelectTab3,
+        SelectTab4,
+        SelectTab5,
+        SelectTab6,
+        SelectTab7,
+        SelectTab8,
+        SelectTab9
     ]
 );
 
@@ -98,6 +107,24 @@ fn main() {
                 KeyBinding::new("cmd-+", ZoomInAction, None),
                 KeyBinding::new("cmd--", ZoomOutAction, None),
                 KeyBinding::new("cmd-0", ResetZoomAction, None),
+                KeyBinding::new("cmd-1", SelectTab1, None),
+                KeyBinding::new("ctrl-1", SelectTab1, None),
+                KeyBinding::new("cmd-2", SelectTab2, None),
+                KeyBinding::new("ctrl-2", SelectTab2, None),
+                KeyBinding::new("cmd-3", SelectTab3, None),
+                KeyBinding::new("ctrl-3", SelectTab3, None),
+                KeyBinding::new("cmd-4", SelectTab4, None),
+                KeyBinding::new("ctrl-4", SelectTab4, None),
+                KeyBinding::new("cmd-5", SelectTab5, None),
+                KeyBinding::new("ctrl-5", SelectTab5, None),
+                KeyBinding::new("cmd-6", SelectTab6, None),
+                KeyBinding::new("ctrl-6", SelectTab6, None),
+                KeyBinding::new("cmd-7", SelectTab7, None),
+                KeyBinding::new("ctrl-7", SelectTab7, None),
+                KeyBinding::new("cmd-8", SelectTab8, None),
+                KeyBinding::new("ctrl-8", SelectTab8, None),
+                KeyBinding::new("cmd-9", SelectTab9, None),
+                KeyBinding::new("ctrl-9", SelectTab9, None),
             ]);
             cx.spawn(async move |cx| {
                 cx.open_window(window_options(), |window, cx| {
@@ -1563,6 +1590,8 @@ struct SshDeck {
     vault_info_open: bool,
     /// Search input for the New Tab screen.
     new_tab_query: Entity<InputState>,
+    /// Search input for active terminal session in right sidebar.
+    terminal_search_query: Entity<InputState>,
     /// Selected terminal color theme.
     selected_theme: String,
     /// Terminal font size in pixels. New panes are constructed with it and the
@@ -1726,6 +1755,8 @@ impl SshDeck {
         let draft_port = cx.new(|cx| InputState::new(window, cx).placeholder("port (default 22)"));
         let new_tab_query =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search hosts or tabs"));
+        let terminal_search_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search terminal - ⌘ + F"));
         let hist_who = cx.new(|cx| InputState::new(window, cx).placeholder("User"));
         let hist_where = cx.new(|cx| InputState::new(window, cx).placeholder("Host"));
         let hist_what = cx.new(|cx| InputState::new(window, cx).placeholder("Suggestion..."));
@@ -1770,6 +1801,32 @@ impl SshDeck {
                                 if let Some(first) = filtered.first() {
                                     this.connect((*first).clone(), window, cx);
                                 }
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &terminal_search_query,
+                window,
+                |this, _, event, _window, cx| match event {
+                    InputEvent::Change => {
+                        let query = this.terminal_search_query.read(cx).value().to_string();
+                        if let Some(active) = this.active {
+                            if let Some(session) = this.sessions.get(active) {
+                                session.pane.update(cx, |pane, cx| {
+                                    pane.set_search_query(query, cx);
+                                });
+                            }
+                        }
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        if let Some(active) = this.active {
+                            if let Some(session) = this.sessions.get(active) {
+                                session.pane.update(cx, |pane, cx| {
+                                    pane.next_match(cx);
+                                });
                             }
                         }
                     }
@@ -1874,6 +1931,7 @@ impl SshDeck {
             details_edit_host: None,
             vault_info_open: false,
             new_tab_query,
+            terminal_search_query,
             selected_theme: "Termius Dark".to_string(),
             terminal_font_size: 14.0,
             sidebar_tab: SidebarTab::Snippets,
@@ -1961,14 +2019,66 @@ impl SshDeck {
     fn handle_find_in_terminal(
         &mut self,
         _: &FindInTerminal,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(self.tab, MainTab::Session(_) | MainTab::Workspace) {
+            self.sidebar_open = true;
+            self.sidebar_tab = SidebarTab::Autocomplete;
+            self.terminal_search_query.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+            cx.notify();
+        }
         if let Some(active) = self.active {
             if let Some(session) = self.sessions.get(active) {
                 session.pane.update(cx, |pane, cx| pane.open_search(cx));
             }
         }
+    }
+
+    fn handle_select_tab_n(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        match n {
+            1 => self.select_tab(MainTab::Vaults, window, cx),
+            2 => self.select_tab(MainTab::Sftp, window, cx),
+            _ => {
+                let session_index = n - 3;
+                if session_index < self.sessions.len() {
+                    self.select_tab(MainTab::Session(session_index), window, cx);
+                } else if n == 9 && !self.sessions.is_empty() {
+                    let last = self.sessions.len() - 1;
+                    self.select_tab(MainTab::Session(last), window, cx);
+                }
+            }
+        }
+    }
+
+    fn handle_select_tab_1(&mut self, _: &SelectTab1, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_select_tab_n(1, window, cx);
+    }
+    fn handle_select_tab_2(&mut self, _: &SelectTab2, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_select_tab_n(2, window, cx);
+    }
+    fn handle_select_tab_3(&mut self, _: &SelectTab3, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_select_tab_n(3, window, cx);
+    }
+    fn handle_select_tab_4(&mut self, _: &SelectTab4, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_select_tab_n(4, window, cx);
+    }
+    fn handle_select_tab_5(&mut self, _: &SelectTab5, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_select_tab_n(5, window, cx);
+    }
+    fn handle_select_tab_6(&mut self, _: &SelectTab6, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_select_tab_n(6, window, cx);
+    }
+    fn handle_select_tab_7(&mut self, _: &SelectTab7, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_select_tab_n(7, window, cx);
+    }
+    fn handle_select_tab_8(&mut self, _: &SelectTab8, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_select_tab_n(8, window, cx);
+    }
+    fn handle_select_tab_9(&mut self, _: &SelectTab9, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_select_tab_n(9, window, cx);
     }
 
     fn handle_new_tab(&mut self, _: &NewTabAction, window: &mut Window, cx: &mut Context<Self>) {
@@ -4500,10 +4610,10 @@ impl SshDeck {
 
         if let Some(quick_host) = quick_connect_host {
             connect_pill = connect_pill
-                .bg(rgb(0x2091f6))
+                .bg(rgb(0x1677ff))
                 .text_color(rgb(0xffffff))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(0x1976d2)))
+                .hover(|s| s.bg(rgb(0x0958d9)))
                 .child("Quick Connect")
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.connect(quick_host.clone(), window, cx);
@@ -4511,10 +4621,10 @@ impl SshDeck {
         } else if has_selection {
             let connect_target = selected_id.clone();
             connect_pill = connect_pill
-                .bg(rgb(0x2091f6))
+                .bg(rgb(0x1677ff))
                 .text_color(rgb(0xffffff))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(0x1976d2)))
+                .hover(|s| s.bg(rgb(0x0958d9)))
                 .child("Connect")
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if let Some(host) = connect_target
@@ -4978,7 +5088,7 @@ impl SshDeck {
         let muted = rgb(0x8d9ba3);
         let fg = rgb(0x1d2033);
         let card_bg = rgb(0xffffff);
-        let border_selected = rgb(0x2091f6);
+        let border_selected = rgb(0x1677ff);
         let border_default = rgb(0xe2e8f0);
         let orange = rgb(0xe95420);
         let is_list = self.view_mode == ViewMode::List;
@@ -6042,13 +6152,13 @@ impl SshDeck {
                     Some(
                         Button::new("details-connect")
                             .primary()
-                            .rounded(px(10.))
-                            .with_size(Size::Size(px(17.)))
+                            .rounded(px(8.))
+                            .with_size(Size::Size(px(16.)))
                             .label("Connect")
                             .w_full()
-                            .h(px(46.))
-                            .bg(rgb(0x2091f6))
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .h(px(44.))
+                            .bg(rgb(0x1677ff))
+                            .font_weight(gpui_kit::FontWeight::BOLD)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.connect(host_for_connect.clone(), window, cx);
                             }))
@@ -7223,6 +7333,67 @@ impl SshDeck {
     }
 
     fn render_sidebar_autocomplete(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let search_box = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .h(px(34.))
+            .px_2()
+            .rounded(px(8.))
+            .bg(rgb(0x23273a))
+            .border_1()
+            .border_color(rgba(0xffffff14))
+            .gap_1()
+            .child(
+                Icon::new(IconName::Search)
+                    .size(px(14.))
+                    .text_color(rgb(0x8d91a5)),
+            )
+            .child(
+                div().flex_1().min_w(px(0.)).child(
+                    Input::new(&self.terminal_search_query)
+                        .bordered(false)
+                        .cleanable(true),
+                ),
+            )
+            .child(
+                Button::new("btn-term-search-prev")
+                    .ghost()
+                    .xsmall()
+                    .icon(
+                        Icon::new(IconName::ChevronUp)
+                            .size(px(12.))
+                            .text_color(rgb(0x8d91a5)),
+                    )
+                    .tooltip("Previous match (Shift+Enter)")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(active) = this.active {
+                            if let Some(session) = this.sessions.get(active) {
+                                session.pane.update(cx, |pane, cx| pane.prev_match(cx));
+                            }
+                        }
+                    })),
+            )
+            .child(
+                Button::new("btn-term-search-next")
+                    .ghost()
+                    .xsmall()
+                    .icon(
+                        Icon::new(IconName::ChevronDown)
+                            .size(px(12.))
+                            .text_color(rgb(0x8d91a5)),
+                    )
+                    .tooltip("Next match (Enter)")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(active) = this.active {
+                            if let Some(session) = this.sessions.get(active) {
+                                session.pane.update(cx, |pane, cx| pane.next_match(cx));
+                            }
+                        }
+                    })),
+            );
+
         let chip = div()
             .px_2()
             .py_0p5()
@@ -7267,6 +7438,9 @@ impl SshDeck {
             .w_full()
             .px_3()
             .py_2()
+            .gap_2()
+            .child(search_box)
+            .child(div().w_full().h(px(1.)).bg(rgba(0xffffff10)))
             .child(Self::sidebar_row(
                 "Autocomplete",
                 "Ghost-text suggestions as you type in terminal",
@@ -9052,6 +9226,15 @@ impl Render for SshDeck {
             .on_action(cx.listener(Self::handle_zoom_in))
             .on_action(cx.listener(Self::handle_zoom_out))
             .on_action(cx.listener(Self::handle_reset_zoom))
+            .on_action(cx.listener(Self::handle_select_tab_1))
+            .on_action(cx.listener(Self::handle_select_tab_2))
+            .on_action(cx.listener(Self::handle_select_tab_3))
+            .on_action(cx.listener(Self::handle_select_tab_4))
+            .on_action(cx.listener(Self::handle_select_tab_5))
+            .on_action(cx.listener(Self::handle_select_tab_6))
+            .on_action(cx.listener(Self::handle_select_tab_7))
+            .on_action(cx.listener(Self::handle_select_tab_8))
+            .on_action(cx.listener(Self::handle_select_tab_9))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 if let Some((start_idx, start_pos)) = this.tab_drag_start {
                     if event.dragging() {

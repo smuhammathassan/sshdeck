@@ -1139,6 +1139,26 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// Sets or clears the active search query on this terminal pane.
+    pub fn set_search_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if query.is_empty() {
+            self.search = None;
+        } else {
+            self.search = Some(Search { query, current: 0 });
+        }
+        cx.notify();
+    }
+
+    /// Advances to the next search match in this terminal.
+    pub fn next_match(&mut self, cx: &mut Context<Self>) {
+        self.advance_match(true, cx);
+    }
+
+    /// Advances to the previous search match in this terminal.
+    pub fn prev_match(&mut self, cx: &mut Context<Self>) {
+        self.advance_match(false, cx);
+    }
+
     /// Writes raw bytes into the active session transport, if connected.
     pub fn write(&mut self, bytes: &[u8]) {
         if let Some(session) = &self.session {
@@ -1170,13 +1190,8 @@ impl TerminalPane {
     /// The 28pt per-pane header: glyph + truncating title + `~` + green focus
     /// dot, with a split/max/close cluster on the right.
     ///
-    /// The 28pt header always shows its split/maximize/close cluster as three
-    /// 14px icon buttons (~28pt targets): the reference keeps them visible on
-    /// every tile, and hiding them until hover would need hover-group
-    /// machinery this pane does not have. `Icon::data` raw SVGs bypass the
-    /// bundled asset set, which ships no split/expand glyphs. The title
-    /// carries `flex_1` + `min_w(0)` + `truncate` so a long host label
-    /// ellipsizes instead of pushing the cluster out.
+    /// The cluster is conditionally displayed when the pane is focused, matching
+    /// Termius multi-pane behavior.
     fn render_pane_header(&self, focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self
             .header_title
@@ -1229,25 +1244,25 @@ impl TerminalPane {
             .child(div().text_size(px(12.)).text_color(muted).child("~"))
             .when(focused, |el| {
                 el.child(div().size(px(6.)).rounded_full().bg(dot))
+                    .child(action(
+                        "pane-split",
+                        "Split terminal",
+                        glyph::SPLIT,
+                        PaneHeaderAction::Split,
+                    ))
+                    .child(action(
+                        "pane-max",
+                        "Maximize pane",
+                        glyph::EXPAND,
+                        PaneHeaderAction::Maximize,
+                    ))
+                    .child(action(
+                        "pane-close",
+                        "Close pane",
+                        glyph::CLOSE_X,
+                        PaneHeaderAction::Close,
+                    ))
             })
-            .child(action(
-                "pane-split",
-                "Split terminal",
-                glyph::SPLIT,
-                PaneHeaderAction::Split,
-            ))
-            .child(action(
-                "pane-max",
-                "Maximize pane",
-                glyph::EXPAND,
-                PaneHeaderAction::Maximize,
-            ))
-            .child(action(
-                "pane-close",
-                "Close pane",
-                glyph::CLOSE_X,
-                PaneHeaderAction::Close,
-            ))
     }
 
     /// Applies a new grid size to both the local parser and the remote PTY.
