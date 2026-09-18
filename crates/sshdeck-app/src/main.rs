@@ -350,7 +350,12 @@ pub fn parse_quick_connect(raw: &str) -> Option<Host> {
         address = raw.to_string();
     } else if raw.eq_ignore_ascii_case("localhost") {
         address = "localhost".to_string();
-    } else if raw.contains('.') && !raw.contains(' ') && raw.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
+    } else if raw.contains('.')
+        && !raw.contains(' ')
+        && raw
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
         address = raw.to_string();
     } else {
         return None;
@@ -1675,17 +1680,15 @@ impl SshDeck {
         // Re-render the list as the query changes; the filter itself is applied
         // in `render`, so no filtered copy needs to be kept in state.
         let subscriptions = vec![
-            cx.subscribe_in(&filter, window, |this, _, event, window, cx| {
-                match event {
-                    InputEvent::Change => cx.notify(),
-                    InputEvent::PressEnter { .. } => {
-                        let filter_val = this.filter.read(cx).value().trim().to_string();
-                        if let Some(host) = parse_quick_connect(&filter_val) {
-                            this.connect(host, window, cx);
-                        }
+            cx.subscribe_in(&filter, window, |this, _, event, window, cx| match event {
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } => {
+                    let filter_val = this.filter.read(cx).value().trim().to_string();
+                    if let Some(host) = parse_quick_connect(&filter_val) {
+                        this.connect(host, window, cx);
                     }
-                    _ => {}
                 }
+                _ => {}
             }),
             cx.subscribe_in(&new_tab_query, window, |_, _, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -1918,7 +1921,12 @@ impl SshDeck {
         cx.notify();
     }
 
-    fn handle_reset_zoom(&mut self, _: &ResetZoomAction, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_reset_zoom(
+        &mut self,
+        _: &ResetZoomAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.set_terminal_font_size(14.0, window, cx);
         cx.notify();
     }
@@ -2398,29 +2406,31 @@ impl SshDeck {
             pane.set_header_title(host.label.clone());
             let weak_action = weak.clone();
             pane.set_on_pane_action(move |action, pane, window, cx| {
-                weak_action.update(cx, |this, cx| {
-                    this.pane_action(action, pane, window, cx);
-                })
-                .ok();
+                weak_action
+                    .update(cx, |this, cx| {
+                        this.pane_action(action, pane, window, cx);
+                    })
+                    .ok();
             });
             let weak_bc = weak.clone();
             let pane_entity = pane_handle.clone();
             pane.set_on_broadcast(move |bytes, _pane, cx| {
-                weak_bc.update(cx, |this, cx| {
-                    if this.broadcast_mode {
-                        let leaves = workspace_leaves(&this.workspace);
-                        for &idx in &leaves {
-                            if let Some(s) = this.sessions.get(idx) {
-                                if s.pane != pane_entity {
-                                    s.pane.update(cx, |p, _| {
-                                        p.write(bytes);
-                                    });
+                weak_bc
+                    .update(cx, |this, cx| {
+                        if this.broadcast_mode {
+                            let leaves = workspace_leaves(&this.workspace);
+                            for &idx in &leaves {
+                                if let Some(s) = this.sessions.get(idx) {
+                                    if s.pane != pane_entity {
+                                        s.pane.update(cx, |p, _| {
+                                            p.write(bytes);
+                                        });
+                                    }
                                 }
                             }
                         }
-                    }
-                })
-                .ok();
+                    })
+                    .ok();
             });
         });
         // Re-render the chrome whenever the pane's status changes. The pane is
@@ -6158,7 +6168,10 @@ impl SshDeck {
             .map(|(id, label, secondary)| {
                 let select_id = id.clone();
                 let row_pane = pane.clone();
-                let cmd = pane.read(cx).command_of(&id).unwrap_or_else(|| secondary.clone());
+                let cmd = pane
+                    .read(cx)
+                    .command_of(&id)
+                    .unwrap_or_else(|| secondary.clone());
                 div()
                     .id(SharedString::from(format!(
                         "side-snippet-{}",
@@ -6227,8 +6240,11 @@ impl SshDeck {
                             .tooltip("Run in Terminal")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.broadcast_send_text(&cmd, cx);
-                                window.push_notification(Notification::success("Snippet sent to terminal"), cx);
-                            }))
+                                window.push_notification(
+                                    Notification::success("Snippet sent to terminal"),
+                                    cx,
+                                );
+                            })),
                     )
                     .into_any_element()
             })
@@ -6488,8 +6504,13 @@ impl SshDeck {
                                     .icon(IconName::Copy)
                                     .tooltip("Copy command")
                                     .on_click(cx.listener(move |_, _, window, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(copy_cmd.clone()));
-                                        window.push_notification(Notification::info("Copied to clipboard"), cx);
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_cmd.clone(),
+                                        ));
+                                        window.push_notification(
+                                            Notification::info("Copied to clipboard"),
+                                            cx,
+                                        );
                                     })),
                             )
                             .child(
@@ -6500,7 +6521,10 @@ impl SshDeck {
                                     .tooltip("Run in Terminal")
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.broadcast_send_text(&cmd, cx);
-                                        window.push_notification(Notification::success("Command sent to terminal"), cx);
+                                        window.push_notification(
+                                            Notification::success("Command sent to terminal"),
+                                            cx,
+                                        );
                                     })),
                             ),
                     )
@@ -6824,14 +6848,18 @@ impl SshDeck {
             .child(
                 Button::new("ws-broadcast")
                     .small()
-                    .when(self.broadcast_mode, |btn| {
-                        btn.primary()
+                    .when(self.broadcast_mode, |btn| btn.primary())
+                    .when(!self.broadcast_mode, |btn| btn.ghost())
+                    .label(if self.broadcast_mode {
+                        "Broadcast: ON"
+                    } else {
+                        "Broadcast"
                     })
-                    .when(!self.broadcast_mode, |btn| {
-                        btn.ghost()
+                    .tooltip(if self.broadcast_mode {
+                        "Broadcast mode is active: typing goes to all panes"
+                    } else {
+                        "Toggle broadcast mode (send input to all open panes)"
                     })
-                    .label(if self.broadcast_mode { "Broadcast: ON" } else { "Broadcast" })
-                    .tooltip(if self.broadcast_mode { "Broadcast mode is active: typing goes to all panes" } else { "Toggle broadcast mode (send input to all open panes)" })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.broadcast_mode = !this.broadcast_mode;
                         cx.notify();
