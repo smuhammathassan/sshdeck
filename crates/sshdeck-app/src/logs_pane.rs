@@ -74,7 +74,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rgb, AppContext as _, Context, Div, Entity, FocusHandle, Focusable as _, Hsla,
+    div, px, rgb, rgba, AppContext as _, Context, Div, Entity, FocusHandle, Focusable as _, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
     Subscription, Window,
 };

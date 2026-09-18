@@ -8137,9 +8137,8 @@ impl SshDeck {
             let session_idx = tabs[0];
             let (label, username, host_opt, is_local, is_connected) =
                 if let Some(session) = self.sessions.get(session_idx) {
-                    let is_local = session.host == "local-terminal"
-                        || session.host.starts_with("local-terminal-")
-                        || session.is_local;
+                    let is_local = session.host.as_str() == "local-terminal"
+                        || session.host.as_str().starts_with("local-terminal-");
                     let host_opt = self.store.inventory().get(&session.host).cloned();
                     let title = host_opt
                         .as_ref()
@@ -8190,7 +8189,7 @@ impl SshDeck {
                 };
             let orange = rgb(0xe95420);
             let tint = if is_local {
-                rgb(0x282c3f)
+                rgb(0x282c3f).into()
             } else {
                 host_opt
                     .as_ref()
