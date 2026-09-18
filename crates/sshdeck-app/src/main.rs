@@ -8027,21 +8027,22 @@ impl SshDeck {
                     }),
                 );
 
-            if is_active {
-                tab_item = tab_item.child(close_btn);
+            tab_item = if is_active {
+                tab_item
+                    .child(close_btn)
+                    .child(div().max_w(px(140.)).overflow_hidden().child(label))
+                    .when(is_connected, |el| {
+                        el.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)))
+                    })
             } else {
-                tab_item = tab_item.child(drag_btn);
-            }
-
-            tab_item = tab_item
-                .child(div().max_w(px(140.)).overflow_hidden().child(label))
-                .when(is_connected, |el| {
-                    el.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)))
-                });
-
-            if !is_active {
-                tab_item = tab_item.child(close_btn);
-            }
+                tab_item
+                    .child(drag_btn)
+                    .child(div().max_w(px(140.)).overflow_hidden().child(label))
+                    .when(is_connected, |el| {
+                        el.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)))
+                    })
+                    .child(close_btn)
+            };
 
             tab_item = tab_item.on_click(cx.listener(move |this, _, window, cx| {
                 this.workspace = workspace_switch_tab(&this.workspace, pane_index, tab_idx);
