@@ -1531,6 +1531,7 @@ struct SshDeck {
     /// inline form: three inputs plus a visibility flag.
     history: Vec<String>,
     history_form_open: bool,
+    autocomplete_enabled: bool,
     hist_who: Entity<InputState>,
     hist_where: Entity<InputState>,
     hist_what: Entity<InputState>,
@@ -1801,8 +1802,9 @@ impl SshDeck {
             workspace_maximized: false,
             broadcast_mode: false,
             dragged_tab: None,
-            history: Vec::new(),
+            history: crate::snippets_pane::read_recent_shell_history(),
             history_form_open: false,
+            autocomplete_enabled: sshdeck_config::Settings::load().autocomplete_enabled(),
             hist_who,
             hist_where,
             hist_what,
@@ -3124,34 +3126,12 @@ impl SshDeck {
         let header_fg = rgb(0xffffff);
         let win_w = f32::from(window.bounds().size.width);
 
-        let update_pill = div()
-            .id("btn-update")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1p5()
-            .px_2p5()
-            .h(px(30.))
-            .rounded_full()
-            .bg(rgb(0x282b3d))
-            .border_1()
-            .border_color(rgba(0x8d91a540))
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x3e4257)))
-            .child(div().text_xs().text_color(rgb(0xffffff)).child("Update"))
-            .on_click(|_, window, cx| {
-                window.push_notification(Notification::info("sshdeck is up to date"), cx);
-            });
-
         let actions = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
             .flex_shrink_0()
-            // The Update pill is decorative; hide it below ~700px so the tab
-            // strip and the `+` control keep their room.
-            .when(win_w >= 700.0, |el| el.child(update_pill))
             .child(
                 Button::new("command-palette-btn")
                     .ghost()
@@ -3684,6 +3664,7 @@ impl SshDeck {
     /// Visually quiet: no background fill of its own, a lighter active tab
     /// (`#282b3d`, `tab.active.background`), `12px` text. Always rendered,
     /// even with a single tab — the original always shows it.
+    #[allow(dead_code)]
     fn render_pane_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_bg = cx.theme().muted; // #282b3d `tab.active.background`
         let active_fg = cx.theme().foreground; // #ffffff `tab.active.foreground`
@@ -4004,7 +3985,7 @@ impl SshDeck {
                 .child(connect_pill),
         );
 
-        // Toolbar row: + New host (merged split), Terminal, Serial; right view toggles + MH avatar.
+        // Toolbar row: + New host (merged split), Terminal; right view toggles + MH avatar.
         // Termius tokens: split-button bg #e6ebed, hairline border #d5dde0,
         // accent #2091f6, avatar orange #e67e22.
         let toolbar = div()
@@ -6336,21 +6317,51 @@ impl SshDeck {
     fn render_sidebar_autocomplete(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let chip = div()
             .px_2()
-            .py_1()
+            .py_0p5()
             .rounded_full()
             .bg(rgb(0x223636))
             .text_size(px(10.))
             .text_color(cx.theme().success)
             .child("BETA");
-        let control = div().flex().flex_row().items_center().gap_2().child(chip);
+
+        let is_enabled = self.autocomplete_enabled;
+        let toggle_btn = Button::new("side-toggle-autocomplete")
+            .small()
+            .label(if is_enabled { "Enabled" } else { "Disabled" })
+            .selected(is_enabled)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.autocomplete_enabled = !this.autocomplete_enabled;
+                let mut cfg = sshdeck_config::Settings::load();
+                cfg.set_autocomplete_enabled(this.autocomplete_enabled);
+                let _ = cfg.save();
+                window.push_notification(
+                    Notification::info(if this.autocomplete_enabled {
+                        "Autocomplete enabled"
+                    } else {
+                        "Autocomplete disabled"
+                    }),
+                    cx,
+                );
+                cx.notify();
+            }));
+
+        let control = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(chip)
+            .child(toggle_btn);
+
         div()
             .flex()
             .flex_col()
             .w_full()
             .px_3()
+            .py_2()
             .child(Self::sidebar_row(
                 "Autocomplete",
-                "Ghost-text suggestions as you type",
+                "Ghost-text suggestions as you type in terminal",
                 control,
                 cx,
             ))
@@ -7004,9 +7015,9 @@ impl SshDeck {
     ) -> AnyElement {
         let is_focused = self.workspace_focus == pane_index;
         let border_color = if is_focused {
-            cx.theme().primary
+            rgb(0x10b981)
         } else {
-            cx.theme().border
+            rgba(0x8d91a530)
         };
         let tabs_vec = tabs.to_vec();
 
@@ -7761,7 +7772,6 @@ impl Render for SshDeck {
 
         let header = self.render_header(window, cx);
         let sidebar = self.render_sidebar(window, cx);
-        let pane_tabs = self.render_pane_tabs(cx);
         let main = self.render_main(window, cx);
         let add_host_sheet = self.render_add_host_sheet(window, cx);
         let palette = self.palette.clone();
@@ -7808,10 +7818,6 @@ impl Render for SshDeck {
                             .flex_1()
                             .min_w(px(0.))
                             .overflow_hidden()
-                            .when(
-                                matches!(self.tab, MainTab::Session(_) | MainTab::Workspace),
-                                |el| el.child(pane_tabs),
-                            )
                             .child(main),
                     ),
             )

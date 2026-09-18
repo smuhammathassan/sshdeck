@@ -122,6 +122,7 @@ mod glyph {
     #[allow(dead_code)]
     pub const LIST: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="5" width="18" height="4" rx="2"/><rect x="3" y="10" width="18" height="4" rx="2"/><rect x="3" y="15" width="18" height="4" rx="2"/></svg>"#;
     pub const FINGERPRINT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a7 7 0 0 1 7 7v3"/><path d="M12 9a3 3 0 0 1 3 3v6"/><path d="M5 12a7 7 0 0 1 7-7"/><path d="M9 12a3 3 0 0 1 1.5-2.6"/></svg>"#;
+    #[allow(dead_code)]
     pub const SECURITY_KEY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="3" width="12" height="16" rx="3"/><circle cx="12" cy="14" r="2.5"/><path d="M10 7.5h4"/></svg>"#;
 }
 
@@ -783,22 +784,6 @@ impl KeysPane {
                                 this.cert_only = !this.cert_only;
                                 cx.notify();
                             })),
-                    )
-                    .child(
-                        Button::new("keys-touch-id")
-                            .ghost()
-                            .icon(Icon::default().data(glyph::FINGERPRINT))
-                            .label("Touch ID")
-                            .tooltip("macOS Touch ID / Secure Enclave (not yet supported)")
-                            .disabled(true),
-                    )
-                    .child(
-                        Button::new("keys-fido2")
-                            .ghost()
-                            .icon(Icon::default().data(glyph::SECURITY_KEY))
-                            .label("FIDO2")
-                            .tooltip("FIDO2 / U2F security keys (not yet supported)")
-                            .disabled(true),
                     );
             }
             KeysSection::Hosts => {

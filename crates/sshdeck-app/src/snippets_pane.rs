@@ -174,7 +174,59 @@ pub struct SnippetsPane {
     search_open: bool,
     sort_alpha: bool,
     view_list: bool,
+    show_shell_history: bool,
+    history_entries: Vec<String>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Reads the most recent commands from the user's shell history file
+/// (`~/.zsh_history` on macOS / zsh, or `~/.bash_history` on bash).
+pub fn read_recent_shell_history() -> Vec<String> {
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => h,
+        _ => return Vec::new(),
+    };
+    let home_path = std::path::Path::new(&home);
+    let zsh_hist = home_path.join(".zsh_history");
+    let bash_hist = home_path.join(".bash_history");
+
+    let contents = if zsh_hist.exists() {
+        std::fs::read(&zsh_hist).unwrap_or_default()
+    } else if bash_hist.exists() {
+        std::fs::read(&bash_hist).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    if contents.is_empty() {
+        return Vec::new();
+    }
+
+    let text = String::from_utf8_lossy(&contents);
+    let mut commands = Vec::new();
+
+    for line in text.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let cmd = if trimmed.starts_with(':') {
+            if let Some((_, after)) = trimmed.split_once(';') {
+                after.trim()
+            } else {
+                trimmed
+            }
+        } else {
+            trimmed
+        };
+        if !cmd.is_empty() && !commands.iter().any(|c| c == cmd) {
+            commands.push(cmd.to_string());
+            if commands.len() >= 100 {
+                break;
+            }
+        }
+    }
+    commands
 }
 
 impl SnippetsPane {
@@ -232,6 +284,8 @@ impl SnippetsPane {
             search_open: false,
             sort_alpha: false,
             view_list: false,
+            show_shell_history: false,
+            history_entries: Vec::new(),
             _subscriptions: subscriptions,
         };
         // Select the first snippet if any, so the variable form is visible on open.
@@ -645,9 +699,6 @@ impl SnippetsPane {
                                     })),
                             ),
                     )
-                    // ponytail: the session sidebar owns shell history and this
-                    // pane has no handle to it, so the button stays disabled
-                    // until the root view plumbs a sidebar-history callback in.
                     .child(
                         Button::new("snippets-history")
                             .ghost()
@@ -655,8 +706,20 @@ impl SnippetsPane {
                             .icon(Icon::default().data(glyph::CLOCK))
                             .label("Shell History")
                             .text_size(px(14.))
-                            .disabled(true)
-                            .tooltip("Shell history lives in the session sidebar"),
+                            .selected(self.show_shell_history)
+                            .tooltip(if self.show_shell_history {
+                                "Return to snippets"
+                            } else {
+                                "View recent shell history and convert to snippets"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_shell_history = !this.show_shell_history;
+                                if this.show_shell_history {
+                                    this.form_open = false;
+                                    this.history_entries = read_recent_shell_history();
+                                }
+                                cx.notify();
+                            })),
                     ),
             )
             .child(
@@ -1427,6 +1490,156 @@ impl SnippetsPane {
             "Save your most used commands as snippets to reuse them in one click.",
         )
     }
+
+    fn render_shell_history(&self, cx: &mut Context<Self>) -> Div {
+        let filter_query = self.search_input.read(cx).value().to_lowercase();
+        let entries: Vec<String> = self
+            .history_entries
+            .iter()
+            .filter(|cmd| {
+                if filter_query.is_empty() {
+                    true
+                } else {
+                    cmd.to_lowercase().contains(&filter_query)
+                }
+            })
+            .cloned()
+            .collect();
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scrollbar()
+            .p_4()
+            .gap_2()
+            .when(entries.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .py_12()
+                        .gap_2()
+                        .child(
+                            div()
+                                .size(px(48.))
+                                .rounded(px(10.))
+                                .bg(glyph_bg())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::default()
+                                        .data(glyph::CLOCK)
+                                        .size(px(24.))
+                                        .text_color(rgb(0xffffff)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                .text_size(px(16.))
+                                .child("No shell history found"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Commands from ~/.zsh_history or ~/.bash_history will appear here"),
+                        ),
+                )
+            })
+            .children(entries.into_iter().enumerate().map(|(idx, cmd)| {
+                let cmd_str = cmd.clone();
+                let copy_str = cmd.clone();
+                let save_str = cmd.clone();
+                let has_exec = self.on_execute.is_some();
+                let exec_fn = self.on_execute.clone();
+                div()
+                    .id(SharedString::from(format!("shell-hist-row-{idx}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .px_3()
+                    .py_2p5()
+                    .bg(cx.theme().popover)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(px(8.))
+                    .hover(|s| s.bg(cx.theme().muted))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_family("Menlo")
+                            .text_size(px(13.))
+                            .text_color(cx.theme().foreground)
+                            .child(SharedString::from(cmd_str.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                Button::new(SharedString::from(format!("shell-save-{idx}")))
+                                    .small()
+                                    .icon(IconName::Plus)
+                                    .label("Save snippet")
+                                    .tooltip("Save as new snippet")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.draft_template.update(cx, |state, cx| {
+                                            state.set_value(&save_str, window, cx);
+                                        });
+                                        let label = if save_str.len() > 30 {
+                                            format!("{}…", &save_str[..30])
+                                        } else {
+                                            save_str.clone()
+                                        };
+                                        this.draft_label.update(cx, |state, cx| {
+                                            state.set_value(&label, window, cx);
+                                        });
+                                        this.editing = None;
+                                        this.form_open = true;
+                                        this.show_shell_history = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("shell-copy-{idx}")))
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::Copy)
+                                    .tooltip("Copy to clipboard")
+                                    .on_click(cx.listener(move |_, _, window, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(copy_str.clone()));
+                                        window.push_notification(Notification::info("Copied command to clipboard"), cx);
+                                    })),
+                            )
+                            .when(has_exec, |el| {
+                                el.child(
+                                    Button::new(SharedString::from(format!("shell-run-{idx}")))
+                                        .small()
+                                        .ghost()
+                                        .icon(IconName::Play)
+                                        .tooltip("Run in active terminal")
+                                        .on_click(cx.listener(move |_, _, window, cx| {
+                                            if let Some(handler) = &exec_fn {
+                                                handler(&cmd_str, window, cx);
+                                            }
+                                        })),
+                                )
+                            }),
+                    )
+            }))
+    }
 }
 
 impl Render for SnippetsPane {
@@ -1441,6 +1654,8 @@ impl Render for SnippetsPane {
 
         let body: AnyElement = if form_open {
             self.render_form(cx).into_any_element()
+        } else if self.show_shell_history {
+            self.render_shell_history(cx).into_any_element()
         } else if !has_snippets {
             self.render_empty(cx).into_any_element()
         } else {

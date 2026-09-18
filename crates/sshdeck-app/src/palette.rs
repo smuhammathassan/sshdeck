@@ -157,7 +157,7 @@ impl Command {
             label,
             keywords,
             shortcut: None,
-            kind: Kind::Unavailable("Not implemented"),
+            kind: Kind::Host,
         }
     }
 
