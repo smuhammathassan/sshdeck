@@ -81,6 +81,17 @@ use sshdeck_core::session::Session;
 /// create loop cannot grow the process without bound.
 const MAX_FORWARDS: usize = 64;
 
+/// Card columns for the available width: 1-up narrow, 2-up medium, 3-up wide.
+fn card_cols(win_w: f32) -> usize {
+    if win_w < 520.0 {
+        1
+    } else if win_w < 860.0 {
+        2
+    } else {
+        3
+    }
+}
+
 /// Which OpenSSH grammar a spec is parsed with.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ForwardKind {
@@ -445,10 +456,12 @@ impl ForwardPane {
         div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .justify_between()
-            .h(px(56.))
+            .min_h(px(56.))
             .px_3()
+            .py_1()
             .flex_shrink_0()
             .bg(cx.theme().popover)
             .border_b_1()
@@ -463,6 +476,7 @@ impl ForwardPane {
                         Button::new("forward-new")
                             .icon(IconName::Plus)
                             .label("New forwarding")
+                            .small()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.form_open = !this.form_open;
                                 if !this.form_open {
@@ -473,8 +487,8 @@ impl ForwardPane {
                     )
                     .child(
                         Button::new("forward-new-caret")
-                            .ghost()
                             .icon(IconName::ChevronDown)
+                            .small()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.form_open = !this.form_open;
                                 if !this.form_open {
@@ -645,7 +659,7 @@ impl ForwardPane {
     }
 
     /// The list or card grid, or whichever state stands in for it.
-    fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_body(&self, win_w: f32, cx: &mut Context<Self>) -> AnyElement {
         if self.forwards.is_empty() {
             return empty_state(
                 cx,
@@ -690,17 +704,40 @@ impl ForwardPane {
                 .iter()
                 .map(|row| self.render_card(row, cx).into_any_element())
                 .collect();
+            // Chunked rows so narrow windows drop 3-up to 2-up to 1-up.
+            // `AnyElement` is not `Clone`, so the cards are consumed in order
+            // rather than copied out of borrowed chunks.
+            let cols = card_cols(win_w).max(1);
+            let mut grid_rows: Vec<AnyElement> = Vec::new();
+            let mut cards = cards.into_iter();
+            loop {
+                let mut row_cards: Vec<AnyElement> = cards.by_ref().take(cols).collect();
+                if row_cards.is_empty() {
+                    break;
+                }
+                while row_cards.len() < cols {
+                    row_cards.push(div().flex_1().into_any_element());
+                }
+                grid_rows.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_3()
+                        .w_full()
+                        .children(row_cards)
+                        .into_any_element(),
+                );
+            }
             div()
                 .id("forward-grid")
                 .flex()
-                .flex_row()
-                .flex_wrap()
+                .flex_col()
                 .gap_3()
                 .p_3()
                 .flex_1()
                 .min_h(px(0.))
                 .overflow_y_scrollbar()
-                .children(cards)
+                .children(grid_rows)
                 .into_any_element()
         } else {
             let rows: Vec<AnyElement> = visible
@@ -764,7 +801,8 @@ impl ForwardPane {
             .flex_col()
             .justify_between()
             .gap_2()
-            .w(px(280.))
+            .flex_1()
+            .min_w(px(220.))
             .min_h(px(90.))
             .p_3()
             .rounded(px(10.))
@@ -916,10 +954,11 @@ impl ForwardPane {
 }
 
 impl Render for ForwardPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let background = cx.theme().sidebar;
         let foreground = cx.theme().foreground;
         let form_open = self.form_open;
+        let win_w = f32::from(window.bounds().size.width);
 
         div()
             .flex()
@@ -933,25 +972,32 @@ impl Render for ForwardPane {
             .when(self.search_open, |el| {
                 el.child(
                     div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
                         .px_3()
                         .py_2()
                         .border_b_1()
                         .border_color(cx.theme().border)
                         .bg(cx.theme().popover)
                         .child(
-                            Input::new(&self.search_input)
-                                .small()
-                                .cleanable(true)
-                                .prefix(
-                                    Icon::new(IconName::Search)
-                                        .small()
-                                        .text_color(cx.theme().muted_foreground),
-                                ),
+                            div().flex_1().min_w(px(120.)).child(
+                                Input::new(&self.search_input)
+                                    .small()
+                                    .cleanable(true)
+                                    .prefix(
+                                        Icon::new(IconName::Search)
+                                            .small()
+                                            .text_color(cx.theme().muted_foreground),
+                                    ),
+                            ),
                         ),
                 )
             })
             .when(form_open, |el| el.child(self.render_form(cx)))
-            .child(self.render_body(cx))
+            .child(self.render_body(win_w, cx))
     }
 }
 
@@ -1049,6 +1095,13 @@ mod tests {
             target_host: "db.internal".into(),
             target_port: 5432,
         }
+    }
+
+    #[test]
+    fn card_grid_drops_columns_on_narrow_windows() {
+        assert_eq!(card_cols(400.0), 1);
+        assert_eq!(card_cols(520.0), 2);
+        assert_eq!(card_cols(860.0), 3);
     }
 
     #[test]

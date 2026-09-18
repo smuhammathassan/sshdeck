@@ -597,7 +597,7 @@ impl PaletteView {
 }
 
 impl Render for PaletteView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Every colour here is a theme token: `background` is the white panel,
         // `muted` the filled search row and the selected row, `muted_foreground`
         // the secondary text, `border` the hairline. No literals, no shadow.
@@ -681,7 +681,10 @@ impl Render for PaletteView {
 
         // `main.rs` centres the palette horizontally and anchors it near the
         // top; this root adds the window gutter and caps the panel at the
-        // reference width so a narrow window still has breathing room.
+        // reference width (or 90% of the window when narrower) so a narrow
+        // window still has breathing room.
+        let win_w = f32::from(window.bounds().size.width);
+        let cap = (win_w * 0.9).min(720.0).max(200.0);
         div()
             .flex()
             .flex_col()
@@ -697,7 +700,7 @@ impl Render for PaletteView {
                     .flex()
                     .flex_col()
                     .w_full()
-                    .max_w(px(720.))
+                    .max_w(px(cap))
                     .max_h(px(430.))
                     .overflow_hidden()
                     .rounded_lg()

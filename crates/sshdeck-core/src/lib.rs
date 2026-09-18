@@ -109,6 +109,15 @@ pub struct Host {
     pub auth: AuthMethod,
     /// Label of another host to tunnel through, resolved at connect time.
     pub proxy_jump: Option<String>,
+    /// Transport protocols offered for this host (`ssh`, plus `telnet` when
+    /// the user adds it). Predates some inventory files on disk, so it
+    /// defaults to `ssh` rather than an empty list.
+    #[serde(default = "default_protocols")]
+    pub protocols: Vec<String>,
+}
+
+fn default_protocols() -> Vec<String> {
+    vec!["ssh".to_string()]
 }
 
 impl Host {
@@ -126,7 +135,13 @@ impl Host {
             tags: Vec::new(),
             auth: AuthMethod::Agent,
             proxy_jump: None,
+            protocols: default_protocols(),
         }
+    }
+
+    /// Transport protocols in stored order.
+    pub fn protocols(&self) -> &[String] {
+        &self.protocols
     }
 
     /// `user@host:port`, collapsing the port when it is the SSH default.
@@ -457,6 +472,24 @@ mod tests {
         assert_eq!(reloaded.inventory().hosts()[0].label, "Staging");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn protocols_default_to_ssh_and_survive_serde() {
+        let host = Host::new("web", "example.com");
+        assert_eq!(host.protocols(), &["ssh".to_string()]);
+        // Inventory files written before the field existed load as SSH.
+        let legacy: Host = serde_json::from_str(
+            r#"{"id":"web","label":"web","address":"example.com","port":22,"username":"root","auth":{"kind":"agent"}}"#,
+        )
+        .expect("legacy host parses");
+        assert_eq!(legacy.protocols(), &["ssh".to_string()]);
+        // And a round trip keeps an added protocol.
+        let mut host = Host::new("web", "example.com");
+        host.protocols.push("telnet".to_string());
+        let back: Host = serde_json::from_str(&serde_json::to_string(&host).expect("serializes"))
+            .expect("parses");
+        assert_eq!(back.protocols(), &["ssh".to_string(), "telnet".to_string()]);
     }
 
     #[test]

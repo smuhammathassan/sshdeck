@@ -8,7 +8,7 @@
 //! because the Termius layout is specific: a 12px uppercase `muted_foreground`
 //! section header, a 14px primary label with a 12px `muted_foreground`
 //! description beneath it, the control right-aligned and vertically centred,
-//! and a 1px `#8d91a51a` hairline between rows instead of a card border.
+//! and a 1px `sidebar.border` hairline between rows instead of a card border.
 //! `SettingItem::render` keeps the component's search and page machinery while
 //! giving each row that shape.
 //!
@@ -30,8 +30,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rgba, App, Context, FocusHandle, IntoElement, ParentElement as _, Render, Rgba,
-    SharedString, Styled as _, Window,
+    div, px, App, Context, FocusHandle, IntoElement, ParentElement as _, Render, SharedString,
+    Styled as _, Window,
 };
 // `.track_focus(..)` on the root is an `InteractiveElement` method.
 use gpui_kit::InteractiveElement as _;
@@ -76,15 +76,6 @@ fn clamp_scrollback(value: f64) -> usize {
         .round() as usize
 }
 
-/// The `--border-light` row separator, `#8d91a51a`.
-///
-/// The bundled theme has no token for it (`AGENTS.md` errata), and the exact
-/// recovered value is in `docs/UI-PARITY.md` "Semantic tokens", so it is used
-/// directly here.
-fn hairline() -> Rgba {
-    rgba(0x8d91a51a)
-}
-
 /// A section header: 12px, muted, uppercase, with an optional muted note.
 fn section_header(
     cx: &App,
@@ -111,8 +102,9 @@ fn section_header(
 }
 
 /// One row of the grouped list: a 14px primary label, a 12px muted description
-/// beneath it, the control right-aligned and vertically centred, and a 1px
-/// hairline underneath. Rows carry no card border of their own.
+/// beneath it, the control right-aligned and vertically centred, and the
+/// theme's 1px `sidebar.border` hairline underneath. Rows carry no card border
+/// of their own.
 fn setting_row(
     cx: &App,
     label: &'static str,
@@ -129,13 +121,14 @@ fn setting_row(
         .justify_between()
         .gap_4()
         .border_b_1()
-        .border_color(hairline())
+        .border_color(cx.theme().sidebar_border)
         .child(
             div()
                 .flex()
                 .flex_col()
                 .gap_1()
                 .flex_1()
+                .min_w(px(0.))
                 .child(
                     div()
                         .text_size(px(14.0))
@@ -366,7 +359,27 @@ impl SettingsView {
                         )
                     })
                     .keywords(["System at launch", "appearance", "system"]),
-                ),
+                )
+                .item(
+                    SettingItem::render(move |_, _, cx: &mut App| {
+                        setting_row(
+                            cx,
+                            "Font",
+                            SharedString::from(
+                                "Read-only: the chrome follows the active theme's font.",
+                            ),
+                            read_only(cx, SharedString::from("System UI · Menlo mono")),
+                        )
+                    })
+                    .keywords(["Font", "font", "appearance", "typeface"]),
+                )
+                .item(section_item("Themes", None))
+                .item(read_only_item(
+                    "Theme catalogue",
+                    SharedString::from("sshdeck (built-in)"),
+                    "Ready for a shared catalogue: additional themes plug in here.",
+                    &["Theme catalogue", "themes", "catalogue", "appearance"],
+                )),
         )
     }
 
@@ -651,19 +664,31 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Read the size before borrowing `self` for the page builders.
         let compact = self.compact;
         let appearance = self.appearance_page();
         let terminal = self.terminal_page(cx);
         let general = self.general_page(cx);
+        // Cap the pages at the 720px reference width, shrinking to 90% of the
+        // window on narrow screens so the rows keep their 44px shape.
+        let win_w = f32::from(window.bounds().size.width);
+        let cap = (win_w * 0.9).min(720.0).max(200.0);
 
-        div().size_full().track_focus(&self.focus_handle).child(
-            Settings::new("sshdeck-settings")
-                .with_group_variant(GroupBoxVariant::Normal)
-                .with_size(if compact { Size::Small } else { Size::Medium })
-                .pages(vec![appearance, terminal, general]),
-        )
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .track_focus(&self.focus_handle)
+            .child(
+                div().w_full().max_w(px(cap)).flex_1().min_h(px(0.)).child(
+                    Settings::new("sshdeck-settings")
+                        .with_group_variant(GroupBoxVariant::Normal)
+                        .with_size(if compact { Size::Small } else { Size::Medium })
+                        .pages(vec![appearance, terminal, general]),
+                ),
+            )
     }
 }
 

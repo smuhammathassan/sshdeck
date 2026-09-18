@@ -28,10 +28,26 @@
 //!   `300px` basis) with a `40px` navy glyph tile, matching the reference's key
 //!   and known-host tiles. A list view is offered as well (44px rows, hairline
 //!   separators) because a fingerprint needs the horizontal room.
-//! * `Certificate`, `Touch ID` and `FIDO2` are rendered **disabled** with a
-//!   tooltip: the reference shows them, `sshdeck_core` has no x509, passkey or
-//!   FIDO2 store, and shipping them enabled would be a dead write path. This is
-//!   the same dead-control convention `logs_pane` uses.
+//! * `Certificate` is a type filter with a visible selected state: it narrows
+//!   the key list to `*-cert` / cert-kind keys instead of hijacking the search
+//!   box (an earlier revision wrote `"cert"` into the filter input; the
+//!   tooltip lied about what it did). `ponytail:` there is no x509 issuance
+//!   in `sshdeck_core`, so this filters what is on disk; ceiling: OpenSSH
+//!   certificate issuance when core gains it.
+//! * `Touch ID` and `FIDO2` are rendered **disabled** with a tooltip: the
+//!   reference shows them, `sshdeck_core` has no passkey or FIDO2 store, and
+//!   shipping them enabled would be a dead write path. This is the same
+//!   dead-control convention `logs_pane` uses.
+//! * The Keys section drills into a Select Identity picker and an Edit Identity
+//!   form (Termius `3.09.32` / `3.09.38`). The picker is entered from the
+//!   host-details credentials row via [`KeysPane::open_identity_picker`]; the
+//!   form's Save renames the username across the inventory through
+//!   `HostStore`, which is the only core store identities have —
+//!   `sshdeck_core` has no dedicated Identity type, so an identity *is* the
+//!   shared username it was loaded from. `ponytail:` the password field is a
+//!   masked affordance with an eye toggle; the secret itself stays in the OS
+//!   keychain (core holds only the opaque `secret_ref`), so Save persists the
+//!   username rename and never writes secret bytes to the inventory.
 //! * A changed host key is loud, never a tint: a danger-bordered card with the
 //!   old and new fingerprints side by side in labelled boxes, a danger button
 //!   for the second confirmation, and a `CHANGED` pill on the row it belongs to.
@@ -56,7 +72,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, px, rgba, AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity,
+    div, px, rgb, rgba, AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity,
     Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
     Render, SharedString, Stateful, Styled as _, Subscription, Window,
 };
@@ -74,6 +90,19 @@ const SHORT_FINGERPRINT_EDGE: usize = 8;
 /// Grid cards grow from this basis to fill the row, so the grid reflows with
 /// the window instead of clipping.
 const CARD_BASIS: f32 = 300.;
+
+/// Columns of cards for the available width: 1-up narrow, 2-up medium,
+/// 3-up wide. The flex-basis cards already reflow; this chunks rows so the
+/// count is exact at every width.
+fn card_cols(win_w: f32) -> usize {
+    if win_w < 520.0 {
+        1
+    } else if win_w < 860.0 {
+        2
+    } else {
+        3
+    }
+}
 /// Termius' navy identity tile, RGBA (the alpha byte is part of the literal:
 /// `rgba` reads `0xRRGGBBAA`). The one literal in this pane.
 const TILE_BG: u32 = 0x1c4774ff;
@@ -113,6 +142,11 @@ struct KnownEntry {
     hosts: String,
     key_type: String,
     /// `None` when the line's key is not an OpenSSH public key we can parse.
+    ///
+    /// Not displayed — the reference lists the host pattern only — but retained
+    /// for the connect-time trust flow that re-attaches here, and covered by
+    /// the parse tests below.
+    #[allow(dead_code)]
     fingerprint: Option<String>,
     /// `@revoked` lines must never be treated as a usable trust anchor.
     revoked: bool,
@@ -123,6 +157,9 @@ struct KnownEntry {
 struct IdentityEntry {
     name: String,
     auth: String,
+    /// Labels of inventory hosts signing in as this username. Empty when no
+    /// saved host uses it; the detail then hides the Linked-to card.
+    hosts: Vec<String>,
 }
 
 /// A changed host key awaiting the user's replacement decision.
@@ -148,6 +185,17 @@ struct PendingChange {
 pub enum KeysSection {
     Keys,
     Hosts,
+}
+
+/// Drill-in screens over the Keys section: the full list (`List`), the
+/// reference's Select Identity picker (`Picker`), and its Edit Identity form
+/// (`Edit`). Private: callers enter through [`KeysPane::open_identity_picker`]
+/// and [`KeysPane::open_identity_edit`]; the left nav resets to `List`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentityScreen {
+    List,
+    Picker,
+    Edit,
 }
 
 /// How the entries are laid out. Termius defaults to the card grid.
@@ -180,6 +228,19 @@ pub struct KeysPane {
     selected: Option<String>,
     known: Vec<KnownEntry>,
     filter: Entity<InputState>,
+    /// The filter row follows the forward/logs pattern: hidden until the
+    /// toolbar search control opens it, instead of always on screen.
+    search_open: bool,
+    /// Certificate type filter: narrows the key list to cert-like keys with a
+    /// visible selected state, never by writing into the search box.
+    cert_only: bool,
+    /// Drill-in screen over the Keys section (picker / edit form).
+    identity_screen: IdentityScreen,
+    /// Original identity name being edited; `None` means a new identity.
+    editing_identity: Option<String>,
+    edit_name: Entity<InputState>,
+    edit_username: Entity<InputState>,
+    edit_password: Entity<InputState>,
     host_input: Entity<InputState>,
     port_input: Entity<InputState>,
     key_input: Entity<InputState>,
@@ -211,6 +272,13 @@ impl KeysPane {
         });
         let import_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("path to an OpenSSH private key"));
+        let edit_name = cx.new(|cx| InputState::new(window, cx).placeholder("Identity name"));
+        let edit_username = cx.new(|cx| InputState::new(window, cx).placeholder("username"));
+        let edit_password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("password")
+                .masked(true)
+        });
 
         // Re-render as the query changes; the filter is applied in `render`, so
         // no filtered copy is kept in state.
@@ -228,6 +296,13 @@ impl KeysPane {
             selected: None,
             known: Vec::new(),
             filter,
+            search_open: false,
+            cert_only: false,
+            identity_screen: IdentityScreen::List,
+            editing_identity: None,
+            edit_name,
+            edit_username,
+            edit_password,
             host_input,
             port_input,
             key_input,
@@ -244,11 +319,125 @@ impl KeysPane {
     }
 
     /// Shows one of the two sections. Wiring hook for the left nav.
+    /// Resets any identity drill-in: the picker/edit form is entered from the
+    /// host-details credentials row, not from the rail.
     pub fn show(&mut self, section: KeysSection, cx: &mut Context<Self>) {
-        if self.section != section {
+        if self.section != section || self.identity_screen != IdentityScreen::List {
             self.section = section;
+            self.identity_screen = IdentityScreen::List;
             cx.notify();
         }
+    }
+
+    /// Enters the Select Identity picker. Wiring hook for the host-details
+    /// credentials tap in `main.rs` (the existing popover path is untouched).
+    pub fn open_identity_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.section = KeysSection::Keys;
+        self.identity_screen = IdentityScreen::Picker;
+        let handle = self.filter.read(cx).focus_handle(cx);
+        handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Enters the Edit Identity form for `name`, prefilling both name fields
+    /// from the entry (an identity *is* its shared username in this model).
+    pub fn open_identity_edit(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.section = KeysSection::Keys;
+        self.identity_screen = IdentityScreen::Edit;
+        self.editing_identity = Some(name.to_string());
+        self.edit_name
+            .update(cx, |state, cx| state.set_value(name, window, cx));
+        self.edit_username
+            .update(cx, |state, cx| state.set_value(name, window, cx));
+        self.edit_password
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Starts a blank Edit Identity form (the picker's New Identity entry).
+    fn new_identity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.section = KeysSection::Keys;
+        self.identity_screen = IdentityScreen::Edit;
+        self.editing_identity = None;
+        self.edit_name
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.edit_username
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.edit_password
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Persists the Edit Identity form: renames the username across every
+    /// inventory host that signs in as the old name, then saves the store.
+    /// The password field is never written to the inventory — secrets live in
+    /// the OS keychain and core holds only the opaque `secret_ref`.
+    fn save_identity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let original = self.editing_identity.clone().unwrap_or_default();
+        let name = self.edit_name.read(cx).value().trim().to_string();
+        let mut username = self.edit_username.read(cx).value().trim().to_string();
+        if username.is_empty() {
+            username = name.clone();
+        }
+        if username.is_empty() {
+            window.push_notification(
+                Notification::warning("An identity needs a name and a username"),
+                cx,
+            );
+            return;
+        }
+        if original.is_empty() {
+            // Nothing in core to attach a brand-new name to: identities are
+            // derived from host usernames, so a name with no host would vanish
+            // on reload. Say so instead of a dead write.
+            window.push_notification(
+                Notification::info(
+                    "Identities come from host usernames — add a host signing in as this name first",
+                ),
+                cx,
+            );
+            return;
+        }
+        if username == original {
+            self.identity_screen = IdentityScreen::Picker;
+            cx.notify();
+            return;
+        }
+        self.busy = true;
+        cx.notify();
+        let task_old = original.clone();
+        let task_new = username.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { rename_identity_in_store(&task_old, &task_new) })
+                .await;
+            this.update_in(cx, |pane, window, cx| {
+                pane.busy = false;
+                match result {
+                    Ok(count) => {
+                        pane.editing_identity = Some(username.clone());
+                        pane.selected = Some(format!("identity:{username}"));
+                        pane.identity_screen = IdentityScreen::Picker;
+                        pane.reload(window, cx);
+                        window.push_notification(
+                            Notification::success(format!(
+                                "Identity saved on {count} host{}",
+                                if count == 1 { "" } else { "s" }
+                            )),
+                            cx,
+                        );
+                    }
+                    Err(message) => window.push_notification(Notification::error(message), cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Number of keys currently listed. Reader method for the wiring pass.
@@ -519,15 +708,18 @@ impl KeysPane {
     // ── chrome ────────────────────────────────────────────────────────────
 
     /// The single toolbar row: section switch, contextual actions, icon controls.
+    /// Wraps on narrow windows instead of clipping.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
         div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .gap_3()
-            .h(px(56.))
+            .min_h(px(56.))
             .px_3()
+            .py_1()
             .flex_shrink_0()
             .bg(cx.theme().popover)
             .border_b_1()
@@ -575,18 +767,14 @@ impl KeysPane {
                             .ghost()
                             .icon(Icon::default().data(crate::glyph::CERTIFICATE))
                             .label("Certificate")
-                            .tooltip("Filter OpenSSH certificates")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let cur = this.filter.read(cx).value().to_string();
-                                let new_val = if cur == "cert" { "" } else { "cert" };
-                                this.filter.update(cx, |input, cx| {
-                                    input.set_value(new_val, window, cx);
-                                });
-                                if new_val.is_empty() {
-                                    window.push_notification(Notification::info("Cleared certificate filter"), cx);
-                                } else {
-                                    window.push_notification(Notification::info("Filtered certificates (-cert.pub)"), cx);
-                                }
+                            .tooltip(if self.cert_only {
+                                "Showing certificate keys only — click to show all"
+                            } else {
+                                "Show certificate keys only"
+                            })
+                            .selected(self.cert_only)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cert_only = !this.cert_only;
                                 cx.notify();
                             })),
                     )
@@ -595,29 +783,22 @@ impl KeysPane {
                             .ghost()
                             .icon(Icon::default().data(glyph::FINGERPRINT))
                             .label("Touch ID")
-                            .tooltip("macOS Touch ID / Secure Enclave")
-                            .on_click(cx.listener(|_, _, window, cx| {
-                                window.push_notification(
-                                    Notification::info("Touch ID Secure Enclave keys are managed locally via macOS Keychain"),
-                                    cx,
-                                );
-                            })),
+                            .tooltip("macOS Touch ID / Secure Enclave (not yet supported)")
+                            .disabled(true),
                     )
                     .child(
                         Button::new("keys-fido2")
                             .ghost()
                             .icon(Icon::default().data(glyph::SECURITY_KEY))
                             .label("FIDO2")
-                            .tooltip("FIDO2 / U2F Security Key")
-                            .on_click(cx.listener(|_, _, window, cx| {
-                                window.push_notification(
-                                    Notification::info("Insert your FIDO2 key to authenticate with sk-ssh credentials"),
-                                    cx,
-                                );
-                            })),
+                            .tooltip("FIDO2 / U2F security keys (not yet supported)")
+                            .disabled(true),
                     );
             }
             KeysSection::Hosts => {
+                // The trust form is wired to `known_hosts::learn` via
+                // `trust_key`; the toolbar exposes it instead of leaving the
+                // form reachable from nowhere.
                 row = row
                     .child(
                         Button::new("import-known-hosts")
@@ -632,10 +813,11 @@ impl KeysPane {
                             })),
                     )
                     .child(
-                        Button::new("trust-host-key-form")
-                            .icon(IconName::Plus)
+                        Button::new("trust-host-toggle")
+                            .ghost()
+                            .icon(IconName::Check)
                             .label("Trust a host key")
-                            .tooltip("Check a public key against known_hosts and record it")
+                            .tooltip("Check and trust a host public key")
                             .selected(self.show_trust)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.show_trust = !this.show_trust;
@@ -647,9 +829,10 @@ impl KeysPane {
         row
     }
 
-    /// Search, layout and reload controls, right-aligned as in the reference.
+    /// Small icon controls, right-aligned as in the reference: search, layout,
+    /// sort. (ponytail: no refresh control — the pane reloads on open and after
+    /// every write, so a manual reload is one more control with no job.)
     fn render_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
         div()
             .flex()
             .flex_row()
@@ -659,16 +842,23 @@ impl KeysPane {
             .child(
                 Button::new("keys-search")
                     .ghost()
+                    .small()
                     .icon(IconName::Search)
                     .tooltip("Search")
+                    .selected(self.search_open)
                     .on_click(cx.listener(|this, _, window, cx| {
-                        let handle = this.filter.read(cx).focus_handle(cx);
-                        handle.focus(window, cx);
+                        this.search_open = !this.search_open;
+                        if this.search_open {
+                            let handle = this.filter.read(cx).focus_handle(cx);
+                            handle.focus(window, cx);
+                        }
+                        cx.notify();
                     })),
             )
             .child(
                 Button::new("keys-view-grid")
                     .ghost()
+                    .small()
                     .icon(Icon::default().data(glyph::GRID))
                     .tooltip("Grid view")
                     .selected(self.view == ViewMode::Grid)
@@ -680,6 +870,7 @@ impl KeysPane {
             .child(
                 Button::new("keys-calendar")
                     .ghost()
+                    .small()
                     .icon(Icon::default().data(crate::glyph::CALENDAR))
                     .tooltip(if self.sort_alphabetical {
                         "Sorting: Alphabetical (A-Z)"
@@ -697,47 +888,20 @@ impl KeysPane {
                         cx.notify();
                     })),
             )
-            .child(div().w(px(1.)).h(px(20.)).bg(border))
-            .child(
-                Button::new("keys-refresh")
-                    .ghost()
-                    .icon(IconName::RotateCw)
-                    .tooltip("Reload keys and known hosts")
-                    .disabled(self.busy)
-                    .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx))),
-            )
-    }
-
-    /// The filter field, pinned at the top of the content area as the reference
-    /// does with its search bar on the Hosts screen.
-    fn render_filter(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .w_full()
-            .flex_shrink_0()
-            .px_6()
-            .pt_6()
-            .pb_4()
-            .child(
-                Input::new(&self.filter).small().cleanable(true).prefix(
-                    Icon::new(IconName::Search)
-                        .small()
-                        .text_color(cx.theme().muted_foreground),
-                ),
-            )
     }
 
     // ── keys section ──────────────────────────────────────────────────────
 
-    fn render_keys(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_keys(&self, win_w: f32, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let query = self.query(cx);
         let mut visible: Vec<&KeyEntry> = self
             .keys
             .iter()
             .filter(|key| {
+                if self.cert_only && !key_is_cert(key) {
+                    return false;
+                }
                 let name = key_name(key);
                 matches_query(
                     &[name.as_str(), key.kind.as_str(), key.fingerprint.as_str()],
@@ -776,16 +940,9 @@ impl KeysPane {
             })
             .collect();
 
-        let mut visible_identities: Vec<&IdentityEntry> = self
-            .identities
-            .iter()
-            .filter(|ident| matches_query(&[ident.name.as_str(), ident.auth.as_str()], &query))
-            .collect();
-        if self.sort_alphabetical {
-            visible_identities.sort_by(|a, b| a.name.cmp(&b.name));
-        }
+        let shown_identities = visible_identities(&self.identities, &query, self.sort_alphabetical);
 
-        let identity_tiles: Vec<AnyElement> = visible_identities
+        let identity_tiles: Vec<AnyElement> = shown_identities
             .iter()
             .map(|ident| {
                 let id = SharedString::from(format!("identity-{}", ident.name));
@@ -847,11 +1004,11 @@ impl KeysPane {
                 cx,
             ));
         } else {
-            body = body.child(self.layout(tiles));
+            body = body.child(self.layout(win_w, tiles));
         }
 
         body = body.child(section_heading("Identities"));
-        if visible_identities.is_empty() {
+        if shown_identities.is_empty() {
             body = body.child(empty_state(
                 crate::glyph::ID_BADGE,
                 "No identities",
@@ -859,7 +1016,11 @@ impl KeysPane {
                 cx,
             ));
         } else {
-            body = body.child(self.layout(identity_tiles));
+            body = body.child(self.layout(win_w, identity_tiles));
+        }
+
+        if let Some(detail) = self.render_identity_detail(cx) {
+            body = body.child(detail);
         }
 
         if let Some(detail) = self.render_key_detail(cx) {
@@ -904,6 +1065,584 @@ impl KeysPane {
                     .text_size(px(12.))
                     .text_color(cx.theme().muted_foreground)
                     .child("A copy is normalised into the sshdeck keys directory; the original file is left untouched."),
+            )
+            .into_any_element()
+    }
+
+    /// The selected identity's picker detail: a 56px header, a 44px action row,
+    /// a 64px identity row with a 44px tile, 44px input-shaped rows with a
+    /// 12px radius, and a Linked-to card naming what the identity is for.
+    /// Display-only: identities are edited where the host stores them.
+    fn render_identity_detail(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let name = identity_name(self.selected.as_ref())?;
+        let entry = self.identities.iter().find(|ident| ident.name == name)?;
+        let auth = entry.auth.clone();
+        let copy_name = name.to_string();
+        // The Linked-to card names real inventory hosts, or hides when none
+        // uses this username.
+        let linked: Option<String> = if entry.hosts.is_empty() {
+            None
+        } else {
+            Some(entry.hosts.join(", "))
+        };
+
+        Some(
+            panel(cx)
+                .flex()
+                .flex_col()
+                .gap_0()
+                .child(
+                    // 56px header.
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .h(px(56.))
+                        .px_4()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(eyebrow("EDIT IDENTITY", cx))
+                        .child(
+                            Button::new("identity-detail-close")
+                                .ghost()
+                                .small()
+                                .icon(IconName::Close)
+                                .tooltip("Close identity detail")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.selected = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    // 44px toolbar: what it is, plus the one action.
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .h(px(44.))
+                        .px_4()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(SharedString::from(auth.clone())),
+                        )
+                        .child(
+                            Button::new("identity-copy-name")
+                                .ghost()
+                                .small()
+                                .icon(IconName::Copy)
+                                .label("Copy username")
+                                .on_click(cx.listener(move |_, _, window, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copy_name.clone(),
+                                    ));
+                                    window.push_notification(
+                                        Notification::success("Username copied"),
+                                        cx,
+                                    );
+                                })),
+                        ),
+                )
+                .child(
+                    // 64px row with a 44px tile.
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .h(px(64.))
+                        .px_4()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(glyph_tile(crate::glyph::ID_BADGE, 44., cx))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .text_size(px(14.))
+                                        .truncate()
+                                        .child(SharedString::from(name.to_string())),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .truncate()
+                                        .child(SharedString::from(auth.clone())),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .p_4()
+                        .child(identity_field("USERNAME", name, cx))
+                        .child(identity_field("AUTH", &auth, cx))
+                        .when_some(linked, |el, linked| {
+                            el.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .p_3()
+                                    .rounded(px(10.))
+                                    .bg(cx.theme().muted)
+                                    .child(eyebrow("LINKED TO", cx))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(SharedString::from(linked)),
+                                    ),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    // ── identity picker / edit form ─────────────────────────────────────
+
+    /// The reference's Select Identity screen: a white 56px header with a
+    /// hairline, a 44px toolbar carrying New Identity, an inline search and
+    /// the dark `Az` sort chip, then 64px rows with no separators. A row tap
+    /// picks the identity (copies the username, as the Keys-list tiles do);
+    /// the pencil opens the Edit form.
+    fn render_identity_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let accent = cx.theme().accent;
+        let query = self.query(cx);
+        let shown = visible_identities(&self.identities, &query, self.sort_alphabetical);
+        let empty = shown.is_empty();
+
+        let mut rows = div().flex().flex_col().w_full();
+        for ident in shown {
+            let name = ident.name.clone();
+            let auth = ident.auth.clone();
+            let pick_name = name.clone();
+            let pick_auth = auth.clone();
+            let edit = name.clone();
+            // A pencil tap also lands on the row: picking first (List) and
+            // then opening the form (Edit) ends on the form either way.
+            rows = rows.child(
+                div()
+                    .id(SharedString::from(format!("pick-identity-{name}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .h(px(64.))
+                    .px_4()
+                    .w_full()
+                    .cursor_pointer()
+                    .hover(move |el| el.bg(accent))
+                    .child(glyph_tile(crate::glyph::ID_BADGE, 48., cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .truncate()
+                                    .child(SharedString::from(name)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(muted)
+                                    .truncate()
+                                    .child(SharedString::from(auth)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("pick-edit-{edit}")))
+                            .cursor_pointer()
+                            .child(
+                                Icon::default()
+                                    .data(crate::glyph::PENCIL)
+                                    .size(px(18.))
+                                    .text_color(cx.theme().foreground),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_identity_edit(&edit, window, cx);
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.selected = Some(format!("identity:{pick_name}"));
+                        cx.write_to_clipboard(ClipboardItem::new_string(pick_name.clone()));
+                        window.push_notification(
+                            Notification::info(format!(
+                                "Identity {pick_name} ({pick_auth}) picked — username copied"
+                            )),
+                            cx,
+                        );
+                        this.identity_screen = IdentityScreen::List;
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let sort_bg = if self.sort_alphabetical {
+            accent
+        } else {
+            cx.theme().foreground
+        };
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .h(px(56.))
+                    .px_4()
+                    .bg(cx.theme().popover)
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("identity-picker-back")
+                            .ghost()
+                            .icon(IconName::ArrowLeft)
+                            .tooltip("Back to Keychain")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.identity_screen = IdentityScreen::List;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(18.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Select Identity"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Personal vault"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .h(px(44.))
+                    .px_4()
+                    // Reference-spec toolbar fill; no theme token (cf. TILE_BG).
+                    .bg(rgb(0xeef1f4))
+                    .child(
+                        div()
+                            .id("identity-new")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .text_size(px(15.))
+                            .cursor_pointer()
+                            .child(Icon::new(IconName::Plus).size(px(16.)))
+                            .child("New Identity")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.new_identity(window, cx);
+                            })),
+                    )
+                    .child(
+                        div().flex_1().min_w(px(80.)).child(
+                            Input::new(&self.filter).small().cleanable(true).prefix(
+                                Icon::new(IconName::Search)
+                                    .small()
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("identity-sort-az")
+                            .size(px(28.))
+                            .rounded(px(6.))
+                            .bg(sort_bg)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(cx.theme().popover)
+                            .cursor_pointer()
+                            .child("Az")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sort_alphabetical = !this.sort_alphabetical;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                scroll_body("identity-picker-scroll")
+                    .child(if empty {
+                        empty_state(
+                            crate::glyph::ID_BADGE,
+                            if self.identities.is_empty() {
+                                "No identities"
+                            } else {
+                                "No identity matches the search"
+                            },
+                            "Saved host credentials and identities appear here.",
+                            cx,
+                        )
+                    } else {
+                        rows
+                    })
+                    .into_any_element(),
+            )
+            .into_any_element()
+    }
+
+    /// The reference's Edit Identity form: a 56px header with a blue Save that
+    /// persists the username rename to the core store, three 48px inputs, an
+    /// attach row that navigates back to the keys list, and a Linked-to card.
+    fn render_identity_edit(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let popover = cx.theme().popover;
+        let editing = self.editing_identity.clone().unwrap_or_default();
+        let entry = self.identities.iter().find(|ident| ident.name == editing);
+        let linked: Vec<String> = entry.map(|e| e.hosts.clone()).unwrap_or_default();
+        // Core hosts carry no protocol list, so every linked row falls back to
+        // `ssh, {user}`.
+        let linked_user = entry.map(|e| e.name.clone()).unwrap_or_default();
+
+        let form = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded(px(12.))
+            .bg(popover)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(glyph_tile(crate::glyph::ID_BADGE, 48., cx))
+                    .child(field_shell(
+                        None,
+                        Input::new(&self.edit_name)
+                            .appearance(false)
+                            .into_any_element(),
+                        cx,
+                    )),
+            )
+            .child(field_shell(
+                Some(
+                    Icon::new(IconName::User)
+                        .size(px(18.))
+                        .text_color(muted)
+                        .into_any_element(),
+                ),
+                Input::new(&self.edit_username)
+                    .appearance(false)
+                    .into_any_element(),
+                cx,
+            ))
+            .child(field_shell(
+                Some(
+                    Icon::default()
+                        .data(crate::glyph::KEY)
+                        .size(px(18.))
+                        .text_color(muted)
+                        .into_any_element(),
+                ),
+                Input::new(&self.edit_password)
+                    .mask_toggle()
+                    .appearance(false)
+                    .into_any_element(),
+                cx,
+            ))
+            .child(
+                div()
+                    .id("identity-attach")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .pl_1()
+                    .text_size(px(14.))
+                    .text_color(muted)
+                    .cursor_pointer()
+                    .child(Icon::new(IconName::Plus).size(px(16.)))
+                    .child("Key, Certificate, FIDO2")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.identity_screen = IdentityScreen::List;
+                        this.section = KeysSection::Keys;
+                        cx.notify();
+                    })),
+            );
+
+        let mut body = div().flex().flex_col().gap_4().w_full().child(form);
+        if !linked.is_empty() {
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_4()
+                .rounded(px(12.))
+                .bg(popover)
+                .child(
+                    div()
+                        .text_size(px(16.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Linked to"),
+                );
+            for label in linked {
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .flex_shrink_0()
+                                .size(px(48.))
+                                .rounded(px(12.))
+                                // Termius host-tile orange, same literal as main.rs.
+                                .bg(rgb(0xd96c2b))
+                                .child(
+                                    Icon::default()
+                                        .data(crate::glyph::UBUNTU)
+                                        .size(px(24.))
+                                        .text_color(rgb(0xffffff)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .text_size(px(16.))
+                                        .truncate()
+                                        .child(SharedString::from(label)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(muted)
+                                        .truncate()
+                                        .child(SharedString::from(format!("ssh, {linked_user}"))),
+                                ),
+                        ),
+                );
+            }
+            body = body.child(card);
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(cx.theme().sidebar)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .h(px(56.))
+                    .px_4()
+                    .bg(cx.theme().popover)
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("identity-edit-back")
+                            .ghost()
+                            .icon(IconName::ArrowLeft)
+                            .tooltip("Back to Select Identity")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.identity_screen = IdentityScreen::Picker;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .text_size(px(18.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Edit Identity"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Personal vault"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("identity-save")
+                            .w(px(64.))
+                            .h(px(32.))
+                            .rounded(px(8.))
+                            // In-repo accent blue, as the host-card focus ring.
+                            .bg(rgb(0x2091f6))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xffffff))
+                            .cursor_pointer()
+                            .child("Save")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_identity(window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                scroll_body("identity-edit-scroll")
+                    .child(body)
+                    .into_any_element(),
             )
             .into_any_element()
     }
@@ -971,21 +1710,14 @@ impl KeysPane {
 
     // ── known-hosts section ───────────────────────────────────────────────
 
-    fn render_known_hosts(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_known_hosts(&self, win_w: f32, cx: &mut Context<Self>) -> AnyElement {
         let query = self.query(cx);
+        // Host pattern only: the reference lists the recorded pattern and
+        // nothing else, so key type and fingerprint stay out of the filter too.
         let mut visible: Vec<&KnownEntry> = self
             .known
             .iter()
-            .filter(|entry| {
-                matches_query(
-                    &[
-                        entry.hosts.as_str(),
-                        entry.key_type.as_str(),
-                        entry.fingerprint.as_deref().unwrap_or(""),
-                    ],
-                    &query,
-                )
-            })
+            .filter(|entry| matches_query(&[entry.hosts.as_str()], &query))
             .collect();
         if self.sort_alphabetical {
             visible.sort_by(|a, b| a.hosts.cmp(&b.hosts));
@@ -998,15 +1730,12 @@ impl KeysPane {
                     hosts_pattern_matches(&entry.hosts, &pending.host, pending.port)
                 });
                 let alarm = entry.revoked || changed;
-                let shown = entry
-                    .fingerprint
-                    .as_deref()
-                    .map(short_fingerprint)
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "fingerprint unavailable".to_string());
+                // The reference shows the host pattern only — no key type or
+                // fingerprint meta line. The key type stays in the element id
+                // so two lines for one host (e.g. ed25519 + rsa) keep unique ids.
                 let title = entry.hosts.clone();
-                let meta = format!("{} · {}", entry.key_type, shown);
-                let id = SharedString::from(format!("known-{}-{title}", entry.key_type));
+                let meta = String::new();
+                let id = SharedString::from(format!("known-{title}-{}", entry.key_type));
                 let row = match self.view {
                     ViewMode::Grid => card(id, glyph::FINGERPRINT, title, meta, false, alarm, cx),
                     ViewMode::List => {
@@ -1046,7 +1775,7 @@ impl KeysPane {
                 cx,
             ));
         } else {
-            body = body.child(self.layout(tiles));
+            body = body.child(self.layout(win_w, tiles));
         }
 
         scroll_body("known-hosts-scroll")
@@ -1197,17 +1926,42 @@ impl KeysPane {
             .into_any_element()
     }
 
-    /// Grid or list, per the toolbar's layout control.
-    fn layout(&self, tiles: Vec<AnyElement>) -> AnyElement {
+    /// Grid (chunked into `card_cols` rows so narrow windows drop 3-up to
+    /// 2-up to 1-up) or list, per the toolbar's layout control.
+    fn layout(&self, win_w: f32, tiles: Vec<AnyElement>) -> AnyElement {
         match self.view {
-            ViewMode::Grid => div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .gap_4()
-                .w_full()
-                .children(tiles)
-                .into_any_element(),
+            ViewMode::Grid => {
+                let cols = card_cols(win_w).max(1);
+                let mut rows: Vec<AnyElement> = Vec::new();
+                // `AnyElement` is not `Clone`, so the tiles are consumed in
+                // order rather than copied out of borrowed chunks.
+                let mut tiles = tiles.into_iter();
+                loop {
+                    let mut row_cards: Vec<AnyElement> = tiles.by_ref().take(cols).collect();
+                    if row_cards.is_empty() {
+                        break;
+                    }
+                    while row_cards.len() < cols {
+                        row_cards.push(div().flex_1().into_any_element());
+                    }
+                    rows.push(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_4()
+                            .w_full()
+                            .children(row_cards)
+                            .into_any_element(),
+                    );
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .w_full()
+                    .children(rows)
+                    .into_any_element()
+            }
             ViewMode::List => div()
                 .flex()
                 .flex_col()
@@ -1216,10 +1970,48 @@ impl KeysPane {
                 .into_any_element(),
         }
     }
+
+    /// The filter row, shown only while the toolbar search control keeps it
+    /// open (the forward/logs pattern), never always on screen.
+    fn render_search(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .px_6()
+            .pt_3()
+            .flex_shrink_0()
+            .child(
+                div().flex_1().min_w(px(120.)).child(
+                    Input::new(&self.filter).small().cleanable(true).prefix(
+                        Icon::new(IconName::Search)
+                            .small()
+                            .text_color(cx.theme().muted_foreground),
+                    ),
+                ),
+            )
+    }
 }
 
 impl Render for KeysPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let win_w = f32::from(window.bounds().size.width);
+        // The picker and edit form are full-bleed drill-ins with their own
+        // headers; everything else keeps the toolbar plus the opt-in filter.
+        let screen = self.identity_screen;
+        if self.section == KeysSection::Keys && screen == IdentityScreen::Picker {
+            return self.render_identity_picker(cx);
+        }
+        if self.section == KeysSection::Keys && screen == IdentityScreen::Edit {
+            return self.render_identity_edit(cx);
+        }
+        let body: AnyElement = match self.section {
+            KeysSection::Keys => self.render_keys(win_w, cx),
+            KeysSection::Hosts => self.render_known_hosts(win_w, cx),
+        };
+        let search_open = self.search_open;
         div()
             .flex()
             .flex_col()
@@ -1229,11 +2021,9 @@ impl Render for KeysPane {
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().foreground)
             .child(self.render_toolbar(cx))
-            .child(self.render_filter(cx))
-            .child(match self.section {
-                KeysSection::Keys => self.render_keys(cx),
-                KeysSection::Hosts => self.render_known_hosts(cx),
-            })
+            .when(search_open, |el| el.child(self.render_search(cx)))
+            .child(body)
+            .into_any_element()
     }
 }
 
@@ -1410,6 +2200,122 @@ fn state_pill(label: &'static str, color: Hsla, cx: &App) -> Div {
         .child(label)
 }
 
+/// A 44px input-shaped display row with a 12px radius, as the identity
+/// detail's USERNAME / AUTH rows.
+fn identity_field(label: &'static str, value: &str, cx: &App) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .h(px(44.))
+        .px_3()
+        .rounded(px(12.))
+        .border_1()
+        .border_color(cx.theme().border)
+        .child(
+            div()
+                .w(px(90.))
+                .flex_shrink_0()
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(cx.theme().muted_foreground)
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .truncate()
+                .text_size(px(14.))
+                .child(SharedString::from(value.to_string())),
+        )
+}
+
+/// A 48px input shell with a 12px radius and the reference's `#d5dde0`
+/// border (no theme token exists, cf. `TILE_BG`), for the Edit Identity rows.
+fn field_shell(prefix: Option<AnyElement>, input: AnyElement, cx: &App) -> Div {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .h(px(48.))
+        .px_3()
+        .flex_1()
+        .min_w(px(0.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(rgb(0xd5dde0))
+        .bg(cx.theme().popover);
+    if let Some(prefix) = prefix {
+        row = row.child(prefix);
+    }
+    row.child(div().flex_1().min_w(px(0.)).child(input))
+}
+
+/// The selected identity's name, when the selection is an identity pick
+/// (`identity:{name}`) rather than a key fingerprint.
+fn identity_name(selected: Option<&String>) -> Option<&str> {
+    selected?.strip_prefix("identity:")
+}
+
+/// Identities matching `query`, alphabetically sorted when `alpha` is set.
+/// Shared by the Keys list and the Select Identity picker so the two never
+/// drift apart.
+fn visible_identities<'a>(
+    entries: &'a [IdentityEntry],
+    query: &str,
+    alpha: bool,
+) -> Vec<&'a IdentityEntry> {
+    let mut out: Vec<&IdentityEntry> = entries
+        .iter()
+        .filter(|ident| matches_query(&[ident.name.as_str(), ident.auth.as_str()], query))
+        .collect();
+    if alpha {
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    out
+}
+
+/// Whether a key looks certificate-like for the Certificate type filter: a
+/// `-cert` file stem or a cert key kind.
+fn key_is_cert(key: &KeyEntry) -> bool {
+    key_name(key).to_lowercase().contains("cert") || key.kind.to_lowercase().contains("cert")
+}
+
+/// Renames a username across the inventory and saves the store. Runs on the
+/// background executor. Returns the number of hosts updated.
+fn rename_identity_in_store(old: &str, new: &str) -> Result<usize, String> {
+    let mut store = HostStore::at_default_path();
+    store
+        .load()
+        .map_err(|err| format!("could not load hosts: {err}"))?;
+    let updated: Vec<_> = store
+        .inventory()
+        .hosts()
+        .iter()
+        .filter(|host| host.username == old)
+        .cloned()
+        .map(|mut host| {
+            host.username = new.to_string();
+            host
+        })
+        .collect();
+    let count = updated.len();
+    if count == 0 {
+        return Err(format!("no host signs in as {old}"));
+    }
+    for host in updated {
+        store.inventory_mut().upsert(host);
+    }
+    store
+        .save()
+        .map_err(|err| format!("could not save hosts: {err}"))?;
+    Ok(count)
+}
+
 /// A section heading, as the reference's bold "Keys" / "Known Hosts".
 fn section_heading(label: &'static str) -> Div {
     div()
@@ -1576,43 +2482,52 @@ fn load_known_hosts() -> Vec<KnownEntry> {
     text.lines().filter_map(parse_known_hosts_line).collect()
 }
 
-/// Loads saved identities from host credentials and reference defaults.
+/// Loads saved identities from host credentials only — no invented defaults.
+/// Each entry names the real inventory hosts signing in as that username.
 fn load_identities() -> Vec<IdentityEntry> {
-    let mut entries = Vec::new();
+    let mut entries: Vec<IdentityEntry> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-
-    // Default identities from Termius reference
-    let defaults = [
-        ("xrdpuser", "Auth password"),
-        ("RedgeVPS", "Auth password"),
-        ("rege-new", "Auth password"),
-        ("chatwoot", "Auth password"),
-        ("+-", "Auth password"),
-    ];
-    for (name, auth) in defaults {
-        if seen.insert(name.to_string()) {
-            entries.push(IdentityEntry {
-                name: name.to_string(),
-                auth: auth.to_string(),
-            });
-        }
-    }
 
     let mut store = HostStore::at_default_path();
     let _ = store.load();
+    // username -> sorted host labels, so the Linked-to card names real hosts.
+    let mut hosts_by_user: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     for host in store.inventory().hosts() {
-        if !host.username.is_empty() && seen.insert(host.username.clone()) {
-            let auth_str = match &host.auth {
+        if host.username.is_empty() {
+            continue;
+        }
+        hosts_by_user
+            .entry(host.username.clone())
+            .or_default()
+            .push(host.label.clone());
+    }
+    let mut names: Vec<String> = hosts_by_user.keys().cloned().collect();
+    names.sort();
+    for name in names {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let mut labels = hosts_by_user.remove(&name).unwrap_or_default();
+        labels.sort();
+        labels.dedup();
+        let auth_str = store
+            .inventory()
+            .hosts()
+            .iter()
+            .find(|host| host.username == name)
+            .map(|host| match &host.auth {
                 sshdeck_core::AuthMethod::Password { .. } => "Auth password",
                 sshdeck_core::AuthMethod::Key { .. } => "Auth key",
                 sshdeck_core::AuthMethod::Agent => "Auth agent",
                 _ => "Auth password",
-            };
-            entries.push(IdentityEntry {
-                name: host.username.clone(),
-                auth: auth_str.to_string(),
-            });
-        }
+            })
+            .unwrap_or("Auth password");
+        entries.push(IdentityEntry {
+            name,
+            auth: auth_str.to_string(),
+            hosts: labels,
+        });
     }
 
     entries
@@ -1875,6 +2790,82 @@ mod tests {
 
     // An ed25519 public key, lifted from `sshdeck_core::known_hosts` tests.
     const KEY: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+
+    #[test]
+    fn card_grid_drops_columns_on_narrow_windows() {
+        assert_eq!(card_cols(400.0), 1);
+        assert_eq!(card_cols(519.9), 1);
+        assert_eq!(card_cols(520.0), 2);
+        assert_eq!(card_cols(859.9), 2);
+        assert_eq!(card_cols(860.0), 3);
+    }
+
+    #[test]
+    fn identity_picker_lists_filter_and_sort_alphabetically() {
+        let entries = vec![
+            IdentityEntry {
+                name: "xrdpuser".to_string(),
+                auth: "Auth password".to_string(),
+                hosts: Vec::new(),
+            },
+            IdentityEntry {
+                name: "chatwoot".to_string(),
+                auth: "Auth password".to_string(),
+                hosts: Vec::new(),
+            },
+            IdentityEntry {
+                name: "RedgeVPS".to_string(),
+                auth: "Auth key".to_string(),
+                hosts: Vec::new(),
+            },
+        ];
+        // Stored order is kept without sorting.
+        let stored: Vec<&str> = visible_identities(&entries, "", false)
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(stored, vec!["xrdpuser", "chatwoot", "RedgeVPS"]);
+        // The Az chip sorts A-Z.
+        let sorted: Vec<&str> = visible_identities(&entries, "", true)
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(sorted, vec!["RedgeVPS", "chatwoot", "xrdpuser"]);
+        // The inline search matches across name and auth, case-insensitively.
+        let filtered = visible_identities(&entries, "CHAT", true);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "chatwoot");
+        assert_eq!(visible_identities(&entries, "key", true).len(), 1);
+        assert!(visible_identities(&entries, "nothing", true).is_empty());
+    }
+
+    #[test]
+    fn cert_filter_matches_only_cert_like_keys() {
+        let cert = KeyEntry {
+            path: PathBuf::from("id_ed25519-cert"),
+            kind: "ssh-ed25519-cert-v01@openssh.com".to_string(),
+            fingerprint: "SHA256:a".to_string(),
+            authorized: String::new(),
+        };
+        let plain = KeyEntry {
+            path: PathBuf::from("id_ed25519"),
+            kind: "ssh-ed25519".to_string(),
+            fingerprint: "SHA256:b".to_string(),
+            authorized: String::new(),
+        };
+        assert!(key_is_cert(&cert));
+        assert!(!key_is_cert(&plain));
+    }
+
+    #[test]
+    fn identity_picks_resolve_by_prefix_not_fingerprint() {
+        let picked = Some("identity:xrdpuser".to_string());
+        assert_eq!(identity_name(picked.as_ref()), Some("xrdpuser"));
+        // A bare fingerprint is a key selection, never an identity.
+        let key = Some("SHA256:abc".to_string());
+        assert_eq!(identity_name(key.as_ref()), None);
+        assert_eq!(identity_name(None), None);
+    }
 
     #[test]
     fn public_key_fingerprints_come_from_the_crate() {

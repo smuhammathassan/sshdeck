@@ -23,7 +23,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, px, rgb, AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity,
+    div, px, rgb, rgba, AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity,
     FocusHandle, Focusable as _, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
     Render, SharedString, Styled as _, Subscription, Window,
 };
@@ -31,9 +31,22 @@ use sshdeck_snippets::{Snippet, SnippetError, SnippetId, SnippetStore, Variable}
 
 /// The dark-blue glyph background for snippet cards, matching the keychain
 /// cards in the reference. No theme token covers it, so it is hardcoded.
+/// Duplicates `keys_pane::TILE_BG` (`rgba` reads `0xRRGGBBAA`); kept as a
+/// second literal so the panes stay independent.
 fn glyph_bg() -> Hsla {
-    // #244a67 — a dark-blue rounded square, white icon on top.
-    rgb(0x244a67).into()
+    // #1c4774 — a dark-blue rounded square, white icon on top.
+    rgba(0x1c4774ff).into()
+}
+
+/// Card columns for the available width: 1-up narrow, 2-up medium, 3-up wide.
+fn snippet_cols(win_w: f32) -> usize {
+    if win_w < 520.0 {
+        1
+    } else if win_w < 860.0 {
+        2
+    } else {
+        3
+    }
 }
 
 /// Parses the variable declaration field: `name, other=default, third`.
@@ -155,7 +168,6 @@ pub struct SnippetsPane {
     search_input: Entity<InputState>,
     search_open: bool,
     sort_alpha: bool,
-    shell_history_open: bool,
     view_list: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -213,7 +225,6 @@ impl SnippetsPane {
             search_input,
             search_open: false,
             sort_alpha: false,
-            shell_history_open: false,
             view_list: false,
             _subscriptions: subscriptions,
         };
@@ -238,6 +249,36 @@ impl SnippetsPane {
     /// The selected snippet id, if any.
     pub fn selected(&self) -> Option<&SnippetId> {
         self.selected.as_ref()
+    }
+
+    /// Inserts one snippet from the session sidebar's history form and persists
+    /// it. A label collision replaces the existing snippet, the same rule the
+    /// pane's own form follows. Returns the save error, if any, so the caller
+    /// can notify instead of silently dropping the entry.
+    pub fn add_quick_snippet(
+        &mut self,
+        label: String,
+        template: String,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let snippet = match Snippet::new(label, template) {
+            Ok(snippet) => snippet,
+            Err(error) => return Some(error.to_string()),
+        };
+        let new_id = snippet.id().clone();
+        self.store
+            .snippets_mut()
+            .retain(|existing| existing.id() != &new_id);
+        self.store.snippets_mut().push(snippet);
+        self.store
+            .snippets_mut()
+            .sort_by(|a, b| a.label().cmp(b.label()));
+        if let Err(error) = self.store.save() {
+            return Some(error.to_string());
+        }
+        self.selected = Some(new_id);
+        cx.notify();
+        None
     }
 
     /// Whether the create/edit form is open.
@@ -307,7 +348,9 @@ impl SnippetsPane {
         }
     }
 
-    fn open_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens a blank snippet form. Public so the session sidebar's empty
+    /// state can offer the same "New Snippet" affordance as the library.
+    pub fn open_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing = None;
         self.form_error = None;
         self.draft_label
@@ -532,19 +575,20 @@ impl SnippetsPane {
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let border = cx.theme().border;
-        let muted = cx.theme().muted_foreground;
 
-        // Left: + New snippet split button + Shell History (disabled, as in ref).
-        // Right: three small icon controls (search, grid, calendar) disabled.
+        // Left: + New snippet split button. Right: search, layout, sort —
+        // all working toggles.
         div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .justify_between()
-            .h(px(44.))
+            .min_h(px(56.))
             .px_3()
+            .py_1()
             .flex_shrink_0()
-            .bg(cx.theme().background)
+            .bg(cx.theme().popover)
             .border_b_1()
             .border_color(border)
             .child(
@@ -566,7 +610,6 @@ impl SnippetsPane {
                                     .icon(IconName::Plus)
                                     .label("New snippet")
                                     .small()
-                                    .primary()
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_new(window, cx);
                                     })),
@@ -581,18 +624,18 @@ impl SnippetsPane {
                                     })),
                             ),
                     )
+                    // ponytail: the session sidebar owns shell history and this
+                    // pane has no handle to it, so the button stays disabled
+                    // until the root view plumbs a sidebar-history callback in.
                     .child(
-                        Button::new("snippets-shell-history")
+                        Button::new("snippets-history")
+                            .ghost()
+                            .small()
                             .icon(Icon::default().data(glyph::CLOCK))
                             .label("Shell History")
-                            .small()
-                            .ghost()
-                            .selected(self.shell_history_open)
-                            .tooltip("Recent shell commands")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.shell_history_open = !this.shell_history_open;
-                                cx.notify();
-                            })),
+                            .text_size(px(14.))
+                            .disabled(true)
+                            .tooltip("Shell history lives in the session sidebar"),
                     ),
             )
             .child(
@@ -653,13 +696,6 @@ impl SnippetsPane {
                                 window.push_notification(Notification::info(msg), cx);
                                 cx.notify();
                             })),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(muted)
-                            .ml_2()
-                            .child(format!("{}", self.store.len())),
                     ),
             )
     }
@@ -679,7 +715,7 @@ impl SnippetsPane {
                     .w_full()
                     .p_4()
                     .rounded(px(10.))
-                    .bg(cx.theme().background)
+                    .bg(cx.theme().popover)
                     .border_1()
                     .border_color(cx.theme().border)
                     .child(
@@ -798,9 +834,12 @@ impl SnippetsPane {
             )
     }
 
-    fn render_grid(&self, cx: &mut Context<Self>) -> AnyElement {
-        let query = self.search_input.read(cx).value().trim().to_lowercase();
-        let mut snippets: Vec<&Snippet> = self
+    /// Snippets matching `query` (case-insensitive over label, template,
+    /// description), sorted per the pane's sort toggle. Shared by the full
+    /// grid and the sidebar compact list so both filter the same way.
+    fn filtered(&self, query: &str) -> Vec<Snippet> {
+        let query = query.trim().to_lowercase();
+        let mut out: Vec<Snippet> = self
             .store
             .snippets()
             .iter()
@@ -814,11 +853,42 @@ impl SnippetsPane {
                         .map(|d| d.to_lowercase().contains(&query))
                         .unwrap_or(false)
             })
+            .cloned()
             .collect();
-
         if self.sort_alpha {
-            snippets.sort_by(|a, b| a.label().cmp(b.label()));
+            out.sort_by(|a, b| a.label().cmp(b.label()));
         }
+        out
+    }
+
+    /// The search field, so the sidebar compact list can render the same live
+    /// filter instead of owning a second query box.
+    pub fn search_field(&self) -> Entity<InputState> {
+        self.search_input.clone()
+    }
+
+    /// Rows for the sidebar compact list: id plus the two text lines, already
+    /// filtered by the pane's live query and sorted per its sort toggle.
+    pub fn compact_rows(&self, cx: &App) -> Vec<(SnippetId, String, String)> {
+        let query = self.search_input.read(cx).value().to_string();
+        self.filtered(&query)
+            .into_iter()
+            .map(|snippet| {
+                let secondary = secondary_line(&snippet);
+                (snippet.id().clone(), snippet.label().to_string(), secondary)
+            })
+            .collect()
+    }
+
+    /// Selects a snippet and rebuilds its variable inputs. The sidebar
+    /// compact list calls this so a tap selects the same detail.
+    pub fn select(&mut self, id: SnippetId, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_id(id, window, cx);
+    }
+
+    fn render_grid(&self, win_w: f32, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.search_input.read(cx).value().trim().to_lowercase();
+        let snippets: Vec<Snippet> = self.filtered(&query);
 
         if self.view_list {
             let rows: Vec<AnyElement> = snippets
@@ -840,15 +910,38 @@ impl SnippetsPane {
                 .map(|snippet| self.render_card(snippet, cx).into_any_element())
                 .collect();
 
+            // Chunked rows so narrow windows drop 3-up to 2-up to 1-up.
+            // `AnyElement` is not `Clone`, so the cards are consumed in order
+            // rather than copied out of borrowed chunks.
+            let cols = snippet_cols(win_w).max(1);
+            let mut grid_rows: Vec<AnyElement> = Vec::new();
+            let mut cards = cards.into_iter();
+            loop {
+                let mut row_cards: Vec<AnyElement> = cards.by_ref().take(cols).collect();
+                if row_cards.is_empty() {
+                    break;
+                }
+                while row_cards.len() < cols {
+                    row_cards.push(div().flex_1().into_any_element());
+                }
+                grid_rows.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_3()
+                        .w_full()
+                        .children(row_cards)
+                        .into_any_element(),
+                );
+            }
             div()
                 .id("snippets-grid")
                 .flex()
-                .flex_row()
-                .flex_wrap()
+                .flex_col()
                 .gap_3()
                 .p_3()
                 .overflow_y_scrollbar()
-                .children(cards)
+                .children(grid_rows)
                 .into_any_element()
         }
     }
@@ -953,86 +1046,6 @@ impl SnippetsPane {
             )
     }
 
-    fn render_shell_history(&self, cx: &mut Context<Self>) -> Div {
-        let border = cx.theme().border;
-        let muted = cx.theme().muted_foreground;
-        let history = [
-            "systemctl status nginx",
-            "docker compose ps",
-            "tail -n 100 /var/log/syslog",
-            "df -h && free -m",
-            "git status && git pull",
-            "netstat -tuln",
-            "htop",
-            "journalctl -u ssh -n 50",
-        ];
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .mx_3()
-            .my_2()
-            .rounded(px(10.))
-            .bg(cx.theme().popover)
-            .border_1()
-            .border_color(border)
-            .shadow_xs()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child("RECENT SHELL HISTORY (Click to copy)"),
-                    )
-                    .child(
-                        Button::new("close-shell-history")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.shell_history_open = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .children(history.into_iter().enumerate().map(|(i, cmd)| {
-                        let cmd_str = cmd.to_string();
-                        div()
-                            .id(format!("sh-hist-{i}"))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(cx.theme().muted)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(cx.theme().border))
-                            .on_click(cx.listener(move |_, _, window, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(cmd_str.clone()));
-                                window.push_notification(
-                                    Notification::info(format!("Copied: {cmd_str}")),
-                                    cx,
-                                );
-                            }))
-                            .child(div().font_family("Menlo").text_size(px(12.)).child(cmd))
-                            .child(div().text_xs().text_color(muted).child("Copy"))
-                    })),
-            )
-    }
-
     fn render_card(&self, snippet: &Snippet, cx: &mut Context<Self>) -> impl IntoElement {
         let id = snippet.id().clone();
         let selected = self.selected.as_ref() == Some(&id);
@@ -1054,7 +1067,8 @@ impl SnippetsPane {
             .flex_row()
             .items_center()
             .gap_3()
-            .w(px(320.))
+            .flex_1()
+            .min_w(px(220.))
             .h(px(72.))
             .px_3()
             .py_2()
@@ -1364,13 +1378,14 @@ impl SnippetsPane {
 }
 
 impl Render for SnippetsPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Light content surface #edf1f2 is `sidebar` in the light theme; cards
         // and toolbar are `background` (#ffffff).
         let background = cx.theme().sidebar;
         let foreground = cx.theme().foreground;
         let form_open = self.form_open;
         let has_snippets = !self.store.is_empty();
+        let win_w = f32::from(window.bounds().size.width);
 
         let body: AnyElement = if form_open {
             self.render_form(cx).into_any_element()
@@ -1385,7 +1400,7 @@ impl Render for SnippetsPane {
                 .flex_1()
                 .min_h(px(0.))
                 .overflow_y_scrollbar()
-                .child(self.render_grid(cx))
+                .child(self.render_grid(win_w, cx))
                 .when_some(detail, |el, detail| el.child(detail))
                 .into_any_element()
         };
@@ -1403,25 +1418,29 @@ impl Render for SnippetsPane {
             .when(self.search_open, |el| {
                 el.child(
                     div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
                         .px_3()
                         .py_2()
                         .border_b_1()
                         .border_color(cx.theme().border)
                         .bg(cx.theme().popover)
                         .child(
-                            Input::new(&self.search_input)
-                                .small()
-                                .cleanable(true)
-                                .prefix(
-                                    Icon::new(IconName::Search)
-                                        .small()
-                                        .text_color(cx.theme().muted_foreground),
-                                ),
+                            div().flex_1().min_w(px(120.)).child(
+                                Input::new(&self.search_input)
+                                    .small()
+                                    .cleanable(true)
+                                    .prefix(
+                                        Icon::new(IconName::Search)
+                                            .small()
+                                            .text_color(cx.theme().muted_foreground),
+                                    ),
+                            ),
                         ),
                 )
-            })
-            .when(self.shell_history_open, |el| {
-                el.child(self.render_shell_history(cx))
             })
             .child(body)
     }
@@ -1452,7 +1471,7 @@ fn empty_state(cx: &App, title: &str, detail: &str) -> Div {
                 .child(
                     Icon::default()
                         .data(glyph::SNIPPET)
-                        .large()
+                        .size(px(32.))
                         .text_color(foreground),
                 ),
         )
@@ -1476,6 +1495,13 @@ fn empty_state(cx: &App, title: &str, detail: &str) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_columns_drop_on_narrow_windows() {
+        assert_eq!(snippet_cols(400.0), 1);
+        assert_eq!(snippet_cols(520.0), 2);
+        assert_eq!(snippet_cols(860.0), 3);
+    }
 
     #[test]
     fn parse_variables_splits_name_and_default() {

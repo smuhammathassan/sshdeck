@@ -22,7 +22,7 @@ use gpui_kit::component::{
     scroll::ScrollableElement as _,
     tooltip::Tooltip,
     ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _, Root,
-    Sizable as _, Theme, ThemeMode, ThemeRegistry, WindowExt,
+    Sizable as _, Size, Theme, ThemeMode, ThemeRegistry, WindowExt,
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
@@ -40,7 +40,9 @@ use snippets_pane::SnippetsPane;
 use sshdeck_core::session::{Session as SshSession, SessionConfig, SessionEvent};
 use sshdeck_core::{Host, HostId, HostStore, SessionState};
 use sshdeck_sftp::SftpClient;
-use terminal::{PaneStatus, TerminalPane};
+use terminal::{
+    PaneHeaderAction, PaneStatus, TerminalOptions, TerminalPane, TerminalScheme, SCHEMES,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -83,8 +85,8 @@ fn main() {
 /// and the close button stay — the window always has a way to close.
 ///
 /// `traffic_light_position` is set explicitly so the lights sit level with the
-/// 51px tab row inside the 56px header (the [gpui-component `TitleBar`] uses
-/// `(9, 9)` for its 34px bar; `(9, 20)` centres a ~14px light group in 56px).
+/// 30px tab pills inside the 40px header (the [gpui-component `TitleBar`] uses
+/// `(9, 9)` for its 34px bar; `(9, 13)` centres a ~14px light group in 40px).
 /// The header marks itself as `WindowControlArea::Drag`, so the window can be
 /// dragged from the whole header even though the system title bar is hidden.
 ///
@@ -94,7 +96,7 @@ fn window_options() -> WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: None,
             appears_transparent: true,
-            traffic_light_position: Some(point(px(9.), px(20.))),
+            traffic_light_position: Some(point(px(9.), px(13.))),
         }),
         app_owns_titlebar_drag: false,
         ..WindowOptions::default()
@@ -265,6 +267,7 @@ fn parse_start_pane(value: &str) -> Option<StartPane> {
         "snippets" => Some(StartPane::Nav(LeftNav::Snippets)),
         "knownhosts" => Some(StartPane::Nav(LeftNav::KnownHosts)),
         "logs" => Some(StartPane::Nav(LeftNav::Logs)),
+        "settings" => Some(StartPane::Nav(LeftNav::Settings)),
         "sftp" => Some(StartPane::Sftp),
         _ => None,
     }
@@ -285,6 +288,112 @@ fn parse_port(raw: &str) -> Result<u16, String> {
         _ => Err(format!(
             "Port must be a number between 1 and 65535, got \"{raw}\""
         )),
+    }
+}
+
+/// The subtitle under a host card's label: protocols, then the login for each.
+///
+/// Tags live in the Host Details tags box, not here — appending them to the
+/// subtitle duplicated the tag row and pushed real connection info out.
+fn host_subtitle(host: &Host) -> String {
+    let mut tokens: Vec<String> = host.protocols().to_vec();
+    if tokens.is_empty() {
+        tokens.push("ssh".to_string());
+    }
+    if !host.username.is_empty() {
+        // One login per protocol: `ssh, telnet, root, root`.
+        let logins = std::iter::repeat(host.username.clone()).take(tokens.len());
+        tokens.extend(logins);
+    }
+    tokens.join(", ")
+}
+
+/// A Termius Host Details input box: h40, radius 8, `#d5dde0` border.
+///
+/// The caller drops a bare `Input` (with `appearance(false)`) or a static
+/// row inside; the box carries the sizing, border, and padding.
+fn details_box() -> gpui_kit::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .h(px(40.))
+        .px_3()
+        .w_full()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(rgb(0xd5dde0))
+}
+
+/// Vault grid columns for the available centre width, matching Termius's
+/// 1/2/3/4-column breakpoints at 360/700/1200px (3 columns proven at ~1038px
+/// available width in the 3.08.00 capture).
+fn grid_columns(avail_w: f32) -> usize {
+    if avail_w < 360.0 {
+        1
+    } else if avail_w < 700.0 {
+        2
+    } else if avail_w < 1200.0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Left-rail width for the window width: a 60px icon strip when manually
+/// collapsed or the window is narrower than ~900px, otherwise the 185px rail.
+fn rail_width(win_w: f32, collapsed: bool) -> f32 {
+    if collapsed || win_w < 900.0 {
+        60.0
+    } else {
+        185.0
+    }
+}
+
+/// Whether the host-details drawer floats over the vault instead of docking
+/// beside it: below ~800px there is no room for a docked drawer.
+fn details_overlay(win_w: f32) -> bool {
+    win_w < 800.0
+}
+
+/// Docked host-details drawer width: 300px at 800–1100px, 360px above 1100.
+/// Below ~800px the caller floats it (see `details_overlay`) instead.
+fn details_width(win_w: f32) -> f32 {
+    if win_w < 1100.0 {
+        300.0
+    } else {
+        360.0
+    }
+}
+
+/// Max popover width: 320px capped at 90vw so popovers never overflow narrow
+/// windows. Pure so the clamp has a test.
+fn popover_max_w(win_w: f32) -> f32 {
+    (win_w * 0.9).min(320.0).max(160.0)
+}
+
+/// Max popover height: 70vh, always paired with `overflow_y_scrollbar` at the
+/// call site. Pure so the factor has a test.
+fn popover_max_h(win_h: f32) -> f32 {
+    (win_h * 0.7).max(160.0)
+}
+
+/// Below ~600px width anchored popovers become full-width drawers instead of
+/// floating cards. Pure so the breakpoint has a test.
+fn use_full_drawer(win_w: f32) -> bool {
+    win_w < 600.0
+}
+
+/// Host card height: list rows stay 48px; grid cards are 68px, 56px on narrow
+/// windows. 44px inputs keep their touch target (see `sidebar_row`). Pure.
+fn host_card_height(is_list: bool, win_w: f32) -> f32 {
+    if is_list {
+        48.0
+    } else if use_full_drawer(win_w) {
+        56.0
+    } else {
+        68.0
     }
 }
 
@@ -440,6 +549,8 @@ enum MainTab {
     Sftp,
     /// The new tab screen (hosts picker and workspaces).
     NewTab,
+    /// The tiled workspace: one or more session panes side by side.
+    Workspace,
     /// The terminal for `sessions[index]`.
     Session(usize),
 }
@@ -454,6 +565,218 @@ fn tab_after_close(tab: MainTab, closed: usize) -> MainTab {
         other => other,
     }
 }
+
+/// The session right-sidebar tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarTab {
+    Snippets,
+    History,
+    Autocomplete,
+    Appearance,
+}
+
+/// Cap for the session sidebar's suggestion history. Like the logs pane's ring
+/// buffer, it evicts the oldest entry past the cap instead of growing.
+const MAX_HISTORY_ENTRIES: usize = 200;
+
+/// Pushes one suggestion onto the bounded sidebar history, evicting the oldest
+/// past [`MAX_HISTORY_ENTRIES`]. Pure so the bound can be checked without a
+/// window.
+fn push_history(history: &mut Vec<String>, entry: String) {
+    if history.len() >= MAX_HISTORY_ENTRIES {
+        history.remove(0);
+    }
+    history.push(entry);
+}
+
+/// A workspace tiling: one session or a split of nested tilings.
+///
+/// A `Split` lays its children side by side (`Row`) or stacked (`Col`), with
+/// `weights` as each child's `flex_grow` share: nesting mirrors the reference
+/// (a column of two beside a full-height pane) and uneven weights widen one
+/// tile (three columns at 1/1/2). New splits default to equal shares.
+/// ponytail: no drag-resize yet — ceiling: a gutter handle writing user
+/// shares back into `weights`.
+#[derive(Clone, Debug, PartialEq)]
+enum WorkspaceNode {
+    /// No tiles yet; the workspace seeds it from the focused session.
+    Empty,
+    /// One tiled session, by index into `sessions`.
+    Pane(usize),
+    /// A split of two or more nested tilings.
+    Split {
+        dir: SplitDir,
+        weights: Vec<f32>,
+        children: Vec<WorkspaceNode>,
+    },
+}
+
+/// Split direction: `Row` lays children side by side, `Col` stacks them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitDir {
+    Row,
+    Col,
+}
+
+impl SplitDir {
+    /// The perpendicular axis, so splitting a focused tile nests the new
+    /// tile across its parent's direction.
+    fn other(self) -> Self {
+        match self {
+            Self::Row => Self::Col,
+            Self::Col => Self::Row,
+        }
+    }
+}
+
+/// Flattens the tiling into session indexes in tile order. Pure so the tree
+/// bookkeeping has a test.
+fn workspace_leaves(node: &WorkspaceNode) -> Vec<usize> {
+    match node {
+        WorkspaceNode::Empty => Vec::new(),
+        WorkspaceNode::Pane(index) => vec![*index],
+        WorkspaceNode::Split { children, .. } => {
+            children.iter().flat_map(workspace_leaves).collect()
+        }
+    }
+}
+
+/// Splits the focused tile to show `index`: the focused leaf becomes a
+/// two-child split across the parent axis holding the old and new tiles, so
+/// repeated splits nest instead of flattening. An already-tiled session is
+/// focused, not duplicated, so every tile keeps its own `TerminalPane`
+/// entity. Pure so the split bookkeeping has a test. Returns the tree and
+/// the new focus as a flattened leaf position.
+fn workspace_insert(node: &WorkspaceNode, focus: usize, index: usize) -> (WorkspaceNode, usize) {
+    let leaves = workspace_leaves(node);
+    if let Some(position) = leaves.iter().position(|&tile| tile == index) {
+        return (node.clone(), position);
+    }
+    if leaves.is_empty() {
+        return (WorkspaceNode::Pane(index), 0);
+    }
+    // A stale focus splits the last tile rather than panicking.
+    let target = leaves
+        .get(focus)
+        .copied()
+        .unwrap_or(leaves[leaves.len() - 1]);
+    let (out, _) = insert_at(node, target, index, SplitDir::Row);
+    // The insert above always plants `index`, so this cannot fail.
+    let position = workspace_leaves(&out)
+        .iter()
+        .position(|&tile| tile == index)
+        .unwrap_or(0);
+    (out, position)
+}
+
+/// Replaces the leaf showing `target` with a two-child split across the
+/// parent axis. Returns the tree and whether the swap happened.
+fn insert_at(
+    node: &WorkspaceNode,
+    target: usize,
+    index: usize,
+    dir: SplitDir,
+) -> (WorkspaceNode, bool) {
+    match node {
+        WorkspaceNode::Pane(shown) if *shown == target => (
+            WorkspaceNode::Split {
+                dir,
+                weights: vec![1.0, 1.0],
+                children: vec![WorkspaceNode::Pane(*shown), WorkspaceNode::Pane(index)],
+            },
+            true,
+        ),
+        WorkspaceNode::Split {
+            dir: parent,
+            weights,
+            children,
+        } => {
+            let mut out = Vec::with_capacity(children.len());
+            let mut done = false;
+            for child in children {
+                if done {
+                    out.push(child.clone());
+                } else {
+                    let (next, hit) = insert_at(child, target, index, parent.other());
+                    out.push(next);
+                    done = hit;
+                }
+            }
+            (
+                WorkspaceNode::Split {
+                    dir: *parent,
+                    weights: weights.clone(),
+                    children: out,
+                },
+                done,
+            )
+        }
+        _ => (node.clone(), false),
+    }
+}
+
+/// Repairs the tiling after the session at `closed` is removed: tiles showing
+/// it are dropped, later indexes shift down, emptied splits are pruned and
+/// single-child splits collapse. Structural edits reset to equal shares (no
+/// writer of uneven weights exists yet). Pure so the bookkeeping has a test.
+/// Returns the tree and the focus clamped into the remaining tiles.
+fn workspace_remove(node: &WorkspaceNode, focus: usize, closed: usize) -> (WorkspaceNode, usize) {
+    let out = remove_at(node, closed).unwrap_or(WorkspaceNode::Empty);
+    let end = workspace_leaves(&out).len().saturating_sub(1);
+    (out, focus.min(end))
+}
+
+/// Drops the closed session and shifts later indexes down. `None` means
+/// nothing remains; a split left with one child collapses into it.
+fn remove_at(node: &WorkspaceNode, closed: usize) -> Option<WorkspaceNode> {
+    match node {
+        WorkspaceNode::Empty => None,
+        WorkspaceNode::Pane(index) if *index == closed => None,
+        WorkspaceNode::Pane(index) => Some(WorkspaceNode::Pane(if *index > closed {
+            index - 1
+        } else {
+            *index
+        })),
+        WorkspaceNode::Split { dir, children, .. } => {
+            let kept: Vec<WorkspaceNode> = children
+                .iter()
+                .filter_map(|child| remove_at(child, closed))
+                .collect();
+            match kept.len() {
+                0 => None,
+                1 => kept.into_iter().next(),
+                _ => Some(WorkspaceNode::Split {
+                    dir: *dir,
+                    weights: vec![1.0; kept.len()],
+                    children: kept,
+                }),
+            }
+        }
+    }
+}
+
+/// Settles `weights` into one positive share per child: a short table pads
+/// with equal shares and any zero, negative, or non-finite entry falls back
+/// to all-equal. Pure so the ratio math has a test.
+fn normalize_weights(weights: &[f32], len: usize) -> Vec<f32> {
+    let mut out: Vec<f32> = weights.iter().take(len).copied().collect();
+    out.resize(len, 1.0);
+    if out.iter().all(|weight| *weight > 0.0 && weight.is_finite()) {
+        out
+    } else {
+        vec![1.0; len]
+    }
+}
+
+/// Below this window width the workspace stacks tiles vertically instead of
+/// side by side: two 80-column panes cannot fit, so a row would squeeze each
+/// canvas below a usable grid.
+const WORKSPACE_STACK_WIDTH: f32 = 700.0;
+
+/// Below this window width the 300pt session sidebar becomes an overlay drawer
+/// instead of an inset panel: at 300pt plus a usable terminal the content
+/// would squeeze below a usable grid.
+const SIDEBAR_OVERLAY_WIDTH: f32 = 900.0;
 
 /// Left navigation rail entries — mirrors Termius sidebar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -567,19 +890,51 @@ struct SshDeck {
     theme_picker_open: bool,
     /// Credentials popover inside host details (+ SSH ID, Key, etc.).
     credentials_popover_open: bool,
-    /// Whether password text is revealed in credentials.
-    password_visible: bool,
     /// Whether "Show more" collapsible is expanded in host details.
     show_more: bool,
-    /// Whether the inline tag input is open.
-    add_tag_open: bool,
-    add_tag_input: Entity<InputState>,
+    /// Label/address editors for the Host Details panel, synced to the selected
+    /// host by [`SshDeck::sync_details_inputs`] (real `Input`s, not boxes).
+    details_label: Entity<InputState>,
+    details_address: Entity<InputState>,
+    details_port: Entity<InputState>,
+    details_username: Entity<InputState>,
+    details_password: Entity<InputState>,
+    details_group: Entity<InputState>,
+    details_tags: Entity<InputState>,
+    /// Which host the details inputs are synced to; `None` means they are stale
+    /// and must be re-synced before the panel renders them.
+    details_edit_host: Option<HostId>,
     /// Whether the personal vault info dialog is open.
     vault_info_open: bool,
     /// Search input for the New Tab screen.
     new_tab_query: Entity<InputState>,
     /// Selected terminal color theme.
     selected_theme: String,
+    /// Terminal font size in pixels. New panes are constructed with it and the
+    /// stepper applies it live to existing panes; only the scrollback cap
+    /// still needs a pane rebuild (it is fixed when the grid is created).
+    terminal_font_size: f32,
+    /// Session right-sidebar tab and visibility. Open by default next to the
+    /// terminal, mirroring the reference workspace layout.
+    sidebar_tab: SidebarTab,
+    sidebar_open: bool,
+    /// Workspace tiling: a recursive split tree of session indexes, with the
+    /// focused tile as a flattened leaf position.
+    workspace: WorkspaceNode,
+    workspace_focus: usize,
+    /// Toolbar direction override for the root split: `None` follows the
+    /// tree's own directions, `Some` forces one axis. Narrow windows stack
+    /// vertically regardless.
+    workspace_direction: Option<SplitDir>,
+    /// When true the workspace shows only the focused tile.
+    workspace_maximized: bool,
+    /// Sidebar suggestion history (bounded by [`MAX_HISTORY_ENTRIES`]) and its
+    /// inline form: three inputs plus a visibility flag.
+    history: Vec<String>,
+    history_form_open: bool,
+    hist_who: Entity<InputState>,
+    hist_where: Entity<InputState>,
+    hist_what: Entity<InputState>,
     /// Subscription handles must outlive construction, so they are owned here.
     _subscriptions: Vec<Subscription>,
 }
@@ -601,7 +956,21 @@ impl SshDeck {
         let draft_port = cx.new(|cx| InputState::new(window, cx).placeholder("port (default 22)"));
         let new_tab_query =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search hosts or tabs"));
-        let add_tag_input = cx.new(|cx| InputState::new(window, cx).placeholder("New tag name..."));
+        let hist_who = cx.new(|cx| InputState::new(window, cx).placeholder("User"));
+        let hist_where = cx.new(|cx| InputState::new(window, cx).placeholder("Host"));
+        let hist_what = cx.new(|cx| InputState::new(window, cx).placeholder("Suggestion..."));
+        let details_label = cx.new(|cx| InputState::new(window, cx).placeholder("Label"));
+        let details_address =
+            cx.new(|cx| InputState::new(window, cx).placeholder("hostname or IP"));
+        let details_port = cx.new(|cx| InputState::new(window, cx).placeholder("22"));
+        let details_username = cx.new(|cx| InputState::new(window, cx).placeholder("Username"));
+        let details_password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Password")
+                .masked(true)
+        });
+        let details_group = cx.new(|cx| InputState::new(window, cx).placeholder("Parent Group"));
+        let details_tags = cx.new(|cx| InputState::new(window, cx).placeholder("Tags"));
 
         // Re-render the list as the query changes; the filter itself is applied
         // in `render`, so no filtered copy needs to be kept in state.
@@ -614,6 +983,44 @@ impl SshDeck {
             cx.subscribe_in(&new_tab_query, window, |_, _, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
+                }
+            }),
+            // Details editors commit each keystroke to the selected host, so the
+            // card label follows the edit live. The store save is the same
+            // write-every-mutation rule the rest of the view follows.
+            cx.subscribe_in(&details_label, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.commit_details_label(window, cx);
+                }
+            }),
+            cx.subscribe_in(&details_address, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.commit_details_address(window, cx);
+                }
+            }),
+            cx.subscribe_in(&details_port, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.commit_details_port(window, cx);
+                }
+            }),
+            cx.subscribe_in(&details_username, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.commit_details_username(window, cx);
+                }
+            }),
+            cx.subscribe_in(&details_password, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.commit_details_password(window, cx);
+                }
+            }),
+            cx.subscribe_in(&details_group, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.commit_details_group(window, cx);
+                }
+            }),
+            cx.subscribe_in(&details_tags, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.commit_details_tags(window, cx);
                 }
             }),
         ];
@@ -656,13 +1063,30 @@ impl SshDeck {
             details_menu_open: false,
             theme_picker_open: false,
             credentials_popover_open: false,
-            password_visible: false,
             show_more: false,
-            add_tag_open: false,
-            add_tag_input,
+            details_label,
+            details_address,
+            details_port,
+            details_username,
+            details_password,
+            details_group,
+            details_tags,
+            details_edit_host: None,
             vault_info_open: false,
             new_tab_query,
             selected_theme: "Termius Dark".to_string(),
+            terminal_font_size: 14.0,
+            sidebar_tab: SidebarTab::Snippets,
+            sidebar_open: true,
+            workspace: WorkspaceNode::Empty,
+            workspace_focus: 0,
+            workspace_direction: None,
+            workspace_maximized: false,
+            history: Vec::new(),
+            history_form_open: false,
+            hist_who,
+            hist_where,
+            hist_what,
             _subscriptions: subscriptions,
         };
 
@@ -759,6 +1183,7 @@ impl SshDeck {
         host.port = port;
         let id = self.store.inventory_mut().insert(host);
         self.selected = Some(id);
+        self.sync_details_inputs(window, cx);
 
         if let Err(error) = self.store.save() {
             window.push_notification(Notification::error(format!("Could not save: {error}")), cx);
@@ -781,10 +1206,249 @@ impl SshDeck {
         if self.selected.as_ref() == Some(id) {
             self.selected = None;
         }
+        self.details_edit_host = None;
         if let Err(error) = self.store.save() {
             window.push_notification(Notification::error(format!("Could not save: {error}")), cx);
         }
         cx.notify();
+    }
+
+    /// Copies the selected host's label/address into the Host Details inputs.
+    ///
+    /// Called wherever the selection is assigned (card click, add, duplicate),
+    /// because the inputs outlive any one host. The edit-host marker is set
+    /// **before** the values so a `Change` event emitted by `set_value` commits
+    /// back to the newly selected host with identical values — idempotent.
+    fn sync_details_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected.clone() else {
+            self.details_edit_host = None;
+            return;
+        };
+        if self.details_edit_host.as_ref() == Some(&id) {
+            return;
+        }
+        if let Some(host) = self.store.inventory().get(&id).cloned() {
+            self.details_edit_host = Some(id);
+            self.details_label.update(cx, |state, cx| {
+                state.set_value(host.label.as_str(), window, cx)
+            });
+            self.details_address.update(cx, |state, cx| {
+                state.set_value(host.address.as_str(), window, cx);
+            });
+            self.details_port.update(cx, |state, cx| {
+                state.set_value(host.port.to_string().as_str(), window, cx);
+            });
+            self.details_username.update(cx, |state, cx| {
+                state.set_value(host.username.as_str(), window, cx);
+            });
+            let password = match &host.auth {
+                sshdeck_core::AuthMethod::Password { secret_ref } => secret_ref.clone(),
+                _ => String::new(),
+            };
+            self.details_password.update(cx, |state, cx| {
+                state.set_value(password.as_str(), window, cx);
+            });
+            self.details_group.update(cx, |state, cx| {
+                state.set_value(host.group.as_deref().unwrap_or(""), window, cx);
+            });
+            self.details_tags.update(cx, |state, cx| {
+                state.set_value(host.tags.join(", ").as_str(), window, cx);
+            });
+        }
+    }
+
+    /// Writes the details Label input back to the selected host.
+    fn commit_details_label(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.details_edit_host.clone() else {
+            return;
+        };
+        let label = self.details_label.read(cx).value().to_string();
+        if let Some(mut host) = self.store.inventory().get(&id).cloned() {
+            if host.label != label {
+                host.label = label;
+                self.store.inventory_mut().upsert(host);
+                if let Err(error) = self.store.save() {
+                    window.push_notification(
+                        Notification::error(format!("Could not save: {error}")),
+                        cx,
+                    );
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Writes the details Address input back to the selected host.
+    fn commit_details_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.details_edit_host.clone() else {
+            return;
+        };
+        let address = self.details_address.read(cx).value().trim().to_string();
+        if address.is_empty() {
+            return;
+        }
+        if let Some(mut host) = self.store.inventory().get(&id).cloned() {
+            if host.address != address {
+                host.address = address;
+                self.store.inventory_mut().upsert(host);
+                if let Err(error) = self.store.save() {
+                    window.push_notification(
+                        Notification::error(format!("Could not save: {error}")),
+                        cx,
+                    );
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Writes the details Port input back to the selected host.
+    ///
+    /// Intermediate keystrokes (`""`, partial numbers) do not parse, so they
+    /// are ignored rather than clobbering the port or spamming warnings — the
+    /// last good value stays until the field parses again.
+    fn commit_details_port(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.details_edit_host.clone() else {
+            return;
+        };
+        let raw = self.details_port.read(cx).value().to_string();
+        let Ok(port) = parse_port(&raw) else {
+            return;
+        };
+        if let Some(mut host) = self.store.inventory().get(&id).cloned() {
+            if host.port != port {
+                host.port = port;
+                self.store.inventory_mut().upsert(host);
+                if let Err(error) = self.store.save() {
+                    window.push_notification(
+                        Notification::error(format!("Could not save: {error}")),
+                        cx,
+                    );
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Writes the details Username input back to the selected host.
+    fn commit_details_username(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.details_edit_host.clone() else {
+            return;
+        };
+        let username = self.details_username.read(cx).value().trim().to_string();
+        if let Some(mut host) = self.store.inventory().get(&id).cloned() {
+            if host.username != username {
+                host.username = username;
+                self.store.inventory_mut().upsert(host);
+                if let Err(error) = self.store.save() {
+                    window.push_notification(
+                        Notification::error(format!("Could not save: {error}")),
+                        cx,
+                    );
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Writes the details Password input back to the selected host.
+    ///
+    /// A non-empty value selects password auth with that keychain reference;
+    /// clearing the field drops a password-auth host back to agent auth rather
+    /// than persisting an empty secret. Other methods (key, FIDO2) are left
+    /// alone until their own editors exist — typing here must not silently
+    /// discard a key path.
+    fn commit_details_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.details_edit_host.clone() else {
+            return;
+        };
+        let password = self.details_password.read(cx).value().to_string();
+        if let Some(mut host) = self.store.inventory().get(&id).cloned() {
+            let next = match &host.auth {
+                sshdeck_core::AuthMethod::Password { secret_ref } if secret_ref == &password => {
+                    None
+                }
+                sshdeck_core::AuthMethod::Password { .. } => Some(if password.is_empty() {
+                    sshdeck_core::AuthMethod::Agent
+                } else {
+                    sshdeck_core::AuthMethod::Password {
+                        secret_ref: password,
+                    }
+                }),
+                sshdeck_core::AuthMethod::Agent if !password.is_empty() => {
+                    Some(sshdeck_core::AuthMethod::Password {
+                        secret_ref: password,
+                    })
+                }
+                // Key-based and other methods are left alone: typing here
+                // must not silently discard a key path.
+                _ => None,
+            };
+            if let Some(auth) = next {
+                host.auth = auth;
+                self.store.inventory_mut().upsert(host);
+                if let Err(error) = self.store.save() {
+                    window.push_notification(
+                        Notification::error(format!("Could not save: {error}")),
+                        cx,
+                    );
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Writes the details Parent Group input back to the selected host.
+    fn commit_details_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.details_edit_host.clone() else {
+            return;
+        };
+        let raw = self.details_group.read(cx).value().trim().to_string();
+        let group = if raw.is_empty() { None } else { Some(raw) };
+        if let Some(mut host) = self.store.inventory().get(&id).cloned() {
+            if host.group != group {
+                host.group = group;
+                self.store.inventory_mut().upsert(host);
+                if let Err(error) = self.store.save() {
+                    window.push_notification(
+                        Notification::error(format!("Could not save: {error}")),
+                        cx,
+                    );
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Writes the details Tags input back to the selected host.
+    ///
+    /// The box holds a comma-separated list (`prod, edge`); splitting keeps
+    /// editing to one row instead of a pill editor.
+    fn commit_details_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.details_edit_host.clone() else {
+            return;
+        };
+        let tags: Vec<String> = self
+            .details_tags
+            .read(cx)
+            .value()
+            .split(',')
+            .map(|tag| tag.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .collect();
+        if let Some(mut host) = self.store.inventory().get(&id).cloned() {
+            if host.tags != tags {
+                host.tags = tags;
+                self.store.inventory_mut().upsert(host);
+                if let Err(error) = self.store.save() {
+                    window.push_notification(
+                        Notification::error(format!("Could not save: {error}")),
+                        cx,
+                    );
+                }
+                cx.notify();
+            }
+        }
     }
 
     /// Opens a session for `host`, prompting for a password first when the host
@@ -863,7 +1527,32 @@ impl SshDeck {
     ) {
         // Construct the pane inside its own entity context; the shell only holds
         // the handle. `TerminalPane::new` returns the pane state, not an entity.
-        let pane = cx.new(|cx| TerminalPane::new(config, window, cx));
+        // The sidebar's font size and theme apply here so a new pane opens
+        // looking like the existing ones; unknown theme names fall back to the
+        // pane default rather than refusing to connect.
+        let font_size = self.terminal_font_size;
+        let scheme = TerminalScheme::by_name(&self.selected_theme).unwrap_or_default();
+        let options = TerminalOptions::new(font_size, 10_000, true).with_scheme(scheme);
+        // The default constructor covers the default options; anything else
+        // goes through the options form so the sidebar's font size and theme
+        // apply to the new pane.
+        let pane = if options == TerminalOptions::default() {
+            cx.new(|cx| TerminalPane::new(config, window, cx))
+        } else {
+            cx.new(|cx| TerminalPane::new_with_options(config, options, window, cx))
+        };
+        // The pane header reports split/max/close back through a weak handle,
+        // the same shape as the palette's `set_on_select`.
+        let weak = cx.entity().downgrade();
+        pane.update(cx, |pane, _| {
+            pane.set_header_title(host.label.clone());
+            pane.set_on_pane_action(move |action, pane, window, cx| {
+                weak.update(cx, |this, cx| {
+                    this.pane_action(action, pane, window, cx);
+                })
+                .ok();
+            });
+        });
         // Re-render the chrome whenever the pane's status changes. The pane is
         // the only thing that reads the event channel; the shell just mirrors.
         let subscription = cx.observe_in(&pane, window, |this, pane, window, cx| {
@@ -930,11 +1619,6 @@ impl SshDeck {
             );
         }
         cx.notify();
-    }
-
-    /// The tab the pane is showing, if any.
-    fn active_session(&self) -> Option<&Session> {
-        self.active.and_then(|index| self.sessions.get(index))
     }
 
     fn connected_count(&self) -> usize {
@@ -1062,37 +1746,9 @@ impl SshDeck {
         if let Some(pane) = self.logs_pane.clone() {
             return pane;
         }
-        let hosts = self.store.inventory().hosts().to_vec();
-        let pane = cx.new(|cx| {
-            let mut p = LogsPane::new(window, cx);
-            for h in hosts.iter().take(5) {
-                p.append(
-                    "Recent",
-                    "saved",
-                    if h.username.is_empty() {
-                        "user".to_string()
-                    } else {
-                        h.username.clone()
-                    },
-                    "inventory",
-                    h.label.clone(),
-                    h.endpoint(),
-                    logs_pane::LogLevel::Info,
-                    cx,
-                );
-            }
-            p.append(
-                "Today",
-                "active",
-                "system",
-                "localhost",
-                "sshdeck",
-                "Local workspace initialized",
-                logs_pane::LogLevel::Success,
-                cx,
-            );
-            p
-        });
+        // The buffer starts empty: entries appear only as the app pushes real
+        // connect/close/forward/transfer events. Nothing is fabricated here.
+        let pane = cx.new(|cx| LogsPane::new(window, cx));
         self.logs_pane = Some(pane.clone());
         pane
     }
@@ -1116,7 +1772,18 @@ impl SshDeck {
         self.overlay = None;
         self.tab = tab;
         if matches!(tab, MainTab::Sftp) && self.sftp_pane.is_none() {
+            let root = cx.entity().downgrade();
             self.sftp_pane = Some(cx.new(|cx| SftpPane::new(window, cx)));
+            if let Some(pane) = self.sftp_pane.clone() {
+                pane.update(cx, |pane, _| {
+                    pane.set_on_show_logs(move |window, cx| {
+                        root.update(cx, |this, cx| {
+                            this.select_left_nav(LeftNav::Logs, window, cx);
+                        })
+                        .ok();
+                    });
+                });
+            }
         }
         if let MainTab::Session(index) = tab {
             self.active = Some(index);
@@ -1124,10 +1791,109 @@ impl SshDeck {
                 let pane = session.pane.clone();
                 pane.update(cx, |pane, cx| pane.focus(window, cx));
             }
+            self.set_workspace_chrome(false, cx);
+        }
+        if matches!(tab, MainTab::Workspace) {
+            // Seed the workspace from the focused session on first entry.
+            if workspace_leaves(&self.workspace).is_empty() {
+                if let Some(active) = self.active {
+                    self.workspace = WorkspaceNode::Pane(active);
+                    self.workspace_focus = 0;
+                }
+            }
+            self.set_workspace_chrome(true, cx);
+            if let Some(&index) = workspace_leaves(&self.workspace).get(self.workspace_focus) {
+                self.active = Some(index);
+                if let Some(session) = self.sessions.get(index) {
+                    let pane = session.pane.clone();
+                    pane.update(cx, |pane, cx| pane.focus(window, cx));
+                }
+            }
         }
         self.reconcile_sftp(window, cx);
         self.reconcile_forward(cx);
         cx.notify();
+    }
+
+    /// Applies the sidebar's terminal theme to every open pane live. Unknown
+    /// names keep the pane default; the grid parser holds no colours, so no
+    /// rebuild is needed. Called from event handlers only.
+    fn apply_terminal_scheme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let scheme = TerminalScheme::by_name(&self.selected_theme).unwrap_or_default();
+        for session in &self.sessions {
+            session.pane.update(cx, |pane, _| pane.set_scheme(scheme));
+        }
+        let _ = window;
+    }
+
+    /// Applies a sidebar font size to new and existing panes, clamped to the
+    /// terminal's 10–24px bounds. The cell is re-measured from it every frame,
+    /// so `line_height` scales with the glyphs. Called from event handlers.
+    fn set_terminal_font_size(&mut self, size: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let size = if size.is_finite() {
+            size.clamp(10.0, 24.0)
+        } else {
+            14.0
+        };
+        self.terminal_font_size = size;
+        for session in &self.sessions {
+            session.pane.update(cx, |pane, _| pane.set_font_size(size));
+        }
+        let _ = window;
+    }
+
+    /// Shows or hides the 28pt per-pane header on every session pane, with a
+    /// fresh title snapshot. Called from event handlers only — never from
+    /// render or the pane observer, where an entity update would re-notify.
+    fn set_workspace_chrome(&mut self, show: bool, cx: &mut Context<Self>) {
+        for session in &self.sessions {
+            let title = session.status.title.clone().unwrap_or_else(|| {
+                self.store
+                    .inventory()
+                    .get(&session.host)
+                    .map(|host| host.label.clone())
+                    .unwrap_or_else(|| session.host.to_string())
+            });
+            session.pane.update(cx, |pane, _| {
+                pane.set_show_header(show);
+                pane.set_header_title(title.clone());
+            });
+        }
+    }
+
+    /// Handles a workspace pane header action for the tile that owns `pane`.
+    fn pane_action(
+        &mut self,
+        action: PaneHeaderAction,
+        pane: Entity<TerminalPane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.sessions.iter().position(|s| s.pane == pane) else {
+            return;
+        };
+        match action {
+            PaneHeaderAction::Split => self.workspace_split(index, window, cx),
+            PaneHeaderAction::Maximize => {
+                self.workspace_maximized = !self.workspace_maximized;
+                self.select_tab(MainTab::Workspace, window, cx);
+            }
+            PaneHeaderAction::Close => self.close_session(index, window, cx),
+        }
+    }
+
+    /// Tiles `index` next to the focused tile and enters the workspace.
+    ///
+    /// An already-tiled session is focused, not duplicated, so every tile keeps
+    /// its own `TerminalPane` entity. A per-tile second PTY on the same host is
+    /// the upgrade path; it needs the host's `SessionConfig` (and possibly a
+    /// second password) and is deliberately not opened here.
+    fn workspace_split(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (workspace, focus) = workspace_insert(&self.workspace, self.workspace_focus, index);
+        self.workspace = workspace;
+        self.workspace_focus = focus;
+        self.workspace_maximized = false;
+        self.select_tab(MainTab::Workspace, window, cx);
     }
 
     /// Closes one session tab and repairs the focused-tab bookkeeping.
@@ -1161,6 +1927,20 @@ impl SshDeck {
             Some(active) if active > index => Some(active - 1),
             other => other,
         };
+        // Tiles point at session indexes, so they shift down past the removal
+        // and drop tiles that showed the closed session.
+        let (workspace, workspace_focus) =
+            workspace_remove(&self.workspace, self.workspace_focus, index);
+        self.workspace = workspace;
+        self.workspace_focus = workspace_focus;
+        if matches!(self.tab, MainTab::Workspace) {
+            let leaves = workspace_leaves(&self.workspace);
+            if leaves.is_empty() {
+                self.tab = MainTab::Vaults;
+            } else {
+                self.active = leaves.get(self.workspace_focus).copied();
+            }
+        }
         self.reconcile_sftp(window, cx);
         self.reconcile_forward(cx);
         cx.notify();
@@ -1202,13 +1982,23 @@ impl SshDeck {
         let Some(index) = target else {
             return;
         };
-        let session = match self.sessions.get(index) {
-            Some(session) => session.pane.read(cx).session(),
-            None => None,
+        let Some(entry) = self.sessions.get(index) else {
+            return;
         };
+        let host_id = entry.host.clone();
+        let session = entry.pane.read(cx).session();
         let Some(session) = session else {
             return;
         };
+
+        // Show the pane's connecting branch while the transport opens.
+        let label = self
+            .store
+            .inventory()
+            .get(&host_id)
+            .map(|host| host.label.clone())
+            .unwrap_or_else(|| host_id.to_string());
+        pane.update(cx, |pane, cx| pane.set_connecting(Some(label), cx));
 
         cx.spawn_in(window, async move |this, cx| {
             let connected = SftpClient::connect(&session).await;
@@ -1223,6 +2013,7 @@ impl SshDeck {
                         // Leave the pane in its "not connected" state. Retrying is
                         // a user action, so no loop runs here.
                         this.sftp_attached = None;
+                        pane.update(cx, |pane, cx| pane.set_connecting(None, cx));
                         window.push_notification(
                             Notification::warning(format!("SFTP could not open: {error}")),
                             cx,
@@ -1366,7 +2157,7 @@ impl SshDeck {
         }
     }
 
-    /// The single 56px app header: sidebar toggle, the session tabs, the add
+    /// The single 40px app header: sidebar toggle, the session tabs, the add
     /// control, then the right-aligned pane actions.
     ///
     /// This replaces the old three bands (title bar + tab strip + status bar);
@@ -1385,10 +2176,34 @@ impl SshDeck {
     ///   "Connect to Selected Host", or double-clicking the host row.
     /// - `SSH keys & known hosts` → sidebar "Keys" button and the palette.
     /// - Theme toggle → palette "Toggle Light / Dark Theme".
-    fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Header stays dark navy #1d2033 in both Light and Dark (hardcoded; no theme token covers it in Light).
+    fn render_header(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // ponytail: the header is an always-dark chrome strip (`--main-bg`
+        // `#1d2033`), so it keeps fixed dark hexes instead of theme tokens —
+        // in Light mode the theme's `muted`/`foreground` would turn the tabs
+        // light-grey-on-light. Ceiling: a dedicated header token in
+        // `themes/sshdeck.json`; upgrade by adding one and using it here.
         let header_bg = rgb(0x1d2033);
         let header_fg = rgb(0xffffff);
+        let win_w = f32::from(window.bounds().size.width);
+
+        let update_pill = div()
+            .id("btn-update")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            .px_2p5()
+            .h(px(30.))
+            .rounded_full()
+            .bg(rgb(0x282b3d))
+            .border_1()
+            .border_color(rgba(0x8d91a540))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0x3e4257)))
+            .child(div().text_xs().text_color(rgb(0xffffff)).child("Update"))
+            .on_click(|_, window, cx| {
+                window.push_notification(Notification::info("sshdeck is up to date"), cx);
+            });
 
         let actions = div()
             .flex()
@@ -1396,48 +2211,33 @@ impl SshDeck {
             .items_center()
             .gap_2()
             .flex_shrink_0()
-            .child(
-                div()
-                    .id("btn-update")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1p5()
-                    .px_2p5()
-                    .h(px(26.))
-                    .rounded_full()
-                    .bg(rgb(0x282b3d))
-                    .border_1()
-                    .border_color(rgba(0x8d91a540))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x3e4257)))
-                    .child(div().size(px(6.)).rounded_full().bg(rgb(0x21b568)))
-                    .child(div().text_xs().text_color(rgb(0xffffff)).child("Update"))
-                    .on_click(|_, window, cx| {
-                        window.push_notification(Notification::info("sshdeck is up to date"), cx);
-                    }),
-            )
+            // The Update pill is decorative; hide it below ~700px so the tab
+            // strip and the `+` control keep their room.
+            .when(win_w >= 700.0, |el| el.child(update_pill))
             .child(
                 Button::new("notifications")
                     .ghost()
-                    .icon(Icon::default().data(glyph::BELL).size(px(16.)))
+                    .icon(Icon::default().data(glyph::BELL_SOLID).size(px(16.)))
                     .tooltip("Connection logs & events")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.select_left_nav(LeftNav::Logs, window, cx);
                     })),
             )
-            .when(matches!(self.tab, MainTab::Session(_)), |this| {
-                this.child(
-                    Button::new("right-sidebar-toggle")
-                        .ghost()
-                        .icon(IconName::PanelRight)
-                        .tooltip("Toggle host details")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.details_open = !this.details_open;
-                            cx.notify();
-                        })),
-                )
-            });
+            .when(
+                matches!(self.tab, MainTab::Session(_) | MainTab::Workspace),
+                |this| {
+                    this.child(
+                        Button::new("right-sidebar-toggle")
+                            .ghost()
+                            .icon(IconName::PanelRight)
+                            .tooltip("Toggle sidebar")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_open = !this.sidebar_open;
+                                cx.notify();
+                            })),
+                    )
+                },
+            );
 
         div()
             .flex()
@@ -1445,7 +2245,7 @@ impl SshDeck {
             .items_center()
             .gap_2()
             .flex_shrink_0()
-            .h(px(56.))
+            .h(px(40.))
             .bg(header_bg)
             .text_color(header_fg)
             .pl(if cfg!(target_os = "macos") {
@@ -1479,93 +2279,23 @@ impl SshDeck {
         cx.notify();
     }
 
-    /// One host card: `--entity-item-background` at rest, `--list-hover` on
-    /// hover, `--list-select` when selected. The icon is tinted with the host's
-    /// OS brand colour when a group or tag names a known platform; otherwise it
-    /// keeps `--text-secondary` (`Host` has no OS field yet).
-    ///
-    /// `prefix` namespaces the element ids: the same host can be on screen in
-    /// both the sidebar and the Vaults tab, and ids must be unique.
-    fn render_host_row(&mut self, host: &Host, prefix: &str, cx: &mut Context<Self>) -> AnyElement {
-        let id = host.id.clone();
-        let is_selected = self.selected.as_ref() == Some(&id);
-        let is_open = self.sessions.iter().any(|s| s.host == id);
-        let remove_id = id.clone();
-        let connect_host = host.clone();
-        let muted = cx.theme().muted_foreground;
-        // `--entity-item-background`.
-        let card = cx.theme().muted;
-        // `--list-select` / `--list-hover`. The selected value maps to
-        // `list.active.background`; the hover token currently equals the card
-        // background, so the recovered hex is used directly (AGENTS.md errata).
-        let card_selected = cx.theme().list_active;
-        let card_hover = rgb(0x3e4257);
-        let tint = host_os_tint(host, muted);
-
-        div()
-            .id(SharedString::from(format!("{prefix}-host-{id}")))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.selected = Some(id.clone());
-                cx.notify();
-            }))
-            .on_double_click(cx.listener(move |this, _, window, cx| {
-                this.connect(connect_host.clone(), window, cx);
-            }))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .w_full()
-            .px_2()
-            .py_2()
-            .rounded_md()
-            .cursor_pointer()
-            .bg(if is_selected { card_selected } else { card })
-            // `--list-hover`: the card highlight, via the hover style
-            // refinement (`StatefulInteractiveElement::hover`).
-            .hover(|style| style.bg(card_hover))
-            .child(Icon::new(IconName::Globe).text_color(tint))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(SharedString::from(host.label.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(SharedString::from(host.endpoint())),
-                    ),
-            )
-            .when(is_open, |el| {
-                el.child(Icon::new(IconName::Check).text_color(cx.theme().success))
-            })
-            .child(
-                Button::new(SharedString::from(format!("{prefix}-remove-{remove_id}")))
-                    .ghost()
-                    .icon(IconName::Close)
-                    .tooltip("Remove host")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.remove_host(&remove_id, window, cx);
-                    })),
-            )
-            .into_any_element()
-    }
-
     fn render_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_left_rail(window, cx)
     }
 
     fn render_left_rail(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rail_bg = rgb(0xf7f9fa);
-        let border = rgb(0xd5dde0);
+        // ponytail: the rail is white in Light mode but `sidebar.background`
+        // is shared with the window root and the add-host sheet, so it cannot
+        // move to white on its own — the rail rides `popover` (`#ffffff` in
+        // Light) instead. Ceiling: a dedicated `rail.background` token in
+        // `themes/sshdeck.json`; upgrade by adding one and using it here.
+        let rail_bg = cx.theme().popover;
+        let border = cx.theme().sidebar_border;
         let active_bg = cx.theme().muted; // #e6ebed in light
         let fg = cx.theme().foreground; // #141729
         let muted = cx.theme().muted_foreground; // #798c94
         let win_w = f32::from(window.bounds().size.width);
-        let collapsed = self.sidebar_collapsed || win_w < 768.0;
+        let collapsed = self.sidebar_collapsed || win_w < 900.0;
 
         let nav_item = move |label: &'static str, glyph_data: &'static [u8], is_active: bool| {
             div()
@@ -1575,7 +2305,7 @@ impl SshDeck {
                 .items_center()
                 .when(collapsed, |el| el.justify_center().px_0())
                 .when(!collapsed, |el| el.gap_2().px_3())
-                .h(px(38.))
+                .h(px(44.))
                 .rounded(px(8.))
                 .cursor_pointer()
                 .when(is_active, |el| el.bg(active_bg))
@@ -1601,7 +2331,7 @@ impl SshDeck {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .w(if collapsed { px(60.) } else { px(180.) })
+            .w(px(rail_width(win_w, self.sidebar_collapsed)))
             .h_full()
             .bg(rail_bg)
             .border_r_1()
@@ -1637,7 +2367,7 @@ impl SshDeck {
                 )),
             )
             .child(
-                nav_item("Known Hosts", glyph::FINGERPRINT, known_active).on_click(cx.listener(
+                nav_item("Known Hosts", glyph::RADIOWAVES, known_active).on_click(cx.listener(
                     |this, _, window, cx| {
                         this.select_left_nav(LeftNav::KnownHosts, window, cx);
                     },
@@ -1650,86 +2380,36 @@ impl SshDeck {
                     },
                 )),
             )
-            .child(
-                nav_item(
-                    "Settings",
-                    glyph::SETTINGS,
-                    self.left_nav == LeftNav::Settings
-                        || matches!(self.overlay, Some(Overlay::Settings(_))),
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_settings(window, cx);
-                })),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("nav-toggle-collapse")
-                    .ghost()
-                    .w_full()
-                    .icon(
-                        Icon::new(if collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronLeft
-                        })
-                        .size(px(16.)),
-                    )
-                    .label(if collapsed { "" } else { "Collapse" })
-                    .tooltip(if collapsed {
-                        "Expand sidebar"
-                    } else {
-                        "Collapse sidebar"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.sidebar_collapsed = !this.sidebar_collapsed;
-                        cx.notify();
-                    })),
-            )
-    }
-
-    fn render_empty_state(&self, title: &str, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .size_full()
-            .p_8()
-            .child(Icon::new(IconName::Inbox).large().text_color(muted))
-            .child(
-                div()
-                    .text_color(muted)
-                    .child(SharedString::from(title.to_string())),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("No data yet — this pane is not wired."),
-            )
-            .into_any_element()
     }
 
     /// The add-host sheet: a right-hand panel over a scrim, carrying the same
     /// four fields and the same validation the always-visible sidebar form had.
     /// Opening and closing is the header `+` and the sheet's close control.
-    fn render_add_host_sheet(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    ///
+    /// Below ~600px window width the panel becomes a full-width drawer so the
+    /// 360px card never overflows a narrow window.
+    fn render_add_host_sheet(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         if !self.add_host_open {
             return None;
         }
+        let win_w = f32::from(window.bounds().size.width);
+        let narrow = use_full_drawer(win_w);
 
         let panel = div()
             .absolute()
             .top_0()
-            .right_0()
+            .when(!narrow, |el| el.right_0().w(px(360.)))
+            .when(narrow, |el| el.left_0().right_0().w_full())
             .h_full()
-            .w(px(360.))
             .flex()
             .flex_col()
             .gap_3()
             .p_4()
+            .overflow_y_scrollbar()
             .border_l_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().sidebar)
@@ -1787,7 +2467,7 @@ impl SshDeck {
         )
     }
 
-    /// One fixed header tab (Vaults or SFTP): 51px tall inside the 56px header,
+    /// One fixed header tab (Vaults or SFTP): 30px tall inside the 40px header,
     /// 6px radius, transparent until selected. Uses 16px icons throughout the
     /// chrome (medium, the default) with the heavier glyph choice for each tab.
     fn render_fixed_tab(
@@ -1798,9 +2478,12 @@ impl SshDeck {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_active = self.tab == target && self.overlay.is_none();
-        let muted = cx.theme().muted_foreground; // #8d91a5
-        let selected_bg = cx.theme().muted; // #282b3d
-        let selected_fg = cx.theme().foreground; // #ffffff
+        // ponytail: tabs live in the always-dark header (see `render_header`),
+        // so they use the fixed dark hexes, not theme tokens. Ceiling: a
+        // header token in `themes/sshdeck.json`.
+        let muted: Hsla = rgb(0x8d91a5).into();
+        let selected_bg = rgb(0x282b3d);
+        let selected_fg: Hsla = rgb(0xffffff).into();
         let hover_bg = rgb(0x3e4257);
 
         let mut tab_div = div()
@@ -1810,9 +2493,12 @@ impl SshDeck {
             .items_center()
             .gap_1p5()
             .px_3()
-            .h(px(51.))
+            .h(px(30.))
             .rounded_md()
             .cursor_pointer()
+            .min_w(px(0.))
+            .flex_shrink_1()
+            .overflow_hidden()
             .text_color(if is_active { selected_fg } else { muted })
             .when(is_active, |el| el.bg(selected_bg))
             .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
@@ -1822,7 +2508,7 @@ impl SshDeck {
                     .size(px(16.))
                     .text_color(if is_active { selected_fg } else { muted }),
             )
-            .child(label);
+            .child(div().min_w(px(0.)).flex_shrink_1().truncate().child(label));
 
         if label == "Vaults" {
             tab_div = tab_div
@@ -1849,9 +2535,12 @@ impl SshDeck {
     /// The tab row: the two fixed tabs (Vaults, SFTP), then one tab per open
     /// session, New Tab if open, then the add tab `+` control.
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground; // #8d91a5
-        let selected_bg = cx.theme().muted; // #282b3d
-        let selected_fg = cx.theme().foreground; // #ffffff
+        // ponytail: same always-dark header exception as `render_fixed_tab` —
+        // fixed dark hexes, not theme tokens. Ceiling: a header token in
+        // `themes/sshdeck.json`.
+        let muted: Hsla = rgb(0x8d91a5).into();
+        let selected_bg = rgb(0x282b3d);
+        let selected_fg: Hsla = rgb(0xffffff).into();
         let hover_bg = rgb(0x3e4257); // --list-hover
         let active = self.active;
 
@@ -1864,7 +2553,7 @@ impl SshDeck {
             .flex_row()
             .items_center()
             .gap_1()
-            .h(px(51.))
+            .h(px(30.))
             .flex_1()
             .min_w(px(0.))
             .overflow_x_scrollbar()
@@ -1908,7 +2597,7 @@ impl SshDeck {
                     .justify_center()
                     .child(
                         Icon::default()
-                            .data(glyph::UBUNTU)
+                            .data(glyph::UBUNTU_SOLID)
                             .size(px(14.))
                             .text_color(tint),
                     )
@@ -1936,9 +2625,12 @@ impl SshDeck {
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .h(px(51.))
+                    .h(px(30.))
                     .rounded_md()
                     .cursor_pointer()
+                    .min_w(px(0.))
+                    .flex_shrink_1()
+                    .overflow_hidden()
                     .text_color(if is_active { selected_fg } else { muted })
                     .when(is_active, |el| el.bg(selected_bg))
                     .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
@@ -1947,17 +2639,29 @@ impl SshDeck {
                         move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
                     })
                     .child(os_tile)
-                    .child(SharedString::from(label))
                     .child(
-                        Button::new(SharedString::from(format!("close-tab-{close_id}")))
-                            .ghost()
-                            .icon(IconName::Close)
-                            .tooltip("Close session")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close_session(index, window, cx);
-                            })),
+                        div()
+                            .min_w(px(0.))
+                            .flex_shrink_1()
+                            .truncate()
+                            .child(SharedString::from(label)),
                     )
+                    // ponytail: idle tabs show no X; the selected tab keeps its
+                    // X. Hover-reveal would need per-tab hover state, so hover
+                    // alone does not reveal it. Ceiling: a hovered-tab field
+                    // wired to mouse listeners, checked alongside `is_active`.
+                    .when(is_active, |el| {
+                        el.child(
+                            Button::new(SharedString::from(format!("close-tab-{close_id}")))
+                                .ghost()
+                                .icon(IconName::Close)
+                                .tooltip("Close session")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_session(index, window, cx);
+                                })),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_tab(MainTab::Session(index), window, cx);
                     })),
@@ -1973,17 +2677,26 @@ impl SshDeck {
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .h(px(51.))
+                    .h(px(30.))
                     .rounded_md()
                     .bg(selected_bg)
                     .text_color(selected_fg)
+                    .min_w(px(0.))
+                    .flex_shrink_1()
+                    .overflow_hidden()
                     .child(
                         Icon::default()
                             .data(glyph::TERMINAL_PROMPT)
                             .size(px(16.))
                             .text_color(selected_fg),
                     )
-                    .child("New Tab")
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex_shrink_1()
+                            .truncate()
+                            .child("New Tab"),
+                    )
                     .child(
                         Button::new("close-new-tab")
                             .ghost()
@@ -1997,18 +2710,29 @@ impl SshDeck {
             );
         }
 
-        strip.child(
-            Button::new("add-tab-btn")
-                .ghost()
-                .icon(IconName::Plus)
-                .tooltip("New tab")
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.select_tab(MainTab::NewTab, window, cx);
-                })),
-        )
+        // The `+` control lives outside the scrolling strip so it stays
+        // visible no matter how many tabs overflow.
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_1()
+            .min_w(px(0.))
+            .child(strip.flex_shrink_1())
+            .child(
+                div().flex_shrink_0().child(
+                    Button::new("add-tab-btn")
+                        .ghost()
+                        .icon(IconName::Plus)
+                        .tooltip("New tab")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.select_tab(MainTab::NewTab, window, cx);
+                        })),
+                ),
+            )
     }
 
-    /// ~28px band directly under the 56px header, spanning **only the pane
+    /// ~28px band directly under the 40px header, spanning **only the pane
     /// area, not the sidebar**. Holds the focused pane's own tabs plus a `+`.
     /// Visually quiet: no background fill of its own, a lighter active tab
     /// (`#282b3d`, `tab.active.background`), `12px` text. Always rendered,
@@ -2016,7 +2740,7 @@ impl SshDeck {
     fn render_pane_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_bg = cx.theme().muted; // #282b3d `tab.active.background`
         let active_fg = cx.theme().foreground; // #ffffff `tab.active.foreground`
-        let hover_bg = rgb(0x3e4257); // --list-hover, no token
+        let hover_bg = cx.theme().list_hover; // `--list-hover`, mode-aware
 
         // One tab reflecting the focused pane. For a session the label is the
         // pane title or host label and the glyph is SquareTerminal tinted by
@@ -2042,6 +2766,12 @@ impl SshDeck {
                 IconName::SquareTerminal,
                 cx.theme().muted_foreground,
                 "new tab".to_string(),
+            ),
+            MainTab::Workspace => (
+                "Workspace".to_string(),
+                IconName::PanelRight,
+                cx.theme().muted_foreground,
+                "workspace".to_string(),
             ),
             MainTab::Session(index) => {
                 if let Some(session) = self.sessions.get(index) {
@@ -2085,7 +2815,7 @@ impl SshDeck {
             .px_2()
             .flex_shrink_0()
             .border_b_1()
-            .border_color(rgba(0x8d91a51a)) // --border-light
+            .border_color(cx.theme().sidebar_border) // --border-light
             // No background fill on the row itself — only the active tab is
             // elevated (`#282b3d`, radius 6px) with primary text; inactive
             // would be transparent with `#8d91a5` (here only one tab, so active).
@@ -2254,9 +2984,10 @@ impl SshDeck {
                     LeftNav::Settings => self.render_overlay(cx),
                 }
             }
-            MainTab::Sftp => self.render_sftp(cx),
-            MainTab::NewTab => self.render_new_tab(cx),
-            MainTab::Session(_) => self.render_session(cx),
+            MainTab::Sftp => self.render_sftp(window, cx),
+            MainTab::NewTab => self.render_new_tab(window, cx),
+            MainTab::Workspace => self.render_workspace(window, cx),
+            MainTab::Session(_) => self.render_session(window, cx),
         }
     }
 
@@ -2267,38 +2998,48 @@ impl SshDeck {
         let has_selection = self.selected.is_some();
         let selected_id = self.selected.clone();
 
-        // Top search row: Input + Connect button (disabled until a host is selected).
-        let search_row = div()
+        // Top search row: the Connect pill lives inside the search field's
+        // right edge, grey and disabled-looking until a host is selected —
+        // never solid blue up here (the blue Connect belongs to Host Details).
+        let mut connect_pill = div()
+            .id("vault-connect")
+            .absolute()
+            .right(px(6.))
+            .top(px(2.))
+            .h(px(28.))
+            .px_3()
+            .rounded(px(7.))
             .flex()
-            .flex_row()
             .items_center()
-            .gap_2()
-            .w_full()
-            .p_2()
-            .child(
-                div()
-                    .flex_1()
-                    .child(Input::new(&self.filter).small().cleanable(true)),
-            )
-            .child(
-                Button::new("vault-connect")
-                    .small()
-                    .primary()
-                    .label("Connect")
-                    .when(!has_selection, |b| b.disabled(true))
-                    .when(has_selection, |b| {
-                        let host = selected_id
-                            .as_ref()
-                            .and_then(|id| self.store.inventory().get(id).cloned());
-                        b.on_click(cx.listener(move |this, _, window, cx| {
-                            if let Some(host) = host.clone() {
-                                this.connect(host, window, cx);
-                            }
-                        }))
-                    }),
-            );
+            .bg(rgb(0xdfe5e7))
+            .text_size(px(13.))
+            .text_color(rgb(0x9aa5ab))
+            .child("Connect");
+        if has_selection {
+            let connect_target = selected_id.clone();
+            connect_pill = connect_pill
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0xd5dde0)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(host) = connect_target
+                        .clone()
+                        .and_then(|id| this.store.inventory().get(&id).cloned())
+                    {
+                        this.connect(host, window, cx);
+                    }
+                }));
+        }
+        let search_row = div().flex().flex_row().items_center().w_full().p_2().child(
+            div()
+                .relative()
+                .flex_1()
+                .child(Input::new(&self.filter).small().cleanable(true))
+                .child(connect_pill),
+        );
 
-        // Toolbar row: + New host (split), Terminal, Serial; right view toggles + MH avatar.
+        // Toolbar row: + New host (merged split), Terminal, Serial; right view toggles + MH avatar.
+        // Termius tokens: split-button bg #e6ebed, hairline border #d5dde0,
+        // accent #2091f6, avatar orange #e67e22.
         let toolbar = div()
             .flex()
             .flex_row()
@@ -2312,19 +3053,43 @@ impl SshDeck {
                     .flex()
                     .flex_row()
                     .items_center()
+                    .gap_0()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(0xd5dde0))
+                    .bg(rgb(0xe6ebed))
                     .child(
-                        Button::new("vault-new-host")
-                            .small()
-                            .label("+ New host")
+                        div()
+                            .id("vault-new-host")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .px_2()
+                            .py_1()
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0xd5dde0)))
+                            .child("+ New host")
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.open_add_host(window, cx)),
                             ),
                     )
+                    .child(div().w(px(1.)).h(px(18.)).bg(rgb(0xd5dde0)))
                     .child(
-                        Button::new("vault-new-host-caret")
-                            .small()
-                            .icon(IconName::ChevronDown)
-                            .tooltip("Add host, group or port forwarding")
+                        div()
+                            .id("vault-new-host-caret")
+                            .flex()
+                            .items_center()
+                            .px_1p5()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0xd5dde0)))
+                            .child(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(px(18.))
+                                    .text_color(cx.theme().muted_foreground),
+                            )
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.open_add_host(window, cx)),
                             ),
@@ -2334,7 +3099,7 @@ impl SshDeck {
                 Button::new("vault-terminal")
                     .small()
                     .ghost()
-                    .icon(Icon::default().data(glyph::TERMINAL_PROMPT).size(px(14.)))
+                    .icon(Icon::default().data(glyph::TERMINAL_PROMPT).size(px(18.)))
                     .label("Terminal")
                     .tooltip("Terminal")
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -2342,19 +3107,43 @@ impl SshDeck {
                     })),
             )
             .child(
-                Button::new("vault-serial")
-                    .small()
-                    .ghost()
-                    .icon(Icon::default().data(glyph::SERIAL).size(px(14.)))
-                    .label("Serial")
-                    .tooltip("Open serial console")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.select_tab(MainTab::NewTab, window, cx);
-                        window.push_notification(
-                            Notification::info("Serial connection: configure port in session"),
-                            cx,
-                        );
-                    })),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new("vault-serial")
+                            .small()
+                            .ghost()
+                            .icon(Icon::default().data(glyph::SERIAL).size(px(18.)))
+                            .label("Serial")
+                            .tooltip("Open serial console")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.select_tab(MainTab::NewTab, window, cx);
+                                window.push_notification(
+                                    Notification::info(
+                                        "Serial connection: configure port in session",
+                                    ),
+                                    cx,
+                                );
+                            })),
+                    )
+                    // Up-arrow badge Termius pins to Serial: a text arrow
+                    // avoids an unproven `IconName` (missing assets render
+                    // as nothing — see AGENTS.md icon errata).
+                    .child(
+                        div()
+                            .size(px(16.))
+                            .rounded_full()
+                            .bg(rgb(0xd5dde0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(11.))
+                            .text_color(rgb(0x798c94))
+                            .child("↑"),
+                    ),
             )
             .child(div().flex_1())
             .child(
@@ -2366,7 +3155,7 @@ impl SshDeck {
                                 ViewMode::Grid => glyph::GRID,
                                 ViewMode::List => glyph::LIST,
                             })
-                            .size(px(14.)),
+                            .size(px(18.)),
                     )
                     .tooltip(match self.view_mode {
                         ViewMode::Grid => "Switch to list view",
@@ -2383,7 +3172,7 @@ impl SshDeck {
             .child(
                 Button::new("vault-filter")
                     .ghost()
-                    .icon(Icon::default().data(glyph::TAG).size(px(14.)))
+                    .icon(Icon::default().data(glyph::TAG).size(px(18.)))
                     .tooltip("Filter by tags")
                     .on_click(cx.listener(|this, _, window, cx| {
                         let mut all_tags: Vec<String> = this
@@ -2422,7 +3211,7 @@ impl SshDeck {
             .child(
                 Button::new("vault-calendar")
                     .ghost()
-                    .icon(Icon::default().data(glyph::CALENDAR).size(px(14.)))
+                    .icon(Icon::default().data(glyph::CALENDAR).size(px(18.)))
                     .tooltip(self.host_sort.label())
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.host_sort = this.host_sort.next();
@@ -2438,9 +3227,11 @@ impl SshDeck {
                     .gap_1()
                     .child(
                         div()
-                            .size(px(24.))
-                            .rounded_full()
-                            .bg(rgb(0xd97706))
+                            .size(px(32.))
+                            .rounded(px(8.))
+                            .bg(rgb(0xe67e22))
+                            .border_2()
+                            .border_color(rgb(0x2091f6))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -2452,17 +3243,17 @@ impl SshDeck {
                     .child(
                         div()
                             .id("btn-vault-add-member")
-                            .size(px(24.))
-                            .rounded_full()
-                            .bg(rgb(0x2091f6))
+                            .size(px(32.))
+                            .rounded(px(8.))
+                            .bg(rgb(0xd5dde0))
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_xs()
                             .font_weight(gpui_kit::FontWeight::BOLD)
-                            .text_color(rgb(0xffffff))
+                            .text_color(cx.theme().foreground)
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x1976d2)))
+                            .hover(|s| s.bg(rgb(0xa4b3ba)))
                             .child("+")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.vault_info_open = !this.vault_info_open;
@@ -2473,37 +3264,25 @@ impl SshDeck {
 
         // Host cards — responsive column chunking based on available width
         let win_w = f32::from(window.bounds().size.width);
-        let sidebar_w = if self.sidebar_collapsed || win_w < 768.0 {
-            60.0
-        } else {
-            180.0
-        };
+        let sidebar_w = rail_width(win_w, self.sidebar_collapsed);
+        // Below ~800px the drawer floats over the grid instead of docking,
+        // so the grid keeps the full centre width.
+        let overlay_drawer = details_overlay(win_w) && self.details_open;
         let details_w = if self.details_open {
-            if win_w < 850.0 {
-                (win_w - sidebar_w - 40.0).clamp(240.0, 300.0)
-            } else if win_w < 1100.0 {
-                300.0
+            if overlay_drawer {
+                (win_w - sidebar_w).max(280.0)
             } else {
-                360.0
+                details_width(win_w)
             }
         } else {
             0.0
         };
-        let avail_w = (win_w - sidebar_w - details_w - 32.0).max(180.0);
+        let docked_details_w = if overlay_drawer { 0.0 } else { details_w };
+        let avail_w = (win_w - sidebar_w - docked_details_w - 32.0).max(180.0);
 
         let chunk_size = match self.view_mode {
             ViewMode::List => 1,
-            ViewMode::Grid => {
-                if avail_w < 380.0 {
-                    1
-                } else if avail_w < 680.0 {
-                    2
-                } else if avail_w < 1050.0 {
-                    3
-                } else {
-                    4
-                }
-            }
+            ViewMode::Grid => grid_columns(avail_w),
         };
 
         let query = self.filter.read(cx).value().to_string();
@@ -2532,17 +3311,19 @@ impl SshDeck {
         for chunk in filtered.chunks(chunk_size) {
             let mut row_cards: Vec<AnyElement> = Vec::new();
             for host in chunk {
-                row_cards.push(self.render_host_card(host, cx));
+                row_cards.push(self.render_host_card(host, window, cx));
             }
             for _ in chunk.len()..chunk_size {
-                row_cards.push(div().flex_1().into_any_element());
+                row_cards.push(div().flex_1().min_w(px(0.)).into_any_element());
             }
             rows.push(
                 div()
                     .flex()
                     .flex_row()
+                    .flex_wrap()
                     .gap_3()
                     .w_full()
+                    .min_w(px(0.))
                     .children(row_cards)
                     .into_any_element(),
             );
@@ -2560,9 +3341,10 @@ impl SshDeck {
             .py_2()
             .child(
                 div()
-                    .text_sm()
-                    .text_color(muted)
-                    .child(format!("Hosts ({})", filtered.len())),
+                    .text_size(px(15.))
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().foreground)
+                    .child("Hosts"),
             )
             .children(rows);
 
@@ -2579,7 +3361,7 @@ impl SshDeck {
 
         let details_open = self.details_open;
         let details = if details_open {
-            Some(self.render_host_details_panel(details_w, cx))
+            Some(self.render_host_details_panel(details_w, window, cx))
         } else {
             None
         };
@@ -2604,17 +3386,21 @@ impl SshDeck {
         let vault_info_modal = if self.vault_info_open {
             let host_count = self.store.inventory().hosts().len();
             let fg = cx.theme().foreground;
+            let win_h = f32::from(window.bounds().size.height);
             Some(
                 div()
                     .absolute()
                     .top(px(80.))
                     .left(px(12.))
                     .w(px(320.))
+                    .max_w(px(popover_max_w(win_w)))
+                    .max_h(px(popover_max_h(win_h)))
+                    .overflow_y_scrollbar()
                     .p_4()
                     .rounded(px(12.))
-                    .bg(rgb(0xffffff))
+                    .bg(cx.theme().popover)
                     .border_1()
-                    .border_color(rgb(0xd5dde0))
+                    .border_color(cx.theme().border)
                     .shadow_lg()
                     .flex()
                     .flex_col()
@@ -2656,9 +3442,9 @@ impl SshDeck {
                             .gap_1()
                             .p_2()
                             .rounded_md()
-                            .bg(rgb(0xf7f9fa))
+                            .bg(cx.theme().background)
                             .border_1()
-                            .border_color(rgb(0xd5dde0))
+                            .border_color(cx.theme().border)
                             .child(div().text_xs().text_color(muted).child("Location: ~/.config/sshdeck/hosts.json"))
                             .child(div().text_xs().text_color(fg).child(format!("Total hosts: {host_count}")))
                             .child(div().text_xs().text_color(rgb(0x21b568)).child("Network: 100% Offline (0 cloud tracking)")),
@@ -2675,31 +3461,44 @@ impl SshDeck {
             .h_full()
             .min_h(px(0.))
             .overflow_hidden()
+            .relative()
             .bg(content_bg)
             .child(centre)
-            .when_some(details, |el, panel| el.child(panel))
+            .when_some(details, |el, panel| {
+                if overlay_drawer {
+                    // Narrow window: the drawer floats over the grid at full
+                    // remaining width instead of squeezing it.
+                    el.child(div().absolute().top_0().right_0().bottom_0().child(panel))
+                } else {
+                    el.child(panel)
+                }
+            })
             .when_some(reopen_button, |el, btn| el.child(btn))
             .when_some(vault_info_modal, |el, modal| el.child(modal))
             .into_any_element()
     }
 
-    fn render_host_card(&mut self, host: &Host, cx: &mut Context<Self>) -> AnyElement {
+    fn render_host_card(
+        &mut self,
+        host: &Host,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let is_selected = self.selected.as_ref() == Some(&host.id);
         let connect_host = host.clone();
+        let select_id = host.id.clone();
         let id = host.id.clone();
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
-        let card_bg = rgb(0xffffff);
-        let border_selected = rgb(0x2091f6);
-        let border_default = rgb(0xd5dde0);
+        let card_bg = cx.theme().popover;
+        let border_selected = cx.theme().primary;
+        let border_default = cx.theme().border;
         let orange = rgb(0xd96c2b);
         let is_list = self.view_mode == ViewMode::List;
+        let win_w = f32::from(window.bounds().size.width);
+        let card_h = host_card_height(is_list, win_w);
 
-        let tags_str = if host.tags.is_empty() {
-            format!("ssh, {}", host.username)
-        } else {
-            format!("ssh, {}, {}", host.username, host.tags.join(", "))
-        };
+        let tags_str = host_subtitle(host);
 
         div()
             .id(SharedString::from(format!("vault-card-{id}")))
@@ -2709,7 +3508,8 @@ impl SshDeck {
             .gap_3()
             .flex_1()
             .min_w(px(0.))
-            .h(if is_list { px(48.) } else { px(64.) })
+            .overflow_hidden()
+            .h(px(card_h))
             .px_3()
             .rounded(px(10.))
             .bg(card_bg)
@@ -2720,10 +3520,12 @@ impl SshDeck {
                 border_default
             })
             .when(is_selected, |el| el.border_2())
+            .shadow_xs()
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.selected = Some(id.clone());
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.selected = Some(select_id.clone());
                 this.details_open = true;
+                this.sync_details_inputs(window, cx);
                 cx.notify();
             }))
             .on_double_click(cx.listener(move |this, _, window, cx| {
@@ -2731,15 +3533,15 @@ impl SshDeck {
             }))
             .child(
                 div()
-                    .size(if is_list { px(32.) } else { px(40.) })
-                    .rounded(px(8.))
+                    .size(if is_list { px(32.) } else { px(44.) })
+                    .rounded(px(10.))
                     .bg(orange)
                     .flex()
                     .items_center()
                     .justify_center()
                     .child(
                         Icon::default()
-                            .data(glyph::UBUNTU)
+                            .data(glyph::UBUNTU_SOLID)
                             .size(if is_list { px(18.) } else { px(24.) })
                             .text_color(rgb(0xffffff)),
                     ),
@@ -2754,6 +3556,7 @@ impl SshDeck {
                     .child(
                         div()
                             .text_size(px(15.))
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .text_color(fg)
                             .truncate()
                             .child(SharedString::from(host.label.clone())),
@@ -2766,16 +3569,133 @@ impl SshDeck {
                             .child(SharedString::from(tags_str)),
                     ),
             )
+            // ponytail: the pencil affordance is hidden, not hover-revealed —
+            // GPUI has no group-hover, so per-card hover tracking would need a
+            // hovered-card state field plus mouse listeners on every card.
+            // Ceiling: add that state and render the affordance only for the
+            // hovered card; editing stays one click away via Host Details.
             .into_any_element()
     }
 
-    fn render_host_details_panel(&mut self, details_w: f32, cx: &mut Context<Self>) -> AnyElement {
-        let border = rgb(0xd5dde0);
+    /// Full-panel theme browser: back header plus one h56 row per scheme.
+    ///
+    /// The inline dropdown could not show swatches, so the theme row
+    /// navigates here instead. Rows reuse the `SCHEMES` registry and the same
+    /// apply path as the sidebar theme list.
+    fn render_theme_browser(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let accent = cx.theme().primary;
+        let card_bg = cx.theme().popover;
+        let selected = self.selected_theme.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .overflow_y_scrollbar()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("theme-browser-back")
+                            .ghost()
+                            .small()
+                            .label("‹ Back")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.theme_picker_open = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(17.))
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .text_color(fg)
+                            .child("Select Color Theme"),
+                    ),
+            )
+            .children(SCHEMES.iter().map(|(name, scheme)| {
+                let chosen = *name == selected;
+                let swatch_bg: Hsla = scheme.background().into();
+                let swatch_fg: Hsla = scheme.foreground().into();
+                let theme_name = name.to_string();
+                div()
+                    .id(SharedString::from(format!("details-theme-{name}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .w_full()
+                    .h(px(56.))
+                    .p_2()
+                    .rounded(px(14.))
+                    .bg(card_bg)
+                    .when(chosen, |s| s.border_1().border_color(accent))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().muted))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.selected_theme = theme_name.clone();
+                        this.theme_picker_open = false;
+                        this.apply_terminal_scheme(window, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(64.))
+                            .h(px(40.))
+                            .flex_shrink_0()
+                            .rounded(px(6.))
+                            .bg(swatch_bg)
+                            .border_1()
+                            .border_color(swatch_fg)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(div().text_size(px(10.)).text_color(swatch_fg).child("$▮")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(fg)
+                                    .child(SharedString::from(name.to_string())),
+                            )
+                            .child(div().text_xs().text_color(muted).child("16 colors")),
+                    )
+                    .when(chosen, |s| {
+                        s.child(Icon::new(IconName::Check).text_color(accent))
+                    })
+            }))
+            .into_any_element()
+    }
+
+    fn render_host_details_panel(
+        &mut self,
+        details_w: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
-        let accent = rgb(0x2091f6);
-        let card_bg = rgb(0xffffff);
+        let card_bg = cx.theme().popover;
+        // Termius host-tile orange #d96c2b.
         let orange = rgb(0xd96c2b);
+        let win_size = window.bounds().size;
+        let win_w = f32::from(win_size.width);
+        let win_h = f32::from(win_size.height);
+        let narrow = use_full_drawer(win_w);
+        let pop_max_w = popover_max_w(win_w);
+        let pop_max_h = popover_max_h(win_h);
 
         let selected_host = self
             .selected
@@ -2787,6 +3707,7 @@ impl SshDeck {
             .flex()
             .flex_col()
             .w_full()
+            .relative()
             .border_b_1()
             .border_color(border)
             .child(
@@ -2803,7 +3724,7 @@ impl SshDeck {
                             .flex_col()
                             .child(
                                 div()
-                                    .text_size(px(15.))
+                                    .text_size(px(17.))
                                     .font_weight(gpui_kit::FontWeight::BOLD)
                                     .text_color(fg)
                                     .child("Host Details"),
@@ -2844,20 +3765,30 @@ impl SshDeck {
                 let host_for_action = selected_host.clone();
                 el.child(
                     div()
+                        .absolute()
+                        .top(px(60.))
+                        // Flip/clamp on narrow windows: stretch to both edges
+                        // instead of overflowing off the right.
+                        .when(!narrow, |el| el.right(px(12.)).w(px(220.)))
+                        .when(narrow, |el| el.left(px(12.)).right(px(12.)))
+                        .max_w(px(pop_max_w))
+                        .max_h(px(pop_max_h))
+                        .overflow_y_scrollbar()
                         .flex()
                         .flex_col()
                         .p_2()
-                        .mx_3()
-                        .mb_2()
-                        .rounded_md()
-                        .bg(rgb(0xffffff))
+                        .rounded(px(12.))
+                        .bg(cx.theme().popover)
                         .border_1()
                         .border_color(border)
+                        .shadow_lg()
                         .gap_1()
                         .child(
                             Button::new("menu-connect")
                                 .ghost()
                                 .small()
+                                .w_full()
+                                .icon(Icon::default().data(glyph::PLUG).size(px(16.)))
                                 .label("Connect")
                                 .on_click(cx.listener({
                                     let host = host_for_action.clone();
@@ -2873,19 +3804,21 @@ impl SshDeck {
                             Button::new("menu-telnet")
                                 .ghost()
                                 .small()
+                                .w_full()
+                                .icon(Icon::default().data(glyph::HOST).size(px(16.)))
                                 .label("Add Telnet")
                                 .on_click(cx.listener({
                                     let host = host_for_action.clone();
                                     move |this, _, window, cx| {
                                         this.details_menu_open = false;
                                         if let Some(mut h) = host.clone() {
-                                            if !h.tags.iter().any(|t| t == "telnet") {
-                                                h.tags.push("telnet".to_string());
+                                            if !h.protocols.iter().any(|p| p == "telnet") {
+                                                h.protocols.push("telnet".to_string());
                                                 this.store.inventory_mut().upsert(h);
                                                 let _ = this.store.save();
                                                 window.push_notification(
                                                     Notification::success(
-                                                        "Added Telnet tag to host",
+                                                        "Added Telnet protocol to host",
                                                     ),
                                                     cx,
                                                 );
@@ -2906,7 +3839,9 @@ impl SshDeck {
                             Button::new("menu-duplicate")
                                 .ghost()
                                 .small()
-                                .label("Duplicate host")
+                                .w_full()
+                                .icon(Icon::default().data(glyph::COPY).size(px(16.)))
+                                .label("Duplicate")
                                 .on_click(cx.listener({
                                     let host = host_for_action.clone();
                                     move |this, _, window, cx| {
@@ -2917,6 +3852,7 @@ impl SshDeck {
                                             let copy_id = this.store.inventory_mut().insert(copy);
                                             let _ = this.store.save();
                                             this.selected = Some(copy_id);
+                                            this.sync_details_inputs(window, cx);
                                             window.push_notification(
                                                 Notification::success("Host duplicated"),
                                                 cx,
@@ -2930,7 +3866,9 @@ impl SshDeck {
                             Button::new("menu-remove")
                                 .ghost()
                                 .small()
-                                .label("Remove host")
+                                .w_full()
+                                .icon(Icon::default().data(glyph::TRASH).size(px(16.)))
+                                .label("Remove")
                                 .on_click(cx.listener({
                                     let host = host_for_action.clone();
                                     move |this, _, window, cx| {
@@ -2944,13 +3882,14 @@ impl SshDeck {
                 )
             });
 
-        let password_visible = self.password_visible;
         let popover_open = self.credentials_popover_open;
         let show_more = self.show_more;
         let theme_picker_open = self.theme_picker_open;
         let selected_theme = self.selected_theme.clone();
 
-        let (body, connect_btn): (AnyElement, Option<AnyElement>) = match selected_host.clone() {
+        let (mut body, mut connect_btn): (AnyElement, Option<AnyElement>) = match selected_host
+            .clone()
+        {
             None => (
                 div()
                     .flex()
@@ -2981,10 +3920,8 @@ impl SshDeck {
                                 .items_center()
                                 .gap_3()
                                 .p_3()
-                                .rounded_md()
+                                .rounded(px(14.))
                                 .bg(card_bg)
-                                .border_1()
-                                .border_color(border)
                                 .child(
                                     div()
                                         .size(px(40.))
@@ -3008,17 +3945,12 @@ impl SshDeck {
                                         .gap_1()
                                         .child(div().text_xs().text_color(muted).child("Address"))
                                         .child(
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .rounded(px(4.))
-                                                .bg(rgb(0xf7f9fa))
-                                                .border_1()
-                                                .border_color(border)
-                                                .text_sm()
-                                                .text_color(fg)
-                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                .child(SharedString::from(host.address.clone())),
+                                            Input::new(&self.details_address).small().prefix(
+                                                div()
+                                                    .size(px(16.))
+                                                    .rounded(px(4.))
+                                                    .bg(orange),
+                                            ),
                                         ),
                                 ),
                         )
@@ -3029,235 +3961,85 @@ impl SshDeck {
                                 .flex_col()
                                 .gap_2()
                                 .p_3()
-                                .rounded_md()
+                                .rounded(px(14.))
                                 .bg(card_bg)
-                                .border_1()
-                                .border_color(border)
                                 .child(
                                     div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
+                                        .text_sm()
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .text_color(fg)
+                                        .child("General"),
+                                )
+                                .child(
+                                    details_box().child(
+                                        Input::new(&self.details_label)
+                                            .small()
+                                            .appearance(false)
+                                            .flex_1(),
+                                    ),
+                                )
+                                // Key-setting row: static disclosure, never a reset control.
+                                .child(
+                                    details_box()
                                         .justify_between()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    Icon::default()
+                                                        .data(glyph::BACKSPACE)
+                                                        .size(px(14.))
+                                                        .text_color(muted),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(muted)
+                                                        .child("Backspace"),
+                                                ),
+                                        )
                                         .child(
                                             div()
                                                 .text_sm()
-                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                .text_color(fg)
-                                                .child("General"),
-                                        )
-                                        .child(
-                                            Button::new("general-backspace")
-                                                .ghost()
-                                                .icon(
-                                                    Icon::default()
-                                                        .data(glyph::BACKSPACE)
-                                                        .size(px(14.)),
-                                                )
-                                                .tooltip("Reset label to endpoint")
-                                                .on_click(cx.listener({
-                                                    let host_id = host.id.clone();
-                                                    move |this, _, window, cx| {
-                                                        if let Some(mut h) = this.store.inventory().get(&host_id).cloned() {
-                                                            h.label = h.endpoint();
-                                                            this.store.inventory_mut().upsert(h);
-                                                            let _ = this.store.save();
-                                                            window.push_notification(
-                                                                Notification::info("Reset host label to endpoint"),
-                                                                cx,
-                                                            );
-                                                            cx.notify();
-                                                        }
-                                                    }
-                                                })),
+                                                .text_color(muted)
+                                                .child("Default"),
                                         ),
                                 )
-                                .child(div().text_xs().text_color(muted).child("Label"))
                                 .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded(px(4.))
-                                        .bg(rgb(0xf7f9fa))
-                                        .border_1()
-                                        .border_color(border)
-                                        .text_sm()
-                                        .text_color(fg)
-                                        .child(SharedString::from(host.label.clone())),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_between()
-                                        .pt_1()
-                                        .border_t_1()
-                                        .border_color(rgba(0x8d91a51a))
+                                    details_box()
                                         .child(
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .child(
-                                                    Icon::default()
-                                                        .data(glyph::FOLDER)
-                                                        .size(px(12.))
-                                                        .text_color(muted),
-                                                )
-                                                .child(div().text_xs().text_color(muted).child("Parent Group")),
-                                        )
-                                        .child(div().text_xs().text_color(fg).child("Default")),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .child(
-                                                    Icon::default()
-                                                        .data(glyph::TAG)
-                                                        .size(px(12.))
-                                                        .text_color(muted),
-                                                )
-                                                .child(div().text_xs().text_color(muted).child("Tags")),
+                                            Icon::default()
+                                                .data(glyph::FOLDER)
+                                                .size(px(14.))
+                                                .text_color(muted),
                                         )
                                         .child(
-                                            div()
-                                                .id("details-btn-add-tag")
-                                                .text_xs()
-                                                .text_color(accent)
-                                                .cursor_pointer()
-                                                .child("+ Add tag")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.add_tag_open = !this.add_tag_open;
-                                                    cx.notify();
-                                                })),
+                                            Input::new(&self.details_group)
+                                                .small()
+                                                .appearance(false)
+                                                .flex_1(),
                                         ),
                                 )
-                                .when(!host.tags.is_empty(), |el| {
-                                    let host_id = host.id.clone();
-                                    let tag_pills: Vec<AnyElement> = host
-                                        .tags
-                                        .iter()
-                                        .map(|t| {
-                                            let tag_str = t.clone();
-                                            let hid = host_id.clone();
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_1()
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded(px(4.))
-                                                .bg(rgb(0xeef2f5))
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(fg)
-                                                        .child(SharedString::from(tag_str.clone())),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id(SharedString::from(format!("remove-tag-{hid}-{tag_str}")))
-                                                        .cursor_pointer()
-                                                        .text_xs()
-                                                        .text_color(muted)
-                                                        .hover(|s| s.text_color(rgb(0xe04d4d)))
-                                                        .child("✕")
-                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                            if let Some(mut h) = this.store.inventory().get(&hid).cloned() {
-                                                                h.tags.retain(|tag| tag != &tag_str);
-                                                                this.store.inventory_mut().upsert(h);
-                                                                let _ = this.store.save();
-                                                                cx.notify();
-                                                            }
-                                                        })),
-                                                )
-                                                .into_any_element()
-                                        })
-                                        .collect();
-                                    el.child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .flex_wrap()
-                                            .gap_1()
-                                            .children(tag_pills),
-                                    )
-                                })
-                                .when(self.add_tag_open, |el| {
-                                    let host_id = host.id.clone();
-                                    let presets = ["prod", "staging", "dev", "vpn", "db", "k8s"];
-                                    let available: Vec<&str> = presets
-                                        .iter()
-                                        .copied()
-                                        .filter(|p| !host.tags.iter().any(|t| t == p))
-                                        .collect();
-                                    el.child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_1()
-                                            .p_2()
-                                            .rounded_md()
-                                            .bg(rgb(0xf7f9fa))
-                                            .border_1()
-                                            .border_color(border)
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(muted)
-                                                    .child("Quick tags:"),
-                                             )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .flex_wrap()
-                                                    .gap_1()
-                                                    .children(available.into_iter().map(|preset| {
-                                                        let hid = host_id.clone();
-                                                        let preset_str = preset.to_string();
-                                                        div()
-                                                            .id(SharedString::from(format!("quick-tag-{hid}-{preset_str}")))
-                                                            .px_2()
-                                                            .py_0p5()
-                                                            .rounded(px(10.))
-                                                            .bg(rgb(0xffffff))
-                                                            .border_1()
-                                                            .border_color(border)
-                                                            .text_xs()
-                                                            .text_color(accent)
-                                                            .cursor_pointer()
-                                                            .hover(|s| s.bg(rgb(0xe8f2fd)))
-                                                            .child(format!("+ {preset}"))
-                                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                                if let Some(mut h) = this.store.inventory().get(&hid).cloned() {
-                                                                    if !h.tags.contains(&preset_str) {
-                                                                        h.tags.push(preset_str.clone());
-                                                                        this.store.inventory_mut().upsert(h);
-                                                                        let _ = this.store.save();
-                                                                        cx.notify();
-                                                                    }
-                                                                }
-                                                            }))
-                                                            .into_any_element()
-                                                    })),
-                                            ),
-                                    )
-                                }),
+                                .child(
+                                    details_box()
+                                        .child(
+                                            Icon::default()
+                                                .data(glyph::TAG)
+                                                .size(px(14.))
+                                                .text_color(muted),
+                                        )
+                                        .child(
+                                            Input::new(&self.details_tags)
+                                                .small()
+                                                .appearance(false)
+                                                .flex_1(),
+                                        ),
+                                )
                         )
-                        // Share this host
+                        // Share this host: its own card, not a row of General.
                         .child(
                             div()
                                 .id("share-this-host-btn")
@@ -3266,13 +4048,20 @@ impl SshDeck {
                                 .items_center()
                                 .justify_center()
                                 .gap_2()
-                                .p_2()
-                                .rounded_md()
-                                .text_color(accent)
+                                .p_3()
+                                .rounded(px(14.))
+                                .bg(card_bg)
+                                .text_color(rgb(0x2091f6))
                                 .cursor_pointer()
+                                // Termius list-hover #f0f3f5.
                                 .hover(|s| s.bg(rgb(0xf0f3f5)))
-                                .child(Icon::default().data(glyph::SHARE).size(px(14.)))
-                                .child(div().text_sm().child("Share this host"))
+                                .child(Icon::default().data(glyph::SHARE).size(px(16.)))
+                                .child(
+                                    div()
+                                        .text_size(px(14.))
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .child("Share this host"),
+                                )
                                 .on_click(cx.listener({
                                     let cmd = format!("ssh -p {} {}@{}", host.port, host.username, host.address);
                                     move |_, _, window, cx| {
@@ -3291,10 +4080,8 @@ impl SshDeck {
                                 .flex_col()
                                 .gap_2p5()
                                 .p_3()
-                                .rounded_md()
+                                .rounded(px(14.))
                                 .bg(card_bg)
-                                .border_1()
-                                .border_color(border)
                                 .child(
                                     div()
                                         .flex()
@@ -3310,16 +4097,21 @@ impl SshDeck {
                                         )
                                         .child(
                                             div()
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded(px(4.))
-                                                .bg(rgb(0xf7f9fa))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .w(px(60.))
+                                                .h(px(28.))
+                                                .px_2()
+                                                .rounded(px(6.))
                                                 .border_1()
-                                                .border_color(border)
-                                                .text_xs()
-                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                .text_color(fg)
-                                                .child(format!("{}", host.port)),
+                                                .border_color(rgb(0xd5dde0))
+                                                .child(
+                                                    Input::new(&self.details_port)
+                                                        .small()
+                                                        .appearance(false)
+                                                        .flex_1(),
+                                                ),
                                         )
                                         .child(
                                             div()
@@ -3337,90 +4129,61 @@ impl SshDeck {
                                         .child("Credentials"),
                                 )
                                 .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(div().text_xs().text_color(muted).child("Username"))
+                                    details_box()
                                         .child(
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .child(
-                                                    Icon::new(IconName::User)
-                                                        .size(px(14.))
-                                                        .text_color(muted),
+                                            Icon::new(IconName::User)
+                                                .size(px(14.))
+                                                .text_color(muted),
+                                        )
+                                        .child(
+                                            Input::new(&self.details_username)
+                                                .small()
+                                                .appearance(false)
+                                                .flex_1(),
+                                        )
+                                        .child(
+                                            Button::new("btn-identity-picker")
+                                                .ghost()
+                                                .small()
+                                                .icon(
+                                                    Icon::default()
+                                                        .data(glyph::PENCIL)
+                                                        .size(px(14.)),
                                                 )
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(fg)
-                                                        .child(SharedString::from(host.username.clone())),
-                                                ),
+                                                .on_click(cx.listener(
+                                                    |this, _, window, cx| {
+                                                        this.select_left_nav(
+                                                            LeftNav::Keychain,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                        let pane = this.ensure_keys_pane(
+                                                            window, cx,
+                                                        );
+                                                        pane.update(cx, |p, cx| {
+                                                            p.open_identity_picker(
+                                                                window, cx,
+                                                            )
+                                                        });
+                                                        cx.notify();
+                                                    },
+                                                )),
                                         ),
                                 )
                                 .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(div().text_xs().text_color(muted).child("Password"))
+                                    details_box()
                                         .child(
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .justify_between()
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_row()
-                                                        .items_center()
-                                                        .gap_1p5()
-                                                        .child(
-                                                            Icon::default()
-                                                                .data(glyph::KEY)
-                                                                .size(px(14.))
-                                                                .text_color(muted),
-                                                        )
-                                                        .child(div().text_sm().text_color(fg).child(
-                                                            if password_visible {
-                                                                match &host.auth {
-                                                                    sshdeck_core::AuthMethod::Password {
-                                                                        secret_ref,
-                                                                    } => secret_ref.clone(),
-                                                                    _ => "(no password set)".to_string(),
-                                                                }
-                                                            } else {
-                                                                "••••••••".to_string()
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    Button::new("pwd-toggle")
-                                                        .ghost()
-                                                        .icon(
-                                                            Icon::default()
-                                                                .data(if password_visible {
-                                                                    glyph::EYE_OFF
-                                                                } else {
-                                                                    glyph::EYE
-                                                                })
-                                                                .size(px(14.)),
-                                                        )
-                                                        .tooltip(if password_visible {
-                                                            "Hide password"
-                                                        } else {
-                                                            "Show password"
-                                                        })
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.password_visible =
-                                                                !this.password_visible;
-                                                            cx.notify();
-                                                        })),
-                                                ),
+                                            Icon::default()
+                                                .data(glyph::KEY)
+                                                .size(px(14.))
+                                                .text_color(muted),
+                                        )
+                                        .child(
+                                            Input::new(&self.details_password)
+                                                .small()
+                                                .appearance(false)
+                                                .mask_toggle()
+                                                .flex_1(),
                                         ),
                                 )
                                 .child(
@@ -3441,20 +4204,78 @@ impl SshDeck {
                                         div()
                                             .flex()
                                             .flex_col()
-                                            .p_2()
-                                            .rounded_md()
-                                            .bg(rgb(0xf7f9fa))
+                                            .w_full()
+                                            .max_w(px(pop_max_w))
+                                            .max_h(px(pop_max_h))
+                                            .overflow_y_scrollbar()
+                                            .p_3()
+                                            .rounded(px(12.))
+                                            .bg(cx.theme().popover)
                                             .border_1()
                                             .border_color(border)
+                                            .shadow_lg()
                                             .gap_1()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .w_full()
+                                                    .pb_1()
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap_0p5()
+                                                            .child(
+                                                                div()
+                                                                    .text_sm()
+                                                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                                    .text_color(fg)
+                                                                    .child("SSH ID"),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(muted)
+                                                                    .child("Passkeys for SSH"),
+                                                            ),
+                                                    )
+                                                    // Lavender Set-up pill.
+                                                    .child(
+                                                        div()
+                                                            .id("creds-setup-pill")
+                                                            .px_2()
+                                                            .py_0p5()
+                                                            .rounded_full()
+                                                            .bg(rgb(0xe8e8ff))
+                                                            .text_xs()
+                                                            .text_color(rgb(0x6666d2))
+                                                            .cursor_pointer()
+                                                            .child("Set up")
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.credentials_popover_open =
+                                                                        false;
+                                                                    this.select_left_nav(
+                                                                        LeftNav::Keychain,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
                                             .child(
                                                 Button::new("add-ssh-key")
                                                     .ghost()
                                                     .small()
+                                                    .w_full()
                                                     .icon(
-                                                        Icon::default().data(glyph::KEY).size(px(14.)),
+                                                        Icon::default().data(glyph::KEY).size(px(16.)),
                                                     )
-                                                    .label("SSH Key")
+                                                    .label("Key")
                                                     .on_click(cx.listener(|this, _, window, cx| {
                                                         this.credentials_popover_open = false;
                                                         this.select_left_nav(LeftNav::Keychain, window, cx);
@@ -3464,10 +4285,11 @@ impl SshDeck {
                                                 Button::new("add-cert")
                                                     .ghost()
                                                     .small()
+                                                    .w_full()
                                                     .icon(
                                                         Icon::default()
                                                             .data(glyph::CERTIFICATE)
-                                                            .size(px(14.)),
+                                                            .size(px(16.)),
                                                     )
                                                     .label("Certificate")
                                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3479,31 +4301,21 @@ impl SshDeck {
                                                 Button::new("add-fido2")
                                                     .ghost()
                                                     .small()
+                                                    .w_full()
                                                     .icon(
                                                         Icon::default()
                                                             .data(glyph::SECURITY_KEY)
-                                                            .size(px(14.)),
+                                                            .size(px(16.)),
                                                     )
-                                                    .label("Security Key / FIDO2")
+                                                    .label("FIDO2")
                                                     .on_click(cx.listener(|this, _, window, cx| {
                                                         this.credentials_popover_open = false;
                                                         this.select_left_nav(LeftNav::Keychain, window, cx);
                                                     })),
                                             ),
                                     )
-                                }),
-                        )
-                        // Card 4: Show more collapsible
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .p_3()
-                                .rounded_md()
-                                .bg(card_bg)
-                                .border_1()
-                                .border_color(border)
+                                })
+                                // Show more lives in this card, not its own.
                                 .child(
                                     Button::new("btn-show-more")
                                         .ghost()
@@ -3519,6 +4331,59 @@ impl SshDeck {
                                         })),
                                 )
                                 .when(show_more, |el| {
+                                    // Agent Forwarding and Host Chaining read
+                                    // live model state (`AuthMethod::Agent`,
+                                    // `Host::proxy_jump`). The rest have no
+                                    // `Host` field, so they render as dimmed
+                                    // non-interactive disclosures, never as
+                                    // controls that look settable but write
+                                    // nowhere.
+                                    let more_row = |icon: &'static [u8],
+                                                    label: &str,
+                                                    value: Option<String>,
+                                                    live: bool|
+                                     -> AnyElement {
+                                        details_box()
+                                            .justify_between()
+                                            .when(!live, |s| s.opacity(0.55))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .flex_shrink_0()
+                                                    .child(
+                                                        Icon::default()
+                                                            .data(icon)
+                                                            .size(px(14.))
+                                                            .text_color(muted),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .text_color(muted)
+                                                            .child(label.to_string()),
+                                                    ),
+                                            )
+                                            .when_some(value, |s, v| {
+                                                s.child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(fg)
+                                                        .min_w(px(0.))
+                                                        .truncate()
+                                                        .child(v),
+                                                )
+                                            })
+                                            .into_any_element()
+                                    };
+                                    let agent_forwarding =
+                                        if matches!(host.auth, sshdeck_core::AuthMethod::Agent) {
+                                            "Enabled".to_string()
+                                        } else {
+                                            "Disabled".to_string()
+                                        };
                                     el.child(
                                         div()
                                             .flex()
@@ -3526,187 +4391,196 @@ impl SshDeck {
                                             .gap_2()
                                             .pt_2()
                                             .border_t_1()
-                                            .border_color(rgba(0x8d91a51a))
+                                            .border_color(cx.theme().sidebar_border)
+                                            .child(more_row(
+                                                glyph::KEY,
+                                                "Agent Forwarding",
+                                                Some(agent_forwarding),
+                                                true,
+                                            ))
+                                            // ponytail: `Host` has no
+                                            // per-host startup-snippet field;
+                                            // the row stays a dimmed
+                                            // disclosure until the model
+                                            // grows one. Upgrade by adding
+                                            // the field and passing its value.
+                                            .child(more_row(
+                                                glyph::SNIPPET,
+                                                "Startup snippet",
+                                                None,
+                                                false,
+                                            ))
+                                            .child(more_row(
+                                                glyph::HOST,
+                                                "Host Chaining",
+                                                host.proxy_jump.clone(),
+                                                host.proxy_jump.is_some(),
+                                            ))
+                                            // ponytail: command-like jumps are
+                                            // refused by `sshdeck_core::jump`
+                                            // (`ChainError::ProxyCommandSkipped`);
+                                            // `Host` carries no ProxyCommand.
+                                            .child(more_row(glyph::FORWARD, "Proxy", None, false))
+                                            // ponytail: `Host` has no env,
+                                            // charset, or mosh fields; dimmed
+                                            // disclosures until it does.
+                                            .child(more_row(
+                                                glyph::CODE,
+                                                "Environment Variable",
+                                                None,
+                                                false,
+                                            ))
+                                            .child(more_row(
+                                                glyph::TERMINAL_PROMPT,
+                                                "UTF-8",
+                                                None,
+                                                false,
+                                            ))
+                                            .child(more_row(
+                                                glyph::PLUG,
+                                                "Mosh",
+                                                Some("Disabled".to_string()),
+                                                false,
+                                            ))
                                             .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                    .text_color(muted)
-                                                    .child("Terminal Theme"),
-                                            )
-                                            .child(
-                                                div()
+                                                details_box()
                                                     .id("btn-terminal-theme-select")
-                                                    .flex()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .p_2()
-                                                    .rounded_md()
-                                                    .bg(rgb(0xf7f9fa))
-                                                    .border_1()
-                                                    .border_color(border)
                                                     .cursor_pointer()
-                                                    .hover(|s| s.border_color(accent))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.theme_picker_open =
-                                                            !this.theme_picker_open;
-                                                        cx.notify();
-                                                    }))
+                                                    .hover(|s| s.bg(cx.theme().muted))
+                                                    .on_click(cx.listener(
+                                                        |this, _, _, cx| {
+                                                            this.theme_picker_open = true;
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                    .child(
+                                                        // Termius terminal preview
+                                                        // (#1d2033) with green bars.
+                                                        div()
+                                                            .w(px(56.))
+                                                            .h(px(36.))
+                                                            .rounded(px(6.))
+                                                            .bg(rgb(0x1d2033))
+                                                            .flex()
+                                                            .flex_col()
+                                                            .justify_center()
+                                                            .gap_1()
+                                                            .px_2()
+                                                            .child(
+                                                                div()
+                                                                    .w(px(28.))
+                                                                    .h(px(3.))
+                                                                    .rounded_full()
+                                                                    .bg(rgb(0x21b568)),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .w(px(36.))
+                                                                    .h(px(3.))
+                                                                    .rounded_full()
+                                                                    .bg(rgb(0x21b568)),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .w(px(20.))
+                                                                    .h(px(3.))
+                                                                    .rounded_full()
+                                                                    .bg(rgb(0x21b568)),
+                                                            ),
+                                                    )
                                                     .child(
                                                         div()
                                                             .text_sm()
                                                             .text_color(fg)
+                                                            .flex_1()
+                                                            .truncate()
                                                             .child(selected_theme.clone()),
                                                     )
                                                     .child(
-                                                        div().text_xs().text_color(muted).child("▾"),
+                                                        div()
+                                                            .text_sm()
+                                                            .text_color(muted)
+                                                            .child("›"),
                                                     ),
                                             )
-                                            .when(theme_picker_open, |theme_el| {
-                                                let themes = [
-                                                    "Termius Dark",
-                                                    "Termius Light",
-                                                    "Monokai",
-                                                    "Solarized Dark",
-                                                    "Dracula",
-                                                    "Nord",
-                                                    "One Dark",
-                                                ];
-                                                theme_el.child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_col()
-                                                        .p_2()
-                                                        .rounded_md()
-                                                        .bg(rgb(0xffffff))
-                                                        .border_1()
-                                                        .border_color(border)
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .text_xs()
-                                                                .font_weight(gpui_kit::FontWeight::BOLD)
-                                                                .text_color(muted)
-                                                                .child("Select Color Theme"),
-                                                        )
-                                                        .children(themes.into_iter().map(|th| {
-                                                            let th_str = th.to_string();
-                                                            let is_cur = th == selected_theme;
-                                                            let th_id = SharedString::from(format!(
-                                                                "theme-opt-{}",
-                                                                th.replace(' ', "-")
-                                                            ));
-                                                            div()
-                                                                .id(th_id)
-                                                                .flex()
-                                                                .flex_row()
-                                                                .items_center()
-                                                                .justify_between()
-                                                                .px_2()
-                                                                .py_1p5()
-                                                                .rounded_md()
-                                                                .cursor_pointer()
-                                                                .when(is_cur, |s| s.bg(rgb(0xe6ebed)))
-                                                                .hover(|s| s.bg(rgb(0xf0f3f5)))
-                                                                .on_click(cx.listener(
-                                                                    move |this, _, _, cx| {
-                                                                        this.selected_theme =
-                                                                            th_str.clone();
-                                                                        this.theme_picker_open = false;
-                                                                        cx.notify();
-                                                                    },
-                                                                ))
-                                                                .child(
-                                                                    div()
-                                                                        .text_sm()
-                                                                        .text_color(fg)
-                                                                        .child(th),
-                                                                )
-                                                                .when(is_cur, |s| {
-                                                                    s.child(
-                                                                        div()
-                                                                            .text_xs()
-                                                                            .text_color(accent)
-                                                                            .child("✓"),
-                                                                    )
-                                                                })
-                                                        })),
-                                                )
-                                            })
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(muted)
-                                                    .child("Startup Snippet: (None)"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(muted)
-                                                    .child("Keep-alive interval: 15s"),
-                                            ),
                                     )
                                 }),
                         )
-                        .into_any_element(),
-                    Some(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .w_full()
-                            .child(
-                                Button::new("details-add-telnet")
-                                    .ghost()
-                                    .small()
-                                    .label("+ Add Telnet")
-                                    .w_full()
-                                    .on_click(cx.listener({
-                                        let host_id = host_for_connect.id.clone();
-                                        move |this, _, window, cx| {
-                                            if let Some(mut h) = this.store.inventory().get(&host_id).cloned() {
-                                                if !h.tags.iter().any(|t| t == "telnet") {
-                                                    h.tags.push("telnet".to_string());
-                                                    this.store.inventory_mut().upsert(h);
-                                                    let _ = this.store.save();
-                                                    window.push_notification(
-                                                        Notification::success("Added Telnet protocol to host"),
-                                                        cx,
-                                                    );
-                                                    cx.notify();
-                                                } else {
-                                                    window.push_notification(
-                                                        Notification::info("Host already has Telnet configured"),
-                                                        cx,
-                                                    );
+                        // Protocol row lives in the scroll body; the footer
+                        // keeps only the pinned Connect CTA.
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_center()
+                                .p_3()
+                                .rounded(px(14.))
+                                .bg(card_bg)
+                                .child(
+                                    Button::new("details-add-telnet")
+                                        .ghost()
+                                        .label("⊕ Add Telnet")
+                                        .w_full()
+                                        .on_click(cx.listener({
+                                            let host_id = host.id.clone();
+                                            move |this, _, window, cx| {
+                                                if let Some(mut h) = this.store.inventory().get(&host_id).cloned() {
+                                                    if !h.protocols.iter().any(|p| p == "telnet") {
+                                                        h.protocols.push("telnet".to_string());
+                                                        this.store.inventory_mut().upsert(h);
+                                                        let _ = this.store.save();
+                                                        window.push_notification(
+                                                            Notification::success("Added Telnet protocol to host"),
+                                                            cx,
+                                                        );
+                                                        cx.notify();
+                                                    } else {
+                                                        window.push_notification(
+                                                            Notification::info("Host already has Telnet configured"),
+                                                            cx,
+                                                        );
+                                                    }
                                                 }
                                             }
-                                        }
-                                    })),
-                            )
-                            .child(
-                                Button::new("details-connect")
-                                    .primary()
-                                    .label("Connect")
-                                    .w_full()
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.connect(host_for_connect.clone(), window, cx);
-                                    })),
-                            )
+                                        })),
+                                ),
+                        )
+                        .into_any_element(),
+                    Some(
+                        Button::new("details-connect")
+                            .primary()
+                            .rounded(px(10.))
+                            .with_size(Size::Size(px(17.)))
+                            .label("Connect")
+                            .w_full()
+                            .h(px(46.))
+                            .bg(rgb(0x2091f6))
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.connect(host_for_connect.clone(), window, cx);
+                            }))
                             .into_any_element(),
                     ),
                 )
             }
         };
 
+        // Full-panel theme browser replaces the scroll body (and its footer
+        // Connect, which belongs to the details view) when open.
+        if theme_picker_open && selected_host.is_some() {
+            body = self.render_theme_browser(cx);
+            connect_btn = None;
+        }
+
         div()
             .flex()
             .flex_col()
             .flex_shrink_0()
             .w(px(details_w))
+            .min_w(px(0.))
             .h_full()
-            .bg(card_bg)
+            .bg(cx.theme().accent)
             .border_l_1()
             .border_color(border)
             .overflow_hidden()
@@ -3734,12 +4608,12 @@ impl SshDeck {
     }
 
     /// The New Tab screen (Screenshot 12): search box with ⌘+K, recent connections, host cards.
-    fn render_new_tab(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_new_tab(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let content_bg = cx.theme().accent; // #edf1f2 in light
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
-        let border = rgb(0xd5dde0);
-        let card_bg = rgb(0xffffff);
+        let card_bg = cx.theme().popover;
+        let win_w = f32::from(window.bounds().size.width);
 
         let query = self.new_tab_query.read(cx).value().to_string();
         let filtered: Vec<Host> = self
@@ -3756,16 +4630,22 @@ impl SshDeck {
             .size_full()
             .bg(content_bg)
             .overflow_y_scrollbar()
-            .p_8()
+            // Full padding on normal windows, tighter below ~700px so the
+            // centred column keeps its width.
+            .p_4()
+            .when(win_w >= 700.0, |el| el.p_8())
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .w_full()
+                    .min_w(px(0.))
                     .max_w(px(720.))
                     .mx_auto()
                     .gap_6()
-                    // Search bar with ⌘+K
+                    // Search bar with ⌘+K: one flat `#e8edf0` surface, no inner
+                    // Input box (`bordered(false)`); the blue focus ring is
+                    // the Input's own (`focus_bordered`, on by default).
                     .child(
                         div()
                             .flex()
@@ -3773,23 +4653,23 @@ impl SshDeck {
                             .items_center()
                             .gap_2()
                             .w_full()
-                            .p_1()
+                            .px_4()
+                            .h(px(44.))
                             .rounded(px(10.))
-                            .bg(card_bg)
-                            .border_1()
-                            .border_color(border)
+                            .bg(rgb(0xe8edf0))
                             .child(
-                                div()
-                                    .flex_1()
-                                    .child(Input::new(&self.new_tab_query).cleanable(true)),
+                                div().flex_1().child(
+                                    Input::new(&self.new_tab_query)
+                                        .bordered(false)
+                                        .cleanable(true),
+                                ),
                             )
                             .child(
                                 div()
                                     .px_2()
                                     .py_1()
-                                    .mr_2()
                                     .rounded(px(4.))
-                                    .bg(rgb(0xe6ebed))
+                                    .bg(cx.theme().muted)
                                     .text_xs()
                                     .text_color(muted)
                                     .child("⌘+K"),
@@ -3815,144 +4695,143 @@ impl SshDeck {
                                     .flex_row()
                                     .items_center()
                                     .gap_2()
+                                    // `#e6ebed` pills behind the ghost buttons.
                                     .child(
-                                        Button::new("new-tab-workspace")
-                                            .ghost()
-                                            .small()
-                                            .label("Create a workspace")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.open_add_host(window, cx);
-                                            })),
+                                        div().bg(rgb(0xe6ebed)).rounded(px(8.)).child(
+                                            Button::new("new-tab-workspace")
+                                                .ghost()
+                                                .small()
+                                                .label("Create a workspace")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.open_add_host(window, cx);
+                                                })),
+                                        ),
                                     )
                                     .child(
-                                        Button::new("new-tab-restore")
-                                            .ghost()
-                                            .small()
-                                            .label("Restore")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                if let Some(host_id) =
-                                                    this.last_session_host.clone()
-                                                {
-                                                    if let Some(host) = this
+                                        div().bg(rgb(0xe6ebed)).rounded(px(8.)).child(
+                                            Button::new("new-tab-restore")
+                                                .ghost()
+                                                .small()
+                                                .label("Restore")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    if let Some(host_id) =
+                                                        this.last_session_host.clone()
+                                                    {
+                                                        if let Some(host) = this
+                                                            .store
+                                                            .inventory()
+                                                            .get(&host_id)
+                                                            .cloned()
+                                                        {
+                                                            this.connect(host, window, cx);
+                                                            return;
+                                                        }
+                                                    }
+                                                    if let Some(first) = this
                                                         .store
                                                         .inventory()
-                                                        .get(&host_id)
+                                                        .hosts()
+                                                        .first()
                                                         .cloned()
                                                     {
-                                                        this.connect(host, window, cx);
-                                                        return;
+                                                        this.connect(first, window, cx);
+                                                    } else {
+                                                        window.push_notification(
+                                                            Notification::warning(
+                                                                "No host available to restore",
+                                                            ),
+                                                            cx,
+                                                        );
                                                     }
-                                                }
-                                                if let Some(first) =
-                                                    this.store.inventory().hosts().first().cloned()
-                                                {
-                                                    this.connect(first, window, cx);
-                                                } else {
-                                                    window.push_notification(
-                                                        Notification::warning(
-                                                            "No host available to restore",
-                                                        ),
-                                                        cx,
-                                                    );
-                                                }
-                                            })),
+                                                })),
+                                        ),
                                     ),
                             ),
                     )
-                    // Host list
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .children(filtered.into_iter().map(|host| {
-                                let connect_host = host.clone();
-                                let id = host.id.clone();
-                                div()
-                                    .id(SharedString::from(format!("new-tab-host-{id}")))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .p_3()
-                                    .rounded(px(10.))
-                                    .bg(card_bg)
-                                    .border_1()
-                                    .border_color(border)
-                                    .cursor_pointer()
-                                    .hover(|s| s.border_color(rgb(0x2091f6)))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.connect(connect_host.clone(), window, cx);
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_3()
-                                            .child(
-                                                div()
-                                                    .size(px(38.))
-                                                    .rounded(px(8.))
-                                                    .bg(rgb(0xd96c2b))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .child(
-                                                        Icon::default()
-                                                            .data(glyph::UBUNTU)
-                                                            .size(px(22.))
-                                                            .text_color(rgb(0xffffff)),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(14.))
-                                                            .font_weight(
-                                                                gpui_kit::FontWeight::MEDIUM,
-                                                            )
-                                                            .text_color(fg)
-                                                            .child(SharedString::from(host.label)),
-                                                    )
-                                                    .child(
-                                                        div().text_xs().text_color(muted).child(
-                                                            SharedString::from(format!(
-                                                                "ssh, {} · {}",
-                                                                host.username, host.address
-                                                            )),
-                                                        ),
-                                                    ),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_2p5()
-                                            .py_1()
-                                            .rounded_full()
-                                            .bg(rgb(0xf0f3f5))
-                                            .border_1()
-                                            .border_color(border)
-                                            .text_xs()
-                                            .text_color(muted)
-                                            .child("Personal"),
-                                    )
-                            })),
-                    ),
+                    // Host list: zebra rows (white / `#f3f5f6`), single-line
+                    // (22px tile + name), bare grey vault label, no hover ring.
+                    .child(div().flex().flex_col().gap_2().children(
+                        filtered.into_iter().enumerate().map(|(row, host)| {
+                            let connect_host = host.clone();
+                            let id = host.id.clone();
+                            let row_bg: Hsla = if row % 2 == 0 {
+                                card_bg
+                            } else {
+                                rgb(0xf3f5f6).into()
+                            };
+                            div()
+                                .id(SharedString::from(format!("new-tab-host-{id}")))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .min_w(px(0.))
+                                .p_3()
+                                .rounded(px(10.))
+                                .bg(row_bg)
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.connect(connect_host.clone(), window, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_3()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .size(px(22.))
+                                                .flex_shrink_0()
+                                                .rounded(px(6.))
+                                                .bg(rgb(0xd96c2b))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    Icon::default()
+                                                        .data(glyph::UBUNTU)
+                                                        .size(px(14.))
+                                                        .text_color(rgb(0xffffff)),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(14.))
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                .text_color(fg)
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .child(SharedString::from(host.label)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(12.))
+                                        .text_color(muted)
+                                        .child("Personal"),
+                                )
+                        }),
+                    )),
             )
             .into_any_element()
     }
 
-    /// The SFTP tab: the browser, attached to the focused session.
-    fn render_sftp(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        match self.sftp_pane.clone() {
+    /// The SFTP tab: the browser, attached to the focused session. While that
+    /// session is still connecting, the connecting rail docks on the right.
+    fn render_sftp(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let browser = match self.sftp_pane.clone() {
             Some(pane) => div()
                 .flex()
                 .flex_col()
                 .flex_1()
+                .min_w(px(0.))
                 .size_full()
                 .overflow_hidden()
                 .child(pane)
@@ -3970,7 +4849,27 @@ impl SshDeck {
                     .child(div().text_color(muted).child("SFTP is not open"))
                     .into_any_element()
             }
-        }
+        };
+
+        let rail = self.active.and_then(|index| {
+            self.sessions.get(index).filter(|session| {
+                matches!(
+                    session.status.state,
+                    SessionState::Connecting | SessionState::Authenticating
+                )
+            })?;
+            Some(self.render_connecting_rail(index, window, cx))
+        });
+
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .size_full()
+            .overflow_hidden()
+            .child(browser)
+            .when_some(rail, |el, rail| el.child(rail))
+            .into_any_element()
     }
 
     /// The settings or keys pane, with a header that closes it.
@@ -4028,8 +4927,9 @@ impl SshDeck {
             .into_any_element()
     }
 
-    /// The live terminal (or connecting screen/empty state) for the focused session.
-    fn render_session(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// The live terminal (or connecting screen/empty state) for the focused session,
+    /// with the 300pt right sidebar docked beside it while open.
+    fn render_session(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
 
         // Bring the focused pane's status onto the tab before rendering chrome.
@@ -4045,7 +4945,7 @@ impl SshDeck {
                         SessionState::Connecting | SessionState::Authenticating
                     );
                     if is_connecting {
-                        self.render_connecting_screen(index, cx)
+                        self.render_connecting_screen(index, window, cx)
                     } else {
                         div()
                             .flex()
@@ -4107,6 +5007,7 @@ impl SshDeck {
         };
 
         let secret = self.render_secret_prompt(cx);
+        let sidebar = self.render_session_sidebar(window, cx);
 
         div()
             .flex()
@@ -4116,17 +5017,1103 @@ impl SshDeck {
             .min_h(px(0.))
             .overflow_hidden()
             .when_some(secret, |el, prompt| el.child(prompt))
-            .child(content)
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .child(content),
+                    )
+                    .child(sidebar),
+            )
             .into_any_element()
     }
 
-    /// Connecting screen (Screenshot 13): host emblem, label, endpoint, animated connecting line, Close button.
-    fn render_connecting_screen(
+    /// The session right sidebar: a 300pt inset panel (10px radius, theme
+    /// background, 7pt margins) with a 40pt 4-icon tab strip and one body per
+    /// tab. Hidden entirely while `sidebar_open` is false; the header's panel
+    /// button toggles it back. Below [`SIDEBAR_OVERLAY_WIDTH`] it becomes an
+    /// overlay drawer (absolute right, bordered, `shadow_lg`) so the terminal
+    /// keeps a usable grid instead of squeezing beside a 300pt panel.
+    fn render_session_sidebar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !self.sidebar_open {
+            return div().into_any_element();
+        }
+        let overlay = f32::from(window.bounds().size.width) < SIDEBAR_OVERLAY_WIDTH;
+        let active = self.sidebar_tab;
+        // `#223636` has no theme token (see AGENTS.md errata on chrome
+        // colours); it is the recovered active-pill fill from the reference.
+        let pill = rgb(0x223636);
+        let green = cx.theme().success;
+        let muted = cx.theme().muted_foreground;
+
+        let tab_button = |id: &'static str,
+                          tip: &'static str,
+                          icon: Icon,
+                          tab: SidebarTab,
+                          cx: &mut Context<Self>| {
+            let selected = active == tab;
+            div()
+                .flex_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .h(px(32.))
+                .rounded(px(8.))
+                .when(selected, |el| el.bg(pill))
+                .child(
+                    Button::new(id)
+                        .ghost()
+                        .icon(icon.text_color(if selected { green } else { muted }))
+                        .tooltip(tip)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.sidebar_tab = tab;
+                            cx.notify();
+                        })),
+                )
+        };
+
+        let body = match active {
+            SidebarTab::Snippets => self.render_sidebar_snippets(window, cx),
+            SidebarTab::History => self.render_sidebar_history(cx),
+            SidebarTab::Autocomplete => self.render_sidebar_autocomplete(cx),
+            SidebarTab::Appearance => self.render_sidebar_appearance(cx),
+        };
+
+        div()
+            .w(px(300.))
+            .flex_shrink_0()
+            .h_full()
+            .when(!overlay, |el| el.py(px(7.)).pr(px(7.)))
+            // Overlay drawer: absolute right over the content with a border and
+            // shadow; the parent row is `relative`, and closing is the same
+            // header toggle that closed the inset panel.
+            .when(overlay, |el| {
+                el.absolute()
+                    .top_0()
+                    .right_0()
+                    .py(px(0.))
+                    .pr(px(0.))
+                    .border_l_1()
+                    .border_color(cx.theme().border)
+                    .shadow_lg()
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .h_full()
+                    .w_full()
+                    .rounded(px(10.))
+                    .bg(cx.theme().background)
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .flex_shrink_0()
+                            .h(px(40.))
+                            .px_2()
+                            .gap_1()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            // Reference order: rocket (autocomplete), braces
+                            // (snippets), clock (history), palette
+                            // (appearance). Rocket, braces, and clock ship as
+                            // raw-SVG `Icon::data` glyphs — the bundled asset
+                            // set has no such icons — while palette reuses
+                            // the bundled `IconName::Palette`.
+                            .child(tab_button(
+                                "side-tab-autocomplete",
+                                "Autocomplete",
+                                Icon::default().data(glyph::ROCKET),
+                                SidebarTab::Autocomplete,
+                                cx,
+                            ))
+                            .child(tab_button(
+                                "side-tab-snippets",
+                                "Snippets",
+                                Icon::default().data(glyph::BRACES),
+                                SidebarTab::Snippets,
+                                cx,
+                            ))
+                            .child(tab_button(
+                                "side-tab-history",
+                                "History",
+                                Icon::default().data(glyph::CLOCK),
+                                SidebarTab::History,
+                                cx,
+                            ))
+                            .child(tab_button(
+                                "side-tab-appearance",
+                                "Appearance",
+                                Icon::new(IconName::Palette),
+                                SidebarTab::Appearance,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scrollbar()
+                            .child(body),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One sidebar row: 14px label, 12px muted description, right-aligned
+    /// control, hairline below. Mirrors the settings surface's row shape.
+    /// 44px min height is the touch target and is kept on all widths; labels
+    /// truncate with `min_w(0)` so long text never overflows a narrow panel.
+    fn sidebar_row(
+        label: &'static str,
+        description: &'static str,
+        control: impl IntoElement,
+        cx: &App,
+    ) -> impl IntoElement {
+        div()
+            .w_full()
+            .min_h(px(44.))
+            .py_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .border_b_1()
+            .border_color(rgba(0x8d91a51a))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .text_color(cx.theme().foreground)
+                            .truncate()
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(description),
+                    ),
+            )
+            .child(control)
+    }
+
+    /// The Autocomplete body: one row with a BETA info chip.
+    ///
+    /// The old `Disabled` dropdown was a dead control (rendered `disabled` with
+    /// no handler), so it is deleted rather than kept as a stub. The BETA chip
+    /// is the info-token (same pattern as the Logs `Upgrade` chip): ghost-text
+    /// suggestions are not implemented yet.
+    /// The Snippets body: a compact 44px-row list with the pane's live search
+    /// field. The rows share the pane's filter state (`search_field` /
+    /// `compact_rows`), so typing here filters the same store the full pane
+    /// shows; a tap selects the snippet in the pane.
+    fn render_sidebar_snippets(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pane = self.ensure_snippets_pane(window, cx);
+        let search = pane.read(cx).search_field();
+        let items = pane.read(cx).compact_rows(cx);
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let empty = items.is_empty();
+        let rows: Vec<AnyElement> = items
+            .into_iter()
+            .map(|(id, label, secondary)| {
+                let select_id = id.clone();
+                let row_pane = pane.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "side-snippet-{}",
+                        select_id.as_str()
+                    )))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_h(px(44.))
+                    .px_2()
+                    .py_1()
+                    .rounded(px(8.))
+                    .border_b_1()
+                    .border_color(border)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().muted))
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        row_pane.update(cx, |pane, cx| {
+                            pane.select(select_id.clone(), window, cx);
+                        });
+                    }))
+                    .child(
+                        div()
+                            .size(px(28.))
+                            .rounded(px(6.))
+                            .bg(rgb(0x244a67))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::default()
+                                    .data(glyph::CODE)
+                                    .size(px(16.))
+                                    .text_color(rgb(0xffffff)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .truncate()
+                                    .child(SharedString::from(label)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(muted)
+                                    .truncate()
+                                    .font_family("Menlo")
+                                    .child(SharedString::from(secondary)),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        // Empty state mirrors the reference: a 72pt braces tile, the
+        // catalogue copy, and a New Snippet affordance that opens the
+        // library's blank form. Built before the chain so no `cx` borrow is
+        // needed inside the `.when` closure below.
+        let new_snippet = Button::new("side-snippet-new")
+            .small()
+            .label("New Snippet")
+            .icon(Icon::default().data(glyph::BRACES))
+            .on_click(cx.listener(|this, _, window, cx| {
+                let pane = this.ensure_snippets_pane(window, cx);
+                pane.update(cx, |pane, cx| {
+                    pane.open_new(window, cx);
+                });
+                this.select_left_nav(LeftNav::Snippets, window, cx);
+            }));
+        let empty_state = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .w_full()
+            .py_6()
+            .child(
+                div()
+                    .size(px(72.))
+                    .rounded(px(16.))
+                    .bg(cx.theme().muted)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .data(glyph::BRACES)
+                            .size(px(28.))
+                            .text_color(muted),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().foreground)
+                    .child("Create snippets from your commands"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Store your most used commands to reuse them in one click."),
+            )
+            .child(new_snippet);
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .w_full()
+            .child(
+                div().flex_shrink_0().p_2().child(
+                    div().flex_1().min_w(px(120.)).child(
+                        Input::new(&search)
+                            .small()
+                            .cleanable(true)
+                            .prefix(Icon::new(IconName::Search).small().text_color(muted)),
+                    ),
+                ),
+            )
+            .child(
+                div()
+                    .id("side-snippets-compact")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .px_2()
+                    .pb_2()
+                    .overflow_y_scrollbar()
+                    .when(empty, |el| el.child(empty_state))
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    fn render_sidebar_autocomplete(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let chip = div()
+            .px_2()
+            .py_1()
+            .rounded_full()
+            .bg(rgb(0x223636))
+            .text_size(px(10.))
+            .text_color(cx.theme().success)
+            .child("BETA");
+        let control = div().flex().flex_row().items_center().gap_2().child(chip);
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .px_3()
+            .child(Self::sidebar_row(
+                "Autocomplete",
+                "Ghost-text suggestions as you type",
+                control,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// The History body: an add form (three inputs + Close/Save) over a flat
+    /// list of saved suggestions, bounded like the logs pane.
+    fn render_sidebar_history(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let form = self.history_form_open.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .gap_2()
+                .p_3()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(Input::new(&self.hist_who).small())
+                .child(Input::new(&self.hist_where).small())
+                .child(Input::new(&self.hist_what).small())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("side-history-close")
+                                .ghost()
+                                .small()
+                                .label("Close")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.history_form_open = false;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("side-history-save")
+                                .small()
+                                .primary()
+                                .label("Save")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let who = this.hist_who.read(cx).value().trim().to_string();
+                                    let whr = this.hist_where.read(cx).value().trim().to_string();
+                                    let what = this.hist_what.read(cx).value().trim().to_string();
+                                    let mut parts = Vec::new();
+                                    if !what.is_empty() {
+                                        parts.push(what.clone());
+                                    }
+                                    if !who.is_empty() {
+                                        parts.push(who.clone());
+                                    }
+                                    if !whr.is_empty() {
+                                        parts.push(whr.clone());
+                                    }
+                                    if !parts.is_empty() {
+                                        push_history(&mut this.history, parts.join(" · "));
+                                    }
+                                    // Persist the suggestion as a snippet so it
+                                    // survives restarts: the command template is
+                                    // the entry, the label names who/where.
+                                    if !what.is_empty() {
+                                        let label = match (who.is_empty(), whr.is_empty()) {
+                                            (false, false) => format!("{who} · {whr}"),
+                                            (false, true) => who.clone(),
+                                            (true, false) => whr.clone(),
+                                            (true, true) => what.clone(),
+                                        };
+                                        let pane = this.ensure_snippets_pane(window, cx);
+                                        let error = pane.update(cx, |pane, cx| {
+                                            pane.add_quick_snippet(label, what, cx)
+                                        });
+                                        if let Some(message) = error {
+                                            window.push_notification(
+                                                Notification::warning(format!(
+                                                    "Suggestion kept for this session, not saved: {message}"
+                                                )),
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                    for input in [&this.hist_who, &this.hist_where, &this.hist_what]
+                                    {
+                                        input.update(cx, |state, cx| {
+                                            state.set_value("", window, cx);
+                                        });
+                                    }
+                                    this.history_form_open = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+        });
+
+        let empty = self.history.is_empty() && !self.history_form_open;
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .flex_1()
+            .min_h(px(0.))
+            .when_some(form, |el, form| el.child(form))
+            .when(empty, |el| {
+                el.child(
+                    div()
+                        .p_3()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No saved suggestions yet"),
+                )
+            })
+            .children(self.history.iter().rev().map(|entry| {
+                div()
+                    .id(SharedString::from(format!("side-history-{entry}")))
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .min_h(px(44.))
+                    .border_b_1()
+                    .border_color(rgba(0x8d91a51a))
+                    .text_sm()
+                    .text_color(cx.theme().foreground)
+                    .child(SharedString::from(entry.clone()))
+            }))
+            .child(
+                div().p_3().child(
+                    Button::new("side-history-add")
+                        .ghost()
+                        .small()
+                        .label("Add suggestion")
+                        .icon(IconName::Plus)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.history_form_open = true;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// The Appearance body: a Font stepper (10–24px, matching the reference
+    /// range) plus the terminal theme list with 64x40 mini-preview swatches
+    /// and a selected border. The ten schemes are the reference catalogue
+    /// with clean-room re-derived colours; picking one applies it live to
+    /// every pane.
+    fn render_sidebar_appearance(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.selected_theme.clone();
+        let font_size = self.terminal_font_size;
+        // Live values: the cell is re-measured from the font size every frame,
+        // so existing panes scale at once; only scrollback still needs a pane
+        // rebuild (fixed when the grid is created).
+        let font_control = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("side-font-dec")
+                    .ghost()
+                    .small()
+                    .label("−")
+                    .tooltip("Smaller terminal text")
+                    .disabled(font_size <= 10.0)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_terminal_font_size(this.terminal_font_size - 1.0, window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(SharedString::from(format!("{font_size:.0} px"))),
+            )
+            .child(
+                Button::new("side-font-inc")
+                    .ghost()
+                    .small()
+                    .label("+")
+                    .tooltip("Larger terminal text")
+                    .disabled(font_size >= 24.0)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_terminal_font_size(this.terminal_font_size + 1.0, window, cx);
+                    })),
+            );
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .px_3()
+            .child(Self::sidebar_row(
+                "Font",
+                "Terminal text size · applies live; scrollback needs a new pane",
+                font_control,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .pt_3()
+                    .pb_2()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("TERMINAL THEMES"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{} themes", SCHEMES.len())),
+                    ),
+            )
+            .children(SCHEMES.iter().map(|(name, scheme)| {
+                let chosen = selected == *name;
+                let swatch_bg: Hsla = scheme.background().into();
+                let swatch_fg: Hsla = scheme.foreground().into();
+                let swatch_cursor: Hsla = scheme.cursor().into();
+                let theme_name = name.to_string();
+                let theme_meta = scheme.meta();
+                div()
+                    .id(SharedString::from(format!("side-theme-{name}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .w_full()
+                    .p_2()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(if chosen {
+                        cx.theme().success
+                    } else {
+                        rgba(0x8d91a51a).into()
+                    })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().muted))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.selected_theme = theme_name.clone();
+                        this.apply_terminal_scheme(window, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(64.))
+                            .h(px(40.))
+                            .flex_shrink_0()
+                            .rounded(px(6.))
+                            .bg(swatch_bg)
+                            .border_1()
+                            .border_color(swatch_fg)
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .gap(px(4.))
+                            .px(px(8.))
+                            // Mini terminal preview: two text bars plus a
+                            // prompt row with a cursor block, in the scheme's
+                            // own colours on its background.
+                            .child(div().w_full().h(px(4.)).rounded_full().bg(swatch_fg))
+                            .child(div().w(px(36.)).h(px(4.)).rounded_full().bg(swatch_fg))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(3.))
+                                    .child(
+                                        div().w(px(10.)).h(px(4.)).rounded_full().bg(swatch_cursor),
+                                    )
+                                    .child(
+                                        div().w(px(6.)).h(px(8.)).rounded(px(1.)).bg(swatch_cursor),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().foreground)
+                                    .child(SharedString::from(name.to_string())),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(theme_meta),
+                            ),
+                    )
+                    .when(chosen, |el| {
+                        el.child(Icon::new(IconName::Check).text_color(cx.theme().success))
+                    })
+            }))
+            .into_any_element()
+    }
+
+    /// The tiled workspace: a recursive split tree of session panes, every
+    /// split laying its children with an 8px gutter. Each tile is a borderless
+    /// click-to-focus wrapper: the pane draws its own 28pt header and green
+    /// focus border, so the wrapper adds no chrome. Tiles flex by their
+    /// settled `weights` share with `min_w/min_h` 0 so panes resize with the
+    /// window. Below [`WORKSPACE_STACK_WIDTH`] every split stacks vertically
+    /// so each canvas keeps a usable grid. Maximize shows only the focused
+    /// tile and toggles back. The right sidebar docks beside the tiles, as in
+    /// the session view.
+    fn render_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if workspace_leaves(&self.workspace).is_empty() {
+            if let Some(active) = self.active {
+                self.workspace = WorkspaceNode::Pane(active);
+                self.workspace_focus = 0;
+            }
+        }
+        let muted = cx.theme().muted_foreground;
+        let narrow = f32::from(window.bounds().size.width) < WORKSPACE_STACK_WIDTH;
+        let maximized = self.workspace_maximized;
+        let focus = self.workspace_focus;
+        let override_dir = self.workspace_direction;
+        let root_dir = match &self.workspace {
+            WorkspaceNode::Split { dir, .. } => *dir,
+            _ => SplitDir::Row,
+        };
+        let effective = if narrow {
+            SplitDir::Col
+        } else {
+            override_dir.unwrap_or(root_dir)
+        };
+        let vertical = effective == SplitDir::Col;
+
+        let leaves = workspace_leaves(&self.workspace);
+        let body: AnyElement = if leaves.is_empty() {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .size_full()
+                .child(
+                    Icon::new(IconName::LayoutDashboard)
+                        .large()
+                        .text_color(muted),
+                )
+                .child(
+                    div()
+                        .text_color(muted)
+                        .child("Split a terminal to start the workspace"),
+                )
+                .into_any_element()
+        } else if maximized {
+            // Only the focused tile; the leaf position doubles as its id.
+            let at = focus.min(leaves.len() - 1);
+            match leaves.get(at).copied() {
+                Some(index) => self.render_workspace_tile(index, at, cx),
+                None => div().flex_1().into_any_element(),
+            }
+        } else {
+            let node = self.workspace.clone();
+            let mut pos = 0;
+            self.render_workspace_node(&node, override_dir, narrow, &mut pos, window, cx)
+        };
+
+        let toolbar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_shrink_0()
+            .h(px(28.))
+            .px_2()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(muted)
+                    .child("Workspace"),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("ws-direction")
+                    .ghost()
+                    .small()
+                    .label(if vertical { "Stacked" } else { "Side by side" })
+                    .tooltip("Toggle split direction")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let narrow = f32::from(window.bounds().size.width) < WORKSPACE_STACK_WIDTH;
+                        let root = match &this.workspace {
+                            WorkspaceNode::Split { dir, .. } => *dir,
+                            _ => SplitDir::Row,
+                        };
+                        let effective = if narrow {
+                            SplitDir::Col
+                        } else {
+                            this.workspace_direction.unwrap_or(root)
+                        };
+                        this.workspace_direction = Some(if effective == SplitDir::Row {
+                            SplitDir::Col
+                        } else {
+                            SplitDir::Row
+                        });
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("ws-max")
+                    .ghost()
+                    .small()
+                    .label(if maximized { "Tile all" } else { "Maximize" })
+                    .tooltip("Maximize the focused tile")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.workspace_maximized = !this.workspace_maximized;
+                        cx.notify();
+                    })),
+            );
+
+        let sidebar = self.render_session_sidebar(window, cx);
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .min_h(px(0.))
+            .overflow_hidden()
+            .child(toolbar)
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .p(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .child(body),
+                    )
+                    .child(sidebar),
+            )
+            .into_any_element()
+    }
+
+    /// Renders one tiling node: a pane becomes a click-to-focus tile, a split
+    /// becomes a flex row (or column) with an 8px gutter whose children flex
+    /// by their settled `weights` share. `root_dir` overrides only the
+    /// outermost split's axis; narrow windows stack every level. `pos` counts
+    /// flattened leaves so clicks land on the focused leaf.
+    fn render_workspace_node(
+        &mut self,
+        node: &WorkspaceNode,
+        root_dir: Option<SplitDir>,
+        narrow: bool,
+        pos: &mut usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match node {
+            WorkspaceNode::Empty => div().flex_1().into_any_element(),
+            WorkspaceNode::Pane(index) => {
+                let position = *pos;
+                *pos += 1;
+                self.render_workspace_tile(*index, position, cx)
+            }
+            WorkspaceNode::Split {
+                dir,
+                weights,
+                children,
+            } => {
+                let axis = root_dir.unwrap_or(*dir);
+                let column = narrow || axis == SplitDir::Col;
+                let shares = normalize_weights(weights, children.len());
+                let mut items = Vec::with_capacity(children.len());
+                for (child, share) in children.iter().zip(shares) {
+                    let element = self.render_workspace_node(child, None, narrow, pos, window, cx);
+                    items.push(
+                        div()
+                            .flex_1()
+                            .flex_grow(share)
+                            .min_w(px(0.))
+                            .min_h(px(0.))
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .child(element)
+                            .into_any_element(),
+                    );
+                }
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .gap_2()
+                    .when(column, |el| el.flex_col())
+                    .when(!column, |el| el.flex_row())
+                    .children(items)
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// One workspace tile: a borderless click-to-focus wrapper around the
+    /// session's `TerminalPane`. The pane draws its own green focus border
+    /// and 28pt header, so the wrapper adds no chrome of its own.
+    fn render_workspace_tile(
+        &mut self,
+        index: usize,
+        position: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(session) = self.sessions.get(index) else {
+            return div().flex_1().into_any_element();
+        };
+        let pane = session.pane.clone();
+        let focus_pane = pane.clone();
+        let host_id = session.host.clone();
+        div()
+            .id(SharedString::from(format!("ws-tile-{host_id}-{position}")))
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.workspace_focus = position;
+                this.active = Some(index);
+                focus_pane.update(cx, |pane, cx| pane.focus(window, cx));
+                cx.notify();
+            }))
+            .child(pane)
+            .into_any_element()
+    }
+
+    /// The connecting rail: a white 280pt panel with a `#5a5e73` header, a
+    /// 32px status glyph, and Show logs / Close buttons on `#e6ebed` 32px
+    /// pills. Shared by the connecting screen and the SFTP right pane.
+    fn render_connecting_rail(
         &mut self,
         session_index: usize,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (host_id, state_label, title) = if let Some(session) = self.sessions.get(session_index)
+        {
+            (
+                session.host.clone(),
+                session.status.state.label(),
+                session
+                    .status
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| session.host.to_string()),
+            )
+        } else {
+            return div().into_any_element();
+        };
+        let host = self.store.inventory().get(&host_id).cloned();
+        let display_title = host.as_ref().map(|h| h.label.clone()).unwrap_or(title);
+        let endpoint_str = host
+            .as_ref()
+            .map(|h| format!("{}:{}", h.address, h.port))
+            .unwrap_or_else(|| host_id.to_string());
+        let muted = cx.theme().muted_foreground;
+        // 280px rail, capped at 90% of the window so it never squeezes the
+        // connecting view out on narrow windows.
+        let win_w = f32::from(window.bounds().size.width);
+        let rail_max_w = (win_w * 0.9).max(220.0);
+
+        // `#e6ebed` 32px pills wrapping ghost buttons, so the button chrome
+        // stays flat while the pill carries the fill.
+        let pill = |label: Button| {
+            div()
+                .h(px(32.))
+                .flex_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .bg(rgb(0xe6ebed))
+                .child(label)
+        };
+
+        div()
+            .w(px(280.))
+            .max_w(px(rail_max_w))
+            .min_w(px(0.))
+            .flex_shrink_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0xffffff))
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(0x5a5e73))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xffffff))
+                            .truncate()
+                            .child(SharedString::from(display_title)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xd0d3e0))
+                            .truncate()
+                            .child(SharedString::from(endpoint_str)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_3()
+                    .p_6()
+                    // ponytail: a static glyph, not an animation — the only
+                    // budgeted timer is the cursor blink. Upgrade with a
+                    // rotation step driven by the pane's notify loop.
+                    .child(
+                        Icon::new(IconName::RotateCw)
+                            .size(px(32.))
+                            .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(SharedString::from(format!("{state_label}..."))),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .p_3()
+                    .child(pill(
+                        Button::new("rail-logs")
+                            .ghost()
+                            .small()
+                            .label("Show logs")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.select_left_nav(LeftNav::Logs, window, cx);
+                            })),
+                    ))
+                    .child(pill(
+                        Button::new("rail-close")
+                            .ghost()
+                            .small()
+                            .label("Close")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_session(session_index, window, cx);
+                            })),
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// Connecting screen (Screenshot 13, light): emblem + name/endpoint row
+    /// with a Show-logs pill, a static connecting rail, and a Close pill.
+    /// No right rail on this screen; labels truncate with `min_w(0)`.
+    fn render_connecting_screen(
+        &mut self,
+        session_index: usize,
+        _window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (host_id, _state_label, title) = if let Some(session) = self.sessions.get(session_index)
         {
             (
                 session.host.clone(),
@@ -4148,10 +6135,24 @@ impl SshDeck {
             .map(|h| format!("SSH {}:{}", h.address, h.port))
             .unwrap_or_else(|| format!("SSH {host_id}"));
 
-        let bg_color = rgb(0x141729);
-        let text_primary = rgb(0xffffff);
-        let text_muted = rgb(0x8d91a5);
-        let line_color = rgb(0x2091f6);
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let rail_grey = rgb(0x5a5e73);
+
+        // Neutral grey pills wrapping ghost buttons, so the button chrome
+        // stays flat while the pill carries the fill.
+        let pill = |label: Button| {
+            div()
+                .h(px(36.))
+                .px_2()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .bg(rgb(0xe6ebed))
+                .child(label)
+        };
 
         div()
             .flex()
@@ -4159,125 +6160,137 @@ impl SshDeck {
             .items_center()
             .justify_center()
             .size_full()
-            .bg(bg_color)
-            .p_8()
-            .gap_6()
-            .child(
-                div()
-                    .size(px(64.))
-                    .rounded(px(14.))
-                    .bg(rgb(0xd96c2b))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Icon::default()
-                            .data(glyph::UBUNTU)
-                            .size(px(36.))
-                            .text_color(rgb(0xffffff)),
-                    ),
-            )
+            .bg(cx.theme().background)
+            .overflow_hidden()
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .items_center()
-                    .gap_1()
+                    .gap_4()
+                    .w_full()
+                    .max_w(px(600.))
+                    .min_w(px(0.))
+                    .p_8()
                     .child(
                         div()
-                            .text_size(px(20.))
-                            .text_color(text_primary)
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child(display_title),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_3()
+                            .w_full()
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .size(px(40.))
+                                    .flex_shrink_0()
+                                    .rounded(px(10.))
+                                    .bg(rgb(0xd96c2b))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        Icon::default()
+                                            .data(glyph::UBUNTU)
+                                            .size(px(24.))
+                                            .text_color(rgb(0xffffff)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .text_size(px(15.))
+                                            .text_color(fg)
+                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                            .truncate()
+                                            .child(SharedString::from(display_title.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(muted)
+                                            .truncate()
+                                            .child(SharedString::from(endpoint_str.clone())),
+                                    ),
+                            )
+                            .child(pill(
+                                Button::new("connecting-logs")
+                                    .ghost()
+                                    .small()
+                                    .label("Show logs")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.select_left_nav(LeftNav::Logs, window, cx);
+                                    })),
+                            )),
                     )
+                    // ponytail: static rail, not an animation — the only
+                    // budgeted timer is the cursor blink. Upgrade with a
+                    // rotation step driven by the pane's notify loop.
                     .child(
                         div()
-                            .text_size(px(14.))
-                            .text_color(text_muted)
-                            .child(endpoint_str),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .px_6()
-                    .py_3()
-                    .rounded_full()
-                    .bg(rgba(0xffffff0d))
-                    .child(
-                        Icon::default()
-                            .data(glyph::PLUG)
-                            .size(px(20.))
-                            .text_color(text_muted),
-                    )
-                    .child(div().w(px(120.)).h(px(2.)).bg(line_color))
-                    .child(
-                        Icon::default()
-                            .data(glyph::TERMINAL_PROMPT)
-                            .size(px(20.))
-                            .text_color(line_color),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(text_muted)
-                    .child(format!("Status: {state_label}...")),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        Button::new("connecting-logs")
-                            .ghost()
-                            .small()
-                            .label("Show logs")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.select_left_nav(LeftNav::Logs, window, cx);
-                            })),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .w_full()
+                            .child(
+                                div()
+                                    .size(px(28.))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(cx.theme().primary)
+                                    .child(
+                                        Icon::default()
+                                            .data(glyph::PLUG)
+                                            .size(px(16.))
+                                            .text_color(rgb(0xffffff)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(260.))
+                                    .flex_1()
+                                    .h(px(3.))
+                                    .rounded_full()
+                                    .bg(rail_grey),
+                            )
+                            .child(
+                                div()
+                                    .size(px(28.))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(rail_grey)
+                                    .child(
+                                        Icon::default()
+                                            .data(glyph::TERMINAL_PROMPT)
+                                            .size(px(16.))
+                                            .text_color(rgb(0xffffff)),
+                                    ),
+                            ),
                     )
                     .child(
-                        Button::new("connecting-close")
-                            .danger()
-                            .small()
-                            .label("Close")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.close_session(session_index, window, cx);
-                            })),
+                        div().flex().flex_row().items_center().child(pill(
+                            Button::new("connecting-close")
+                                .ghost()
+                                .small()
+                                .label("Close")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.close_session(session_index, window, cx);
+                                })),
+                        )),
                     ),
             )
             .into_any_element()
-    }
-
-    /// The host, auth method and connection state the removed status bar used
-    /// to show, folded into the header's right cluster: the active session's
-    /// endpoint and state, or the selected host when no session is open.
-    fn status_line(&self) -> String {
-        let host = self
-            .active_session()
-            .and_then(|session| self.store.inventory().get(&session.host))
-            .or_else(|| {
-                self.selected
-                    .as_ref()
-                    .and_then(|id| self.store.inventory().get(id))
-            })
-            .map(|host| format!("{} · {}", host.endpoint(), host.auth.label()));
-
-        let state = match self.active_session() {
-            Some(session) => session.status.state.label(),
-            None => "no session".to_string(),
-        };
-
-        match host {
-            Some(host) => format!("{host} · {state}"),
-            None => state,
-        }
     }
 }
 
@@ -4285,11 +6298,11 @@ impl Render for SshDeck {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let foreground = cx.theme().foreground;
 
-        let header = self.render_header(cx);
+        let header = self.render_header(window, cx);
         let sidebar = self.render_sidebar(window, cx);
         let pane_tabs = self.render_pane_tabs(cx);
         let main = self.render_main(window, cx);
-        let add_host_sheet = self.render_add_host_sheet(cx);
+        let add_host_sheet = self.render_add_host_sheet(window, cx);
         let palette = self.palette.clone();
 
         let mut root = div()
@@ -4300,9 +6313,6 @@ impl Render for SshDeck {
             // window's `background` token is the darker `--surface-lowest`.
             .bg(cx.theme().sidebar)
             .text_color(foreground)
-            // `--default-font-size` is 14px; the theme's `font.size` is 13, so
-            // the body size is set explicitly here.
-            .text_size(px(14.))
             // The palette's navigation actions are bound in its own context. The
             // context is only active while the palette is open, so these keys are
             // never stolen from the terminal or an input.
@@ -4317,7 +6327,11 @@ impl Render for SshDeck {
                     .flex_row()
                     .flex_1()
                     .overflow_hidden()
-                    .child(sidebar)
+                    // Sessions are full-bleed: no left rail, no pane tab row.
+                    .when(
+                        !matches!(self.tab, MainTab::Session(_) | MainTab::Workspace),
+                        |el| el.child(sidebar),
+                    )
                     .child(
                         div()
                             .flex()
@@ -4325,9 +6339,10 @@ impl Render for SshDeck {
                             .flex_1()
                             .min_w(px(0.))
                             .overflow_hidden()
-                            .when(matches!(self.tab, MainTab::Session(_)), |el| {
-                                el.child(pane_tabs)
-                            })
+                            .when(
+                                matches!(self.tab, MainTab::Session(_) | MainTab::Workspace),
+                                |el| el.child(pane_tabs),
+                            )
                             .child(main),
                     ),
             )
@@ -4460,6 +6475,10 @@ mod tests {
             parse_start_pane("logs"),
             Some(StartPane::Nav(LeftNav::Logs))
         );
+        assert_eq!(
+            parse_start_pane("settings"),
+            Some(StartPane::Nav(LeftNav::Settings))
+        );
         assert_eq!(parse_start_pane("sftp"), Some(StartPane::Sftp));
 
         // Unknown and empty values fall back to the default instead of panicking.
@@ -4476,6 +6495,167 @@ mod tests {
         assert_eq!(tab_after_close(MainTab::Sftp, 0), MainTab::Sftp);
         assert_eq!(tab_after_close(MainTab::Vaults, 0), MainTab::Vaults);
         assert_eq!(tab_after_close(MainTab::NewTab, 0), MainTab::NewTab);
+        assert_eq!(tab_after_close(MainTab::Workspace, 0), MainTab::Workspace);
+    }
+
+    #[test]
+    fn sidebar_history_evicts_the_oldest_past_the_cap() {
+        let mut history = Vec::new();
+        for index in 0..MAX_HISTORY_ENTRIES {
+            push_history(&mut history, format!("entry-{index}"));
+        }
+        assert_eq!(history.len(), MAX_HISTORY_ENTRIES);
+        push_history(&mut history, "one-more".to_string());
+        assert_eq!(history.len(), MAX_HISTORY_ENTRIES);
+        assert_eq!(history[0], "entry-1");
+        assert_eq!(history[MAX_HISTORY_ENTRIES - 1], "one-more");
+    }
+
+    #[test]
+    fn closing_a_session_repairs_the_split_tree() {
+        let flat = |tiles: &[usize]| WorkspaceNode::Split {
+            dir: SplitDir::Row,
+            weights: vec![1.0; tiles.len()],
+            children: tiles
+                .iter()
+                .map(|&tile| WorkspaceNode::Pane(tile))
+                .collect(),
+        };
+        // The closed tile drops out; later indexes shift down.
+        let (tree, focus) = workspace_remove(&flat(&[0, 1, 2]), 2, 1);
+        assert_eq!((workspace_leaves(&tree), focus), (vec![0, 1], 1));
+        // Focus into a removed tile clamps to the last remaining tile.
+        let (tree, focus) = workspace_remove(&WorkspaceNode::Pane(3), 0, 3);
+        assert_eq!((tree, focus), (WorkspaceNode::Empty, 0));
+        // An unrelated close leaves tiles and focus alone.
+        let (tree, focus) = workspace_remove(&flat(&[0, 2]), 1, 5);
+        assert_eq!((workspace_leaves(&tree), focus), (vec![0, 2], 1));
+        // Empty stays empty; a close cannot invent a focus.
+        let (tree, focus) = workspace_remove(&WorkspaceNode::Empty, 0, 0);
+        assert_eq!((tree, focus), (WorkspaceNode::Empty, 0));
+        // A stale focus past the end clamps to the last tile.
+        let (tree, focus) = workspace_remove(&flat(&[0, 1]), 9, 5);
+        assert_eq!((workspace_leaves(&tree), focus), (vec![0, 1], 1));
+        // Earlier indexes are untouched; only later ones shift.
+        let (tree, focus) = workspace_remove(&flat(&[0, 1, 4]), 0, 1);
+        assert_eq!((workspace_leaves(&tree), focus), (vec![0, 3], 0));
+        // A split left with one child collapses into it.
+        let nested = WorkspaceNode::Split {
+            dir: SplitDir::Row,
+            weights: vec![1.0, 1.0],
+            children: vec![
+                WorkspaceNode::Pane(0),
+                WorkspaceNode::Split {
+                    dir: SplitDir::Col,
+                    weights: vec![1.0, 1.0],
+                    children: vec![WorkspaceNode::Pane(1), WorkspaceNode::Pane(2)],
+                },
+            ],
+        };
+        let (tree, _) = workspace_remove(&nested, 0, 0);
+        assert_eq!(
+            tree,
+            WorkspaceNode::Split {
+                dir: SplitDir::Col,
+                weights: vec![1.0, 1.0],
+                children: vec![WorkspaceNode::Pane(0), WorkspaceNode::Pane(1)],
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_split_nests_without_duplicates() {
+        // An empty tree tiles directly.
+        assert_eq!(
+            workspace_insert(&WorkspaceNode::Empty, 0, 1),
+            (WorkspaceNode::Pane(1), 0)
+        );
+        // Splitting a lone pane wraps it across the row axis.
+        let (tree, focus) = workspace_insert(&WorkspaceNode::Pane(0), 0, 1);
+        assert_eq!(focus, 1);
+        assert_eq!(
+            tree,
+            WorkspaceNode::Split {
+                dir: SplitDir::Row,
+                weights: vec![1.0, 1.0],
+                children: vec![WorkspaceNode::Pane(0), WorkspaceNode::Pane(1)],
+            }
+        );
+        // Splitting inside a row nests a column: the reference's
+        // full-height pane beside a stacked pair.
+        let (tree, focus) = workspace_insert(&tree, 1, 2);
+        assert_eq!((workspace_leaves(&tree), focus), (vec![0, 1, 2], 2));
+        assert!(matches!(
+            &tree,
+            WorkspaceNode::Split {
+                dir: SplitDir::Row,
+                children,
+                ..
+            } if matches!(
+                &children[1],
+                WorkspaceNode::Split {
+                    dir: SplitDir::Col,
+                    ..
+                }
+            )
+        ));
+        // An already-tiled session focuses instead of duplicating, so every
+        // tile keeps its own pane entity.
+        let (same, focus) = workspace_insert(&tree, 0, 1);
+        assert_eq!((same, focus), (tree, 1));
+        // A stale focus splits the last tile rather than panicking.
+        let (tree, focus) = workspace_insert(&WorkspaceNode::Pane(0), 9, 1);
+        assert_eq!((workspace_leaves(&tree), focus), (vec![0, 1], 1));
+    }
+
+    #[test]
+    fn split_weights_default_to_equal_shares() {
+        assert_eq!(normalize_weights(&[], 3), vec![1.0, 1.0, 1.0]);
+        assert_eq!(normalize_weights(&[1.0, 1.0, 2.0], 3), vec![1.0, 1.0, 2.0]);
+        // Short tables pad; zero, negative, and non-finite entries fall back
+        // to all-equal rather than collapsing a tile.
+        assert_eq!(normalize_weights(&[2.0], 2), vec![2.0, 1.0]);
+        assert_eq!(normalize_weights(&[1.0, 0.0], 2), vec![1.0, 1.0]);
+        assert_eq!(normalize_weights(&[1.0, -3.0], 2), vec![1.0, 1.0]);
+        assert_eq!(normalize_weights(&[1.0, f32::NAN], 2), vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn vault_subtitle_and_grid_columns_follow_termius() {
+        let mut host = Host::new("prod", "10.0.0.1");
+        host.username = "root".to_string();
+        host.tags.push("prod".into());
+        // Tags live in Host Details pills, never in the subtitle: protocols
+        // first, then the login for each.
+        assert_eq!(host_subtitle(&host), "ssh, root");
+        host.protocols.push("telnet".to_string());
+        assert_eq!(host_subtitle(&host), "ssh, telnet, root, root");
+        host.username.clear();
+        assert_eq!(host_subtitle(&host), "ssh, telnet");
+        host.protocols.clear();
+        assert_eq!(host_subtitle(&host), "ssh");
+
+        assert_eq!(grid_columns(359.9), 1);
+        assert_eq!(grid_columns(360.0), 2);
+        assert_eq!(grid_columns(699.9), 2);
+        assert_eq!(grid_columns(700.0), 3);
+        assert_eq!(grid_columns(1199.9), 3);
+        assert_eq!(grid_columns(1200.0), 4);
+    }
+
+    #[test]
+    fn chrome_breakpoints_collapse_before_they_clip() {
+        // Rail: 60px icons when manually collapsed or below ~900px.
+        assert_eq!(rail_width(1400.0, false), 185.0);
+        assert_eq!(rail_width(900.0, false), 185.0);
+        assert_eq!(rail_width(899.9, false), 60.0);
+        assert_eq!(rail_width(1400.0, true), 60.0);
+        // Drawer: overlay below ~800px, 300px at 800–1100, 360px above.
+        assert!(details_overlay(799.9));
+        assert!(!details_overlay(800.0));
+        assert_eq!(details_width(800.0), 300.0);
+        assert_eq!(details_width(1099.9), 300.0);
+        assert_eq!(details_width(1100.0), 360.0);
     }
 
     #[test]
@@ -4495,5 +6675,23 @@ mod tests {
         // Compare in `Hsla` space: an `Hsla -> Rgba -> Hsla` round trip loses a
         // least-significant bit (0xce0056 renders as 0xce0055 on the way back).
         assert_eq!(host_os_tint(&host, fallback), Hsla::from(rgb(0xce0056)));
+    }
+
+    #[test]
+    fn popovers_clamp_and_drawers_replace_below_600px() {
+        // max_w is min(320, 90vw) floored at 160 so a pill never collapses.
+        assert_eq!(popover_max_w(1200.0), 320.0);
+        assert_eq!(popover_max_w(300.0), 270.0);
+        assert_eq!(popover_max_w(100.0), 160.0);
+        // max_h is 70vh floored at 160, always paired with a scrollbar.
+        assert_eq!(popover_max_h(1000.0), 700.0);
+        assert_eq!(popover_max_h(100.0), 160.0);
+        // Drawer breakpoint.
+        assert!(use_full_drawer(599.9));
+        assert!(!use_full_drawer(600.0));
+        // Grid cards shrink, list rows and 44px touch targets do not.
+        assert_eq!(host_card_height(true, 400.0), 48.0);
+        assert_eq!(host_card_height(false, 400.0), 56.0);
+        assert_eq!(host_card_height(false, 1200.0), 68.0);
     }
 }

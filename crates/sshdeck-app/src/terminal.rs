@@ -26,9 +26,12 @@
 //!     settings_view.read(cx).scrollback_lines(),
 //!     settings_view.read(cx).cursor_blink(),
 //! )
-//! .with_scheme(settings_view.read(cx).scheme());
+//! .with_scheme(TerminalScheme::by_name(&selected_theme).unwrap_or_default());
 //! let pane = cx.new(|cx| TerminalPane::new_with_options(config, options, window, cx));
 //! ```
+//!
+//! The shell keeps the selected scheme name (`selected_theme`) and applies it
+//! to new panes here and to live ones via `TerminalPane::set_scheme`.
 //!
 //! The scrollback cap is fixed when the grid is created, so changing it later
 //! requires rebuilding the pane; `TerminalOptions` never raises it above
@@ -36,20 +39,24 @@
 //! [`SCHEMES`]) supplies the grid, background and cursor colours, so a dark
 //! scheme stays dark even when the app theme is light.
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::glyph;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::{ActiveTheme as _, Icon};
 // `push_notification` is a `WindowExt` method; without the trait in scope the
 // window has no such method (see AGENTS.md errata on missing trait imports).
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, font, point, px, Bounds, ClipboardItem, Context, Div, FocusHandle, FontWeight,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    Pixels, Point, Render, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Styled as _, Task,
-    Window,
+    div, font, point, px, AnyElement, App, Bounds, ClipboardItem, Context, Div, Entity,
+    FocusHandle, FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement as _, Pixels, Point, Render, Rgba, ScrollDelta, ScrollWheelEvent,
+    SharedString, Styled as _, Task, Window,
 };
 use gpui_kit::{InteractiveElement as _, IntoElement};
 use sshdeck_core::session::{Session, SessionConfig, SessionEvent};
@@ -61,13 +68,17 @@ use sshdeck_terminal::{encode_key, Cell, Color, Key, Modifiers, Terminal};
 const SCROLLBACK_LINES: usize = 10_000;
 
 /// Default terminal font size in pixels, alongside the shell's `text_sm`.
-const FONT_SIZE: f32 = 13.0;
+///
+/// Matches the app chrome's 14px body size (see `AGENTS.md` errata on the theme's
+/// 13px `font.size`); the chrome sets its size explicitly until the theme does.
+const FONT_SIZE: f32 = 14.0;
 
 /// Font-size bounds. The floor keeps glyphs legible; the ceiling stops a single
 /// line from swallowing the pane. `TerminalOptions` clamps into this range so a
-/// bad value can never collapse or explode the grid.
-const MIN_FONT_SIZE: f32 = 6.0;
-const MAX_FONT_SIZE: f32 = 72.0;
+/// bad value can never collapse or explode the grid. The ceiling matches the
+/// reference theme dialogue's largest step.
+const MIN_FONT_SIZE: f32 = 10.0;
+const MAX_FONT_SIZE: f32 = 24.0;
 
 /// Cursor blink half-period. Cursor blink is the one timer docs/BUDGET.md
 /// accepts in the terminal; it is parked entirely while the window is
@@ -79,28 +90,6 @@ const MAX_IDX: u8 = 255;
 
 /// Levels of the 6x6x6 colour cube used by xterm-256 palette entries 16-231.
 const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
-
-/// The conventional xterm/ANSI palette for indices 0-15. It is the ANSI table of
-/// the default scheme, so a pane with no explicit scheme keeps drawing exactly
-/// the colours it always has.
-const BASIC_COLORS: [[u8; 3]; 16] = [
-    [0, 0, 0],
-    [205, 0, 0],
-    [0, 205, 0],
-    [205, 205, 0],
-    [0, 0, 238],
-    [205, 0, 205],
-    [0, 205, 205],
-    [229, 229, 229],
-    [127, 127, 127],
-    [255, 0, 0],
-    [0, 255, 0],
-    [255, 255, 0],
-    [92, 92, 255],
-    [255, 0, 255],
-    [0, 255, 255],
-    [255, 255, 255],
-];
 
 /// Packs 8-bit sRGB channels into the `Rgba` the renderer paints.
 fn rgb([r, g, b]: [u8; 3]) -> Rgba {
@@ -130,24 +119,38 @@ fn translucent(color: Rgba, alpha: f32) -> Rgba {
 /// Colours are stored as 8-bit sRGB and converted on read, so a scheme is a
 /// small `Copy` value: no allocation, and nothing that can grow at runtime.
 ///
-/// # Provenance
+/// # Provenance (clean-room)
 ///
-/// - `sshdeck Dark` reproduces the historical behaviour: the conventional
-///   xterm/ANSI 16, with the app's dark terminal colours behind it.
-/// - `Termius Dark` / `Termius Light` are built only from the exact tokens in
-///   `docs/UI-PARITY.md` (recovered from Termius's own stylesheet). No value is
-///   invented. Termius ships a single teal token, so `bright_cyan` reuses it.
-/// - `Solarized Dark` is Ethan Schoonover's Solarized 16-colour terminal
-///   mapping (<https://ethanschoonover.com/solarized/>).
-/// - `Dracula` is the Dracula theme's terminal palette
-///   (<https://draculatheme.com/terminal>).
-/// - `Nord` is the Nord theme's terminal palette
-///   (<https://www.nordtheme.com/docs/colors-and-palettes>).
+/// Names match the reference theme list so a user finds the same catalogue;
+/// every value below was re-derived from reference pixels, never copied from a
+/// theme author or asset:
+///
+/// - background / foreground / cursor per theme are sampled from the
+///   appearance screenshot's swatch rows (mode of the swatch fill, the text
+///   bars, and the prompt block) plus the terminal shots: Termius Dark
+///   `#151728` / `#57b26f`, Termius Light `#d6dde0` / `#333648` / `#428a56`,
+///   Flexoki Dark `#100f0f` / `#cecdc4` / `#6b7f28`, Flexoki Light `#fefcf1` /
+///   `#100f0f` / `#8b9948`, Kanagawa Wave `#1f1f27` / `#dbd7bd` / `#668553`,
+///   Kanagawa Dragon `#181616` / `#c6c9c5` / `#5d6e49`, Kanagawa Lotus
+///   `#f1ecc1` / `#545463` / `#748855`, Hacker Blue `#020514` / `#54b4f9` /
+///   `#649aba`, Hacker Green `#040f02` / `#52ae35` / `#96cc8a`, Hacker Red
+///   `#1c0201` / `#a2251c` (row truncated in the capture, so the cursor
+///   reuses the foreground).
+/// - The 16 ANSI entries are hue-rotated companions of each theme's sampled
+///   accent (fixed hues for red/yellow/magenta/cyan, the accent hue for green
+///   and blue when the accent is green/blue, saturation from the accent,
+///   lightness steps for normal/bright), with black/white taken from the
+///   sampled background/foreground. They are deliberately *not* the authors'
+///   published tables.
+/// - `meta` is the picker's sub-line: the reference default marker for
+///   Termius Dark, "new" for the Flexoki pair, family notes otherwise
+///   (reference download counts are service data this client does not have).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalScheme {
     foreground: [u8; 3],
     background: [u8; 3],
     cursor: [u8; 3],
+    meta: &'static str,
     ansi: [[u8; 3]; 16],
 }
 
@@ -171,6 +174,12 @@ impl TerminalScheme {
         rgb(self.cursor)
     }
 
+    /// The picker's sub-line for this scheme (default/new/family note).
+    #[must_use]
+    pub fn meta(&self) -> &'static str {
+        self.meta
+    }
+
     /// ANSI colour `index` (0-15), or `None` outside that range. The engine
     /// reports indices as `u8`, so an out-of-range value is rejected rather
     /// than silently wrapped into the table.
@@ -181,9 +190,8 @@ impl TerminalScheme {
 
     /// Looks a scheme up by the name in [`SCHEMES`]; `None` when unknown.
     ///
-    /// The registry is a fixed array, so a lookup is a linear scan over six
+    /// The registry is a fixed array, so a lookup is a linear scan over ten
     /// entries with no allocation and no unbounded state.
-    #[allow(dead_code)] // Read by the settings/picker surface, not by the pane.
     #[must_use]
     pub fn by_name(name: &str) -> Option<Self> {
         SCHEMES
@@ -195,143 +203,314 @@ impl TerminalScheme {
 
 /// The selectable schemes, each paired with its display name. The first entry is
 /// the [`Default`] scheme.
-pub const SCHEMES: [(&'static str, TerminalScheme); 6] = [
-    (
-        "sshdeck Dark",
-        TerminalScheme {
-            foreground: [247, 249, 250], // #f7f9fa
-            background: [20, 23, 41],    // #141729
-            cursor: [32, 145, 246],      // #2091f6
-            ansi: BASIC_COLORS,
-        },
-    ),
+pub const SCHEMES: [(&'static str, TerminalScheme); 10] = [
     (
         "Termius Dark",
         TerminalScheme {
-            foreground: [255, 255, 255], // --text-primary (white)
-            background: [20, 23, 41],    // --cf-main-background / grey-1
-            cursor: [32, 145, 246],      // blue accent
+            foreground: [87, 178, 111], // #57b26f
+            background: [21, 23, 40],   // #151728
+            cursor: [87, 178, 111],     // #57b26f
+            meta: "Default",
             ansi: [
-                [29, 32, 51],    // grey-2  #1d2033  (surface / black)
-                [242, 94, 97],   // red     #f25e61
-                [33, 181, 104],  // green   #21b568
-                [242, 201, 76],  // yellow  #f2c94c
-                [24, 108, 181],  // blue-dark #186cb5
-                [175, 95, 255],  // purple  #af5fff
-                [84, 210, 210],  // teal    #54d2d2
-                [213, 221, 224], // grey-4 #d5dde0
-                [90, 94, 115],   // grey-6  #5a5e73  (bright black)
-                [255, 115, 117], // red-light #ff7375
-                [0, 214, 122],   // green-light #00d67a
-                [255, 203, 0],   // bright-yellow #ffcb00
-                [32, 145, 246],  // blue accent  #2091f6  (bright blue)
-                [160, 66, 255],  // vivid-purple #a042ff
-                [84, 210, 210],  // teal (only teal token)
-                [247, 249, 250], // grey-7 #f7f9fa
+                // #151728 #ac4139 #ac8a39 #39ac58
+                [21, 23, 40],
+                [172, 65, 57],
+                [172, 138, 57],
+                [57, 172, 88],
+                // #3965ac #9b39ac #39a4ac #57b26f
+                [57, 101, 172],
+                [155, 57, 172],
+                [57, 164, 172],
+                [87, 178, 111],
+                // #2c4d41 #d27f79 #d2b879 #79d291
+                [44, 77, 65],
+                [210, 127, 121],
+                [210, 184, 121],
+                [121, 210, 145],
+                // #799bd2 #c579d2 #79ccd2 #81c593
+                [121, 155, 210],
+                [197, 121, 210],
+                [121, 204, 210],
+                [129, 197, 147],
             ],
         },
     ),
     (
         "Termius Light",
         TerminalScheme {
-            foreground: [20, 23, 41],    // #141729
-            background: [247, 249, 250], // grey-7 #f7f9fa
-            cursor: [32, 145, 246],      // blue accent
+            foreground: [51, 54, 72],    // #333648
+            background: [214, 221, 224], // #d6dde0
+            cursor: [66, 138, 86],       // #428a56
+            meta: "Light navy",
             ansi: [
-                [20, 23, 41],    // #141729
-                [242, 94, 97],   // red #f25e61
-                [33, 181, 104],  // green #21b568
-                [242, 201, 76],  // yellow #f2c94c
-                [32, 145, 246],  // blue #2091f6
-                [175, 95, 255],  // purple #af5fff
-                [84, 210, 210],  // teal #54d2d2
-                [164, 179, 186], // grey-3 light #a4b3ba
-                [90, 94, 115],   // grey-6 #5a5e73
-                [255, 115, 117], // red-light #ff7375
-                [0, 214, 122],   // green-light #00d67a
-                [255, 203, 0],   // bright-yellow #ffcb00
-                [24, 108, 181],  // blue-dark #186cb5
-                [160, 66, 255],  // vivid-purple #a042ff
-                [84, 210, 210],  // teal #54d2d2
-                [247, 249, 250], // grey-7 #f7f9fa
+                // #333648 #a13d36 #a18136 #36a153
+                [51, 54, 72],
+                [161, 61, 54],
+                [161, 129, 54],
+                [54, 161, 83],
+                // #365fa1 #9136a1 #369aa1 #d6dde0
+                [54, 95, 161],
+                [145, 54, 161],
+                [54, 154, 161],
+                [214, 221, 224],
+                // #6c707d #cc6d66 #ccad66 #66cc82
+                [108, 112, 125],
+                [204, 109, 102],
+                [204, 173, 102],
+                [102, 204, 130],
+                // #668dcc #bd66cc #66c5cc #e6ebec
+                [102, 141, 204],
+                [189, 102, 204],
+                [102, 197, 204],
+                [230, 235, 236],
             ],
         },
     ),
     (
-        "Solarized Dark",
+        "Flexoki Dark",
         TerminalScheme {
-            foreground: [131, 148, 150], // base0 #839496
-            background: [0, 43, 54],     // base03 #002b36
-            cursor: [131, 148, 150],     // base0
+            foreground: [206, 205, 196], // #cecdc4
+            background: [16, 15, 15],    // #100f0f
+            cursor: [107, 127, 40],      // #6b7f28
+            meta: "New · warm dark",
             ansi: [
-                [7, 54, 66],     // base02  #073642
-                [220, 50, 47],   // red     #dc322f
-                [133, 153, 0],   // green   #859900
-                [181, 137, 0],   // yellow  #b58900
-                [38, 139, 210],  // blue    #268bd2
-                [211, 54, 130],  // magenta #d33682
-                [42, 161, 152],  // cyan    #2aa198
-                [238, 232, 213], // base2   #eee8d5
-                [0, 43, 54],     // base03  #002b36
-                [203, 75, 22],   // orange  #cb4b16
-                [88, 110, 117],  // base01  #586e75
-                [101, 123, 131], // base00  #657b83
-                [131, 148, 150], // base0   #839496
-                [108, 113, 196], // violet  #6c71c4
-                [147, 161, 161], // base1   #93a1a1
-                [253, 246, 227], // base3   #fdf6e3
+                // #100f0f #af3f37 #af8b37 #37af53
+                [16, 15, 15],
+                [175, 63, 55],
+                [175, 139, 55],
+                [55, 175, 83],
+                // #3765af #9d37af #37a7af #cecdc4
+                [55, 101, 175],
+                [157, 55, 175],
+                [55, 167, 175],
+                [206, 205, 196],
+                // #52524e #d47d77 #d4b877 #77d48d
+                [82, 82, 78],
+                [212, 125, 119],
+                [212, 184, 119],
+                [119, 212, 141],
+                // #779bd4 #c677d4 #77ced4 #dadad3
+                [119, 155, 212],
+                [198, 119, 212],
+                [119, 206, 212],
+                [218, 218, 211],
             ],
         },
     ),
     (
-        "Dracula",
+        "Flexoki Light",
         TerminalScheme {
-            foreground: [248, 248, 242], // #f8f8f2
-            background: [40, 42, 54],    // #282a36
-            cursor: [248, 248, 242],
+            foreground: [16, 15, 15],    // #100f0f
+            background: [254, 252, 241], // #fefcf1
+            cursor: [139, 153, 72],      // #8b9948
+            meta: "New · warm light",
             ansi: [
-                [33, 34, 44],    // #21222c
-                [255, 85, 85],   // #ff5555
-                [80, 250, 123],  // #50fa7b
-                [241, 250, 140], // #f1fa8c
-                [189, 147, 249], // #bd93f9
-                [255, 121, 198], // #ff79c6
-                [139, 233, 253], // #8be9fd
-                [248, 248, 242], // #f8f8f2
-                [98, 114, 164],  // #6272a4
-                [255, 110, 110], // #ff6e6e
-                [105, 255, 148], // #69ff94
-                [255, 255, 165], // #ffffa5
-                [214, 172, 255], // #d6acff
-                [255, 146, 223], // #ff92df
-                [164, 255, 255], // #a4ffff
-                [255, 255, 255], // #ffffff
+                // #100f0f #a13d36 #a18136 #36a14f
+                [16, 15, 15],
+                [161, 61, 54],
+                [161, 129, 54],
+                [54, 161, 79],
+                // #365fa1 #9136a1 #369aa1 #fefcf1
+                [54, 95, 161],
+                [145, 54, 161],
+                [54, 154, 161],
+                [254, 252, 241],
+                // #63625e #cc6d66 #ccad66 #66cc7e
+                [99, 98, 94],
+                [204, 109, 102],
+                [204, 173, 102],
+                [102, 204, 126],
+                // #668dcc #bd66cc #66c5cc #fefdf7
+                [102, 141, 204],
+                [189, 102, 204],
+                [102, 197, 204],
+                [254, 253, 247],
             ],
         },
     ),
     (
-        "Nord",
+        "Kanagawa Wave",
         TerminalScheme {
-            foreground: [216, 222, 233], // nord4 #d8dee9
-            background: [46, 52, 64],    // nord0 #2e3440
-            cursor: [216, 222, 233],     // nord4
+            foreground: [219, 215, 189], // #dbd7bd
+            background: [31, 31, 39],    // #1f1f27
+            cursor: [102, 133, 83],      // #668553
+            meta: "Warm dark",
             ansi: [
-                [46, 52, 64],    // nord0 #2e3440
-                [191, 97, 106],  // nord11 #bf616a
-                [163, 190, 140], // nord14 #a3be8c
-                [235, 203, 139], // nord13 #ebcb8b
-                [129, 161, 193], // nord9 #81a1c1
-                [180, 142, 173], // nord15 #b48ead
-                [136, 192, 208], // nord8 #88c0d0
-                [216, 222, 233], // nord4 #d8dee9
-                [76, 86, 106],   // nord3 #4c566a
-                [191, 97, 106],  // nord11
-                [163, 190, 140], // nord14
-                [235, 203, 139], // nord13
-                [94, 129, 172],  // nord10 #5e81ac
-                [180, 142, 173], // nord15
-                [143, 188, 187], // nord7 #8fbcbb
-                [236, 239, 244], // nord6 #eceff4
+                // #1f1f27 #ac4139 #ac8a39 #65ac39
+                [31, 31, 39],
+                [172, 65, 57],
+                [172, 138, 57],
+                [101, 172, 57],
+                // #3965ac #9b39ac #39a4ac #dbd7bd
+                [57, 101, 172],
+                [155, 57, 172],
+                [57, 164, 172],
+                [219, 215, 189],
+                // #615f5c #d27f79 #d2b879 #9bd279
+                [97, 95, 92],
+                [210, 127, 121],
+                [210, 184, 121],
+                [155, 210, 121],
+                // #799bd2 #c579d2 #79ccd2 #e4e1ce
+                [121, 155, 210],
+                [197, 121, 210],
+                [121, 204, 210],
+                [228, 225, 206],
+            ],
+        },
+    ),
+    (
+        "Kanagawa Dragon",
+        TerminalScheme {
+            foreground: [198, 201, 197], // #c6c9c5
+            background: [24, 22, 22],    // #181616
+            cursor: [93, 110, 73],       // #5d6e49
+            meta: "Deep warm dark",
+            ansi: [
+                // #181616 #ac4139 #ac8a39 #77ac39
+                [24, 22, 22],
+                [172, 65, 57],
+                [172, 138, 57],
+                [119, 172, 57],
+                // #3965ac #9b39ac #39a4ac #c6c9c5
+                [57, 101, 172],
+                [155, 57, 172],
+                [57, 164, 172],
+                [198, 201, 197],
+                // #555553 #d27f79 #d2b879 #a9d279
+                [85, 85, 83],
+                [210, 127, 121],
+                [210, 184, 121],
+                [169, 210, 121],
+                // #799bd2 #c579d2 #79ccd2 #d4d6d4
+                [121, 155, 210],
+                [197, 121, 210],
+                [121, 204, 210],
+                [212, 214, 212],
+            ],
+        },
+    ),
+    (
+        "Kanagawa Lotus",
+        TerminalScheme {
+            foreground: [84, 84, 99],    // #545463
+            background: [241, 236, 193], // #f1ecc1
+            cursor: [116, 136, 85],      // #748855
+            meta: "Warm light",
+            ansi: [
+                // #545463 #a13d36 #a18136 #36a14f
+                [84, 84, 99],
+                [161, 61, 54],
+                [161, 129, 54],
+                [54, 161, 79],
+                // #365fa1 #9136a1 #369aa1 #f1ecc1
+                [54, 95, 161],
+                [145, 54, 161],
+                [54, 154, 161],
+                [241, 236, 193],
+                // #8b8984 #cc6d66 #ccad66 #66cc7e
+                [139, 137, 132],
+                [204, 109, 102],
+                [204, 173, 102],
+                [102, 204, 126],
+                // #668dcc #bd66cc #66c5cc #f7f4da
+                [102, 141, 204],
+                [189, 102, 204],
+                [102, 197, 204],
+                [247, 244, 218],
+            ],
+        },
+    ),
+    (
+        "Hacker Blue",
+        TerminalScheme {
+            foreground: [84, 180, 249], // #54b4f9
+            background: [2, 5, 20],     // #020514
+            cursor: [100, 154, 186],    // #649aba
+            meta: "Phosphor blue",
+            ansi: [
+                // #020514 #ac4139 #ac8a39 #39ac54
+                [2, 5, 20],
+                [172, 65, 57],
+                [172, 138, 57],
+                [57, 172, 84],
+                // #3981ac #9b39ac #39a4ac #54b4f9
+                [57, 129, 172],
+                [155, 57, 172],
+                [57, 164, 172],
+                [84, 180, 249],
+                // #1f4264 #d27f79 #d2b879 #79d28e
+                [31, 66, 100],
+                [210, 127, 121],
+                [210, 184, 121],
+                [121, 210, 142],
+                // #79b1d2 #c579d2 #79ccd2 #7fc7fa
+                [121, 177, 210],
+                [197, 121, 210],
+                [121, 204, 210],
+                [127, 199, 250],
+            ],
+        },
+    ),
+    (
+        "Hacker Green",
+        TerminalScheme {
+            foreground: [82, 174, 53], // #52ae35
+            background: [4, 15, 2],    // #040f02
+            cursor: [150, 204, 138],   // #96cc8a
+            meta: "Phosphor green",
+            ansi: [
+                // #040f02 #ac4139 #ac8a39 #4eac39
+                [4, 15, 2],
+                [172, 65, 57],
+                [172, 138, 57],
+                [78, 172, 57],
+                // #3965ac #9b39ac #39a4ac #52ae35
+                [57, 101, 172],
+                [155, 57, 172],
+                [57, 164, 172],
+                [82, 174, 53],
+                // #1f4714 #d27f79 #d2b879 #89d279
+                [31, 71, 20],
+                [210, 127, 121],
+                [210, 184, 121],
+                [137, 210, 121],
+                // #799bd2 #c579d2 #79ccd2 #7dc268
+                [121, 155, 210],
+                [197, 121, 210],
+                [121, 204, 210],
+                [125, 194, 104],
+            ],
+        },
+    ),
+    (
+        "Hacker Red",
+        TerminalScheme {
+            foreground: [162, 37, 28], // #a2251c
+            background: [28, 2, 1],    // #1c0201
+            cursor: [162, 37, 28],     // #a2251c
+            meta: "Phosphor red",
+            ansi: [
+                // #1c0201 #c42d22 #c49322 #22c448
+                [28, 2, 1],
+                [196, 45, 34],
+                [196, 147, 34],
+                [34, 196, 72],
+                // #2260c4 #ab22c4 #22b9c4 #a2251c
+                [34, 96, 196],
+                [171, 34, 196],
+                [34, 185, 196],
+                [162, 37, 28],
+                // #4b0e0a #e56f67 #e5bf67 #67e584
+                [75, 14, 10],
+                [229, 111, 103],
+                [229, 191, 103],
+                [103, 229, 132],
+                // #6797e5 #d267e5 #67dce5 #b95c55
+                [103, 151, 229],
+                [210, 103, 229],
+                [103, 220, 229],
+                [185, 92, 85],
             ],
         },
     ),
@@ -339,7 +518,7 @@ pub const SCHEMES: [(&'static str, TerminalScheme); 6] = [
 
 impl Default for TerminalScheme {
     fn default() -> Self {
-        // `SCHEMES` is a fixed six-entry array, so index 0 is always in bounds.
+        // `SCHEMES` is a fixed ten-entry array, so index 0 is always in bounds.
         SCHEMES[0].1
     }
 }
@@ -370,7 +549,7 @@ pub fn color_to_rgb(color: Color, scheme: &TerminalScheme) -> Option<Rgba> {
             }
             // `index` is a u8, so the 0-231 arms above leave only 232-255 here.
             _ => {
-                debug_assert!(index <= MAX_IDX, "vt100 colour indices are u8");
+                debug_assert!(index >= 232, "greyscale ramp starts at index 232");
                 let grey = 8 + 10 * (index - 232);
                 Some(rgb([grey, grey, grey]))
             }
@@ -497,7 +676,6 @@ impl TerminalOptions {
 
     /// Selects a colour scheme. A scheme is a small `Copy` value, so this
     /// cannot introduce unbounded state.
-    #[allow(dead_code)] // Read by the settings surface, not by the pane itself.
     #[must_use]
     pub const fn with_scheme(mut self, scheme: TerminalScheme) -> Self {
         self.scheme = scheme;
@@ -596,6 +774,13 @@ pub struct TerminalPane {
     blink_parked: bool,
     /// The blink timer, held so it is dropped (and cancelled) with the pane.
     blink_task: Option<Task<()>>,
+    /// The 28pt header title, set by the shell (usually the host label).
+    header_title: Option<SharedString>,
+    /// Whether the 28pt per-pane header renders. Off in the single-pane
+    /// session view, on for workspace tiles.
+    show_header: bool,
+    /// Split/maximize/close handler the shell installs; `None` until then.
+    on_pane_action: Option<PaneActionHandler>,
 }
 
 impl TerminalPane {
@@ -669,6 +854,9 @@ impl TerminalPane {
             blink_on: true,
             blink_parked: false,
             blink_task: None,
+            header_title: None,
+            show_header: false,
+            on_pane_action: None,
         };
 
         if let Some(events) = events {
@@ -800,6 +988,133 @@ impl TerminalPane {
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window, cx);
+    }
+
+    /// Sets the 28pt header title (usually the host label). The title is a
+    /// snapshot taken when the shell knows it, not a live binding.
+    pub fn set_header_title(&mut self, title: impl Into<SharedString>) {
+        self.header_title = Some(title.into());
+    }
+
+    /// Shows or hides the 28pt per-pane header.
+    pub fn set_show_header(&mut self, show: bool) {
+        self.show_header = show;
+    }
+
+    /// Applies a colour scheme live. The next frame paints from it; no rebuild
+    /// is needed because the grid parser holds no colours.
+    pub fn set_scheme(&mut self, scheme: TerminalScheme) {
+        self.options = self.options.with_scheme(scheme);
+    }
+
+    /// Applies a font size live, clamped into `MIN_FONT_SIZE..=MAX_FONT_SIZE`.
+    /// The next frame re-measures the cell from it (see `render`), so the grid
+    /// and `line_height` scale together. Only the scrollback cap still needs a
+    /// pane rebuild, since it is fixed when the grid is created.
+    pub fn set_font_size(&mut self, font_size: f32) {
+        let font_size = if font_size.is_finite() {
+            font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+        } else {
+            FONT_SIZE
+        };
+        self.options = TerminalOptions::new(
+            font_size,
+            self.options.scrollback_lines(),
+            self.options.cursor_blink(),
+        )
+        .with_scheme(self.options.scheme());
+    }
+
+    /// Installs the split/maximize/close handler the header buttons call, with
+    /// the pane's own handle so the shell knows which tile acted.
+    pub fn set_on_pane_action(
+        &mut self,
+        handler: impl Fn(PaneHeaderAction, Entity<TerminalPane>, &mut Window, &mut App) + 'static,
+    ) {
+        self.on_pane_action = Some(Rc::new(handler));
+    }
+
+    /// The 28pt per-pane header: glyph + truncating title + `~` + green focus
+    /// dot, with a split/max/close cluster on the right.
+    ///
+    /// The 28pt header always shows its split/maximize/close cluster as three
+    /// 14px icon buttons (~28pt targets): the reference keeps them visible on
+    /// every tile, and hiding them until hover would need hover-group
+    /// machinery this pane does not have. `Icon::data` raw SVGs bypass the
+    /// bundled asset set, which ships no split/expand glyphs. The title
+    /// carries `flex_1` + `min_w(0)` + `truncate` so a long host label
+    /// ellipsizes instead of pushing the cluster out.
+    fn render_pane_header(&self, focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self
+            .header_title
+            .clone()
+            .unwrap_or_else(|| SharedString::from("Terminal"));
+        let fg = self.options.scheme().foreground();
+        let dot = cx.theme().success;
+        let muted = cx.theme().muted_foreground;
+
+        let action =
+            |id: &'static str, tip: &'static str, glyph: &'static [u8], kind: PaneHeaderAction| {
+                let handler = self.on_pane_action.clone();
+                Button::new(id)
+                    .ghost()
+                    .small()
+                    .icon(Icon::default().data(glyph).size(px(14.)).text_color(muted))
+                    .tooltip(tip)
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        if let Some(handler) = handler.as_ref() {
+                            handler(kind, cx.entity(), window, cx);
+                        }
+                    }))
+            };
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .h(px(28.))
+            .px_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                Icon::default()
+                    .data(glyph::TERMINAL_PROMPT)
+                    .size(px(14.))
+                    .text_color(Hsla::from(fg)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(12.))
+                    .text_color(Hsla::from(fg))
+                    .child(title),
+            )
+            .child(div().text_size(px(12.)).text_color(muted).child("~"))
+            .when(focused, |el| {
+                el.child(div().size(px(6.)).rounded_full().bg(dot))
+            })
+            .child(action(
+                "pane-split",
+                "Split terminal",
+                glyph::SPLIT,
+                PaneHeaderAction::Split,
+            ))
+            .child(action(
+                "pane-max",
+                "Maximize pane",
+                glyph::EXPAND,
+                PaneHeaderAction::Maximize,
+            ))
+            .child(action(
+                "pane-close",
+                "Close pane",
+                glyph::CLOSE_X,
+                PaneHeaderAction::Close,
+            ))
     }
 
     /// Applies a new grid size to both the local parser and the remote PTY.
@@ -1237,6 +1552,19 @@ pub struct PaneStatus {
     pub title: Option<String>,
 }
 
+/// A hover-cluster action on a terminal pane header. The shell wires these
+/// through [`TerminalPane::set_on_pane_action`]; the pane only reports which
+/// button was pressed and on which pane, like the palette reports commands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneHeaderAction {
+    Split,
+    Maximize,
+    Close,
+}
+
+/// The shell's split/maximize/close handler for a pane header button.
+type PaneActionHandler = Rc<dyn Fn(PaneHeaderAction, Entity<TerminalPane>, &mut Window, &mut App)>;
+
 /// Maps a GPUI key code to a [`Key`].
 ///
 /// Only key codes the terminal crate understands are returned. IME output
@@ -1508,6 +1836,21 @@ impl Render for TerminalPane {
         });
         let ended = self.ended.clone();
         let connecting = matches!(self.status, SessionState::Connecting);
+        // The focused tile carries the green border; the rest keep the theme
+        // hairline. `FocusHandle::is_focused` needs only the window.
+        let focused = self.focus_handle.is_focused(window);
+        let frame = if focused {
+            cx.theme().success
+        } else {
+            cx.theme().border
+        };
+        // Built before the grid chain so it becomes the first flex child (on
+        // top in a `flex_col`). `None` in the single-pane session view.
+        let header: Option<AnyElement> = if self.show_header {
+            Some(self.render_pane_header(focused, cx).into_any_element())
+        } else {
+            None
+        };
 
         let mut root = div()
             .relative()
@@ -1516,6 +1859,13 @@ impl Render for TerminalPane {
             .flex_1()
             .h_full()
             .overflow_hidden()
+            // A lone pane (no header: the single-pane session view) is
+            // borderless full-bleed per the reference; tiled panes keep the
+            // rounded-10 card, and the shell's 8px gutter is what separates
+            // adjacent tiles.
+            .when(self.show_header, |el| {
+                el.rounded(px(10.)).border_1().border_color(frame)
+            })
             // The pane's own fill and default text come from the scheme, not
             // the app theme, so a dark scheme stays dark in light app mode.
             .bg(scheme_bg)
@@ -1542,37 +1892,50 @@ impl Render for TerminalPane {
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
                 this.scroll_wheel(event, cx);
             }))
-            // A canvas child reports the space the pane was actually given, so
+            .when_some(header, |el, header| el.child(header))
+            // A canvas child reports the space the grid was actually given, so
             // the grid reflows with the window instead of keeping its last size.
             // It draws nothing; the rows below do the painting, and the resize is
-            // a no-op unless the column or row count really changed.
-            .child(div().absolute().size_full().child(gpui_kit::canvas(
-                move |bounds: Bounds<gpui_kit::Pixels>, _, _| bounds.size,
-                {
-                    // A canvas paints with `&mut App`, so the pane is reached
-                    // through a weak handle rather than `Context::listener`.
-                    let view = cx.entity().downgrade();
-                    move |bounds: Bounds<gpui_kit::Pixels>,
-                          size: gpui_kit::Size<gpui_kit::Pixels>,
-                          _,
-                          cx| {
-                        view.update(cx, |pane, cx| {
-                            // The grid shares the pane's top-left, so this is
-                            // the origin a mouse position is measured from.
-                            pane.grid_origin = bounds.origin;
-                            let cols = (f32::from(size.width) / cell_w).floor().max(1.0) as u16;
-                            let rows = (f32::from(size.height) / cell_h).floor().max(1.0) as u16;
-                            // Re-render only when the grid actually changed shape;
-                            // otherwise every frame would schedule the next one.
-                            if pane.resize(cols, rows) {
-                                cx.notify();
+            // a no-op unless the column or row count really changed. It lives in
+            // the grid wrapper (below the optional 28pt header) so the measured
+            // origin and size exclude the header.
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .w_full()
+                    .overflow_hidden()
+                    .child(div().absolute().size_full().child(gpui_kit::canvas(
+                        move |bounds: Bounds<gpui_kit::Pixels>, _, _| bounds.size,
+                        {
+                            // A canvas paints with `&mut App`, so the pane is reached
+                            // through a weak handle rather than `Context::listener`.
+                            let view = cx.entity().downgrade();
+                            move |bounds: Bounds<gpui_kit::Pixels>,
+                                  size: gpui_kit::Size<gpui_kit::Pixels>,
+                                  _,
+                                  cx| {
+                                view.update(cx, |pane, cx| {
+                                    // The grid shares the wrapper's top-left, so this is
+                                    // the origin a mouse position is measured from.
+                                    pane.grid_origin = bounds.origin;
+                                    let cols =
+                                        (f32::from(size.width) / cell_w).floor().max(1.0) as u16;
+                                    let rows =
+                                        (f32::from(size.height) / cell_h).floor().max(1.0) as u16;
+                                    // Re-render only when the grid actually changed shape;
+                                    // otherwise every frame would schedule the next one.
+                                    if pane.resize(cols, rows) {
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
                             }
-                        })
-                        .ok();
-                    }
-                },
-            )))
-            .child(grid);
+                        },
+                    )))
+                    .child(grid),
+            );
 
         if let Some(label) = search_label {
             root = root.child(
@@ -1700,9 +2063,10 @@ mod tests {
     }
 
     #[test]
-    fn basic_ansi_indices_use_the_standard_palette() {
-        assert_eq!(bytes_of(Color::Idx(1)), [205, 0, 0]);
-        assert_eq!(bytes_of(Color::Idx(15)), [255, 255, 255]);
+    fn default_scheme_indices_come_from_its_derived_table() {
+        // Termius Dark's hue-rotated red and its lightened foreground white.
+        assert_eq!(bytes_of(Color::Idx(1)), [172, 65, 57]);
+        assert_eq!(bytes_of(Color::Idx(15)), [129, 197, 147]);
     }
 
     #[test]
@@ -1753,7 +2117,7 @@ mod tests {
     /// Indices 0-15 come from the active scheme; the cube from 16 up does not.
     #[test]
     fn scheme_indices_resolve_through_the_scheme_and_the_cube_does_not() {
-        let scheme = scheme("Dracula");
+        let scheme = scheme("Kanagawa Dragon");
         for index in 0..16u8 {
             assert_eq!(
                 color_to_rgb(Color::Idx(index), &scheme),
@@ -1793,13 +2157,26 @@ mod tests {
     /// default options carry the default scheme.
     #[test]
     fn scheme_round_trips_through_options() {
-        let chosen = scheme("Nord");
+        let chosen = scheme("Kanagawa Wave");
         let options = TerminalOptions::new(13.0, 100, true).with_scheme(chosen);
         assert_eq!(options.scheme(), chosen);
         assert_eq!(
             TerminalOptions::default().scheme(),
             TerminalScheme::default()
         );
+    }
+
+    /// The theme picker offers exactly these names, so every one must resolve:
+    /// an unresolvable name silently falls back to the default scheme.
+    #[test]
+    fn every_scheme_name_resolves_and_unknown_falls_back() {
+        for (name, _) in &SCHEMES {
+            assert!(
+                TerminalScheme::by_name(name).is_some(),
+                "{name} does not resolve"
+            );
+        }
+        assert!(TerminalScheme::by_name("Monokai").is_none());
     }
 
     #[test]

@@ -13,13 +13,15 @@
 //! - Below the banner, a table header row: `Date` (with sort arrow) | `User` |
 //!   `Host` | `Saved` (bookmark column). The header is 36–44px with a hairline
 //!   separator.
-//! - Rows are ~44px, white, hairline `#d5dde0` separators, hover fill. Each row:
+//! - Rows are 56px minimum, white, hairline `#d5dde0` separators, hover fill. Each row:
 //!   Date column `Aug 12, 2026` + `15:13 - 19:41` (secondary, monospaced); User
 //!   column orange `MH` avatar + `muhammad.hassan@teamredge.c…` + machine
 //!   `Muhammads-MacBook-Air.local`; Host column orange (or dark blue) host icon +
 //!   name (`Talluq`, `Ali Jawwad`, `Ubunutu Hadeeth`, `horly cloudzy`,
 //!   `Local Terminal`, …) + `ssh, root/ubuntu/xrdpuser`; Saved column bookmark
 //!   glyph. The screenshot lists ~10 session intervals from `Jul 27` to `Aug 12`.
+//!   Rows carry no leading status dot (the reference has none); severity survives
+//!   as the coloured status text, so nothing relies on colour alone.
 //! - Shared page furniture (from 3.13.29 Port Forwarding empty state and 3.13.24
 //!   Keychain) confirmed the toolbar layout (primary action left, search/grid/
 //!   calendar icons right), card/table styling (white cards, 10px radius, light
@@ -39,15 +41,16 @@
 //! - Content bg is `cx.theme().sidebar` (`#edf1f2` in light); cards/rows are
 //!   `cx.theme().background` (`#ffffff`). Table sits in a white `10px` rounded
 //!   card so the light bg frames it, as in the reference.
-//! - Toolbar row at top: primary action `Clear logs` on the left (disabled when
-//!   empty); on the right the same three small icon controls the other panes
-//!   carry: search (functional — filters the list), grid/list and calendar
-//!   (dead controls, rendered **disabled** and noted below).
-//! - Rows are table-like: `min_h 44px`, hairline separators `cx.theme().border`
+//! - Toolbar row at top once the first entry exists (the reference draws no
+//!   toolbar on empty Logs; only the banner shows): primary action `Clear logs`
+//!   on the left (disabled when empty); on the right the same three small icon
+//!   controls the other panes carry: search (functional — filters the list),
+//!   grid/list and calendar (dead controls, rendered **disabled** and noted below).
+//! - Rows are table-like: `min_h 56px`, hairline separators `cx.theme().border`
 //!   (`#d5dde0` light), hover fill `cx.theme().muted`, monospaced timestamp in
 //!   `Menlo 12px` coloured `muted_foreground` (`#798c94`), then the message/host
-//!   detail. Severity is a 6px coloured dot (success/warning/danger/
-//!   muted_foreground) rather than a coloured row.
+//!   detail. Severity is the coloured status text, not a coloured row and not a
+//!   leading dot (the reference rows carry no dot).
 //! - Empty state mirrors the port-forwarding empty state: centred 72px muted tile
 //!   with a glyph, heading `No activity yet` and one line of explanation.
 //!
@@ -58,17 +61,18 @@
 //!   from the reference; no semantic token covers them.
 //! - All other colours come from `cx.theme()` tokens (`background`, `sidebar`,
 //!   `border`, `muted`, `muted_foreground`, `foreground`, `success`, `warning`,
-//!   `danger`). Body `14px`, secondary `12px–13px`; control radius `6px`
-//!   (`rounded_md`), card radius `10px` (`rounded(px(10.))`) from the theme.
+//!   `danger`, `info`, `info_foreground`). Body `14px`, secondary `12px–13px`;
+//!   control radius `6px` (`rounded_md`), card radius `10px` (`rounded(px(10.))`)
+//!   from the theme.
 
+use crate::glyph;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
-    WindowExt as _,
 };
+use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
     div, px, rgb, AppContext as _, Context, Div, Entity, FocusHandle, Focusable as _, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
@@ -79,6 +83,32 @@ use gpui_kit::{
 /// the memory cliff; 500 entries is well within the 500–1000 budget and keeps the
 /// pane O(1) in the idle case.
 const MAX_LOG_ENTRIES: usize = 500;
+
+/// Below this window width the Saved column hides.
+const HIDE_SAVED_W: f32 = 650.0;
+/// Below this window width the User column hides too.
+const HIDE_USER_W: f32 = 500.0;
+
+/// Whether the Saved column fits at this window width.
+fn show_saved_col(win_w: f32) -> bool {
+    win_w >= HIDE_SAVED_W
+}
+
+/// Whether the User column fits at this window width.
+fn show_user_col(win_w: f32) -> bool {
+    win_w >= HIDE_USER_W
+}
+
+/// Card columns for the available width: 1-up narrow, 2-up medium, 3-up wide.
+fn card_cols(win_w: f32) -> usize {
+    if win_w < 520.0 {
+        1
+    } else if win_w < 860.0 {
+        2
+    } else {
+        3
+    }
+}
 
 /// Severity / outcome of an activity entry. Rendered as a 6px dot, not a coloured row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +211,7 @@ pub struct LogsPane {
     focus_handle: FocusHandle,
     view_grid: bool,
     sort_descending: bool,
+    search_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -204,6 +235,7 @@ impl LogsPane {
             focus_handle,
             view_grid: false,
             sort_descending: true,
+            search_open: false,
             _subscriptions: subscriptions,
         }
     }
@@ -292,103 +324,11 @@ impl LogsPane {
             .collect()
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
-        let border = cx.theme().border;
-        let has_entries = !self.entries.is_empty();
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .h(px(44.))
-            .px_3()
-            .flex_shrink_0()
-            .bg(cx.theme().background)
-            .border_b_1()
-            .border_color(border)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("logs-clear")
-                            .label("Clear logs")
-                            .icon(IconName::Close)
-                            .disabled(!has_entries)
-                            .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{} entries", self.entries.len())),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .flex_shrink_0()
-                    .child(
-                        div()
-                            .w(px(200.))
-                            .child(Input::new(&self.filter_input).small()),
-                    )
-                    .child(
-                        Button::new("logs-search")
-                            .ghost()
-                            .icon(IconName::Search)
-                            .tooltip("Search logs")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let handle = this.filter_input.read(cx).focus_handle(cx);
-                                handle.focus(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("logs-grid")
-                            .ghost()
-                            .icon(IconName::LayoutDashboard)
-                            .selected(self.view_grid)
-                            .tooltip(if self.view_grid {
-                                "Switch to table view"
-                            } else {
-                                "Switch to card grid view"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.view_grid = !this.view_grid;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("logs-calendar")
-                            .ghost()
-                            .icon(IconName::Calendar)
-                            .tooltip(if self.sort_descending {
-                                "Sorting: Newest first ▾"
-                            } else {
-                                "Sorting: Oldest first ▴"
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.sort_descending = !this.sort_descending;
-                                let msg = if this.sort_descending {
-                                    "Sorting logs: Newest first ▾"
-                                } else {
-                                    "Sorting logs: Oldest first ▴"
-                                };
-                                window.push_notification(Notification::info(msg), cx);
-                                cx.notify();
-                            })),
-                    ),
-            )
-    }
-
-    fn render_table_header(&self, cx: &mut Context<Self>) -> Div {
+    fn render_table_header(&self, win_w: f32, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
+        let show_saved = show_saved_col(win_w);
+        let show_user = show_user_col(win_w);
         div()
             .flex()
             .flex_row()
@@ -411,28 +351,36 @@ impl LogsPane {
                     .child("Date")
                     .child(Icon::new(IconName::ArrowUp).small().text_color(muted)),
             )
-            .child(div().flex_1().child("User"))
+            .when(show_user, |el| el.child(div().flex_1().child("User")))
             .child(div().flex_1().child("Host"))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .w(px(48.))
-                    .justify_end()
-                    .child("Saved")
-                    .child(Icon::new(IconName::File).small().text_color(muted)),
-            )
+            .when(show_saved, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .w(px(48.))
+                        .justify_end()
+                        .child("Saved")
+                        .child(
+                            Icon::default()
+                                .data(glyph::BOOKMARK)
+                                .small()
+                                .text_color(muted),
+                        ),
+                )
+            })
     }
 
-    fn render_row(&self, entry: &LogEntry, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_row(&self, entry: &LogEntry, win_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
         let hover = cx.theme().muted;
+        let show_saved = show_saved_col(win_w);
+        let show_user = show_user_col(win_w);
         let fg = cx.theme().foreground;
         let id = entry.id;
-        let marker_color = entry.level.color(&**cx);
         // Host icon tint: the two blue rows in the reference (horly cloudzy,
         // Local Terminal) vs the orange majority.
         let host_lower = entry.host.to_lowercase();
@@ -450,13 +398,12 @@ impl LogsPane {
             .flex_row()
             .items_center()
             .gap_3()
-            .min_h(px(44.))
+            .min_h(px(56.))
             .px_3()
             .py_2()
             .border_b_1()
             .border_color(border)
             .hover(move |style| style.bg(hover))
-            .child(status_marker(marker_color))
             .child(
                 div()
                     .flex()
@@ -476,50 +423,52 @@ impl LogsPane {
                             .child(SharedString::from(entry.time_range.clone())),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .size(px(28.))
-                            .rounded(px(8.))
-                            .bg(user_bg)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(11.))
-                            .font_family("Menlo")
-                            .text_color(rgb(0xffffff))
-                            .child(SharedString::from(initials)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .truncate()
-                                    .child(SharedString::from(entry.user.clone())),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(muted)
-                                    .truncate()
-                                    .child(SharedString::from(entry.user_detail.clone())),
-                            ),
-                    ),
-            )
+            .when(show_user, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .size(px(28.))
+                                .rounded(px(8.))
+                                .bg(user_bg)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(11.))
+                                .font_family("Menlo")
+                                .text_color(rgb(0xffffff))
+                                .child(SharedString::from(initials)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .text_size(px(14.))
+                                        .truncate()
+                                        .child(SharedString::from(entry.user.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(muted)
+                                        .truncate()
+                                        .child(SharedString::from(entry.user_detail.clone())),
+                                ),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -561,21 +510,28 @@ impl LogsPane {
                             ),
                     ),
             )
-            .child(
-                div().w(px(48.)).flex().justify_end().child(
-                    div()
-                        .size(px(28.))
-                        .rounded(px(6.))
-                        .bg(cx.theme().muted)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(Icon::new(IconName::File).small().text_color(muted)),
-                ),
-            )
+            .when(show_saved, |el| {
+                el.child(
+                    div().w(px(48.)).flex().justify_end().child(
+                        div()
+                            .size(px(28.))
+                            .rounded(px(6.))
+                            .bg(cx.theme().muted)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::default()
+                                    .data(glyph::BOOKMARK)
+                                    .small()
+                                    .text_color(muted),
+                            ),
+                    ),
+                )
+            })
     }
 
-    fn render_body(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_body(&self, win_w: f32, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         use gpui_kit::IntoElement as _;
 
         if self.entries.is_empty() {
@@ -616,27 +572,47 @@ impl LogsPane {
         }
 
         if self.view_grid {
-            let cards: Vec<gpui_kit::AnyElement> = entries
+            let mut cards: Vec<gpui_kit::AnyElement> = entries
                 .iter()
                 .map(|entry| self.render_card(entry, cx).into_any_element())
                 .collect();
+            // Chunked rows so narrow windows drop 3-up to 2-up to 1-up.
+            let cols = card_cols(win_w).max(1);
+            let mut grid_rows: Vec<gpui_kit::AnyElement> = Vec::new();
+            while !cards.is_empty() {
+                let n = cols.min(cards.len());
+                let row_cards: Vec<gpui_kit::AnyElement> = cards.drain(..n).collect();
+                let missing = cols - row_cards.len();
+                let mut row_cards = row_cards;
+                for _ in 0..missing {
+                    row_cards.push(div().flex_1().into_any_element());
+                }
+                grid_rows.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_3()
+                        .w_full()
+                        .children(row_cards)
+                        .into_any_element(),
+                );
+            }
             div()
                 .id("logs-grid")
                 .flex()
-                .flex_row()
-                .flex_wrap()
+                .flex_col()
                 .gap_3()
                 .p_3()
                 .flex_1()
                 .min_h(px(0.))
                 .overflow_y_scrollbar()
-                .children(cards)
+                .children(grid_rows)
                 .into_any_element()
         } else {
-            let header = self.render_table_header(cx);
+            let header = self.render_table_header(win_w, cx);
             let rows: Vec<gpui_kit::AnyElement> = entries
                 .iter()
-                .map(|entry| self.render_row(entry, cx).into_any_element())
+                .map(|entry| self.render_row(entry, win_w, cx).into_any_element())
                 .collect();
 
             div()
@@ -692,9 +668,10 @@ impl LogsPane {
             .flex_col()
             .gap_2()
             .p_3()
-            .w(px(280.))
+            .flex_1()
+            .min_w(px(220.))
             .rounded(px(10.))
-            .bg(rgb(0xffffff))
+            .bg(cx.theme().popover)
             .border_1()
             .border_color(border)
             .shadow_xs()
@@ -801,8 +778,10 @@ impl LogsPane {
         div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .justify_between()
+            .gap_2()
             .px_4()
             .py_2p5()
             .mx_3()
@@ -813,24 +792,149 @@ impl LogsPane {
             .border_color(border)
             .child(
                 div()
-                    .text_size(px(13.))
+                    .flex_1()
+                    .min_w(px(120.))
+                    .text_size(px(14.))
                     .text_color(fg)
                     .child("Logs are not available on your current plan."),
             )
+            // Neutral grey chip, not a button: sshdeck is 100% free and local,
+            // so there is no plan to upgrade to — the chip only mirrors the
+            // reference, which draws it as a flat grey pill with dark text.
             .child(
-                Button::new("logs-upgrade")
-                    .small()
+                div()
+                    .px_2p5()
+                    .py_1()
+                    .rounded_full()
+                    .bg(cx.theme().muted)
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Upgrade ↑"),
+            )
+    }
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        let border = cx.theme().border;
+        let empty = self.entries.is_empty();
+
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .min_h(px(56.))
+            .px_3()
+            .py_1()
+            .flex_shrink_0()
+            .bg(cx.theme().popover)
+            .border_b_1()
+            .border_color(border)
+            .child(
+                Button::new("logs-clear")
                     .ghost()
-                    .label("Upgrade ↑")
-                    .tooltip("sshdeck is 100% free and local"),
+                    .small()
+                    .icon(IconName::Close)
+                    .label("Clear logs")
+                    .tooltip("Clear the activity log")
+                    .disabled(empty)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.clear(cx);
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .child(
+                        Button::new("logs-search")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Search)
+                            .tooltip("Search logs")
+                            .selected(self.search_open)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.search_open = !this.search_open;
+                                if this.search_open {
+                                    let handle = this.filter_input.read(cx).focus_handle(cx);
+                                    handle.focus(window, cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("logs-view")
+                            .ghost()
+                            .small()
+                            .icon(IconName::LayoutDashboard)
+                            .tooltip(if self.view_grid {
+                                "Switch to list view"
+                            } else {
+                                "Switch to grid view"
+                            })
+                            .selected(self.view_grid)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view_grid = !this.view_grid;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("logs-sort")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Calendar)
+                            .tooltip(if self.sort_descending {
+                                "Sorting: Newest first"
+                            } else {
+                                "Sorting: Oldest first"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sort_descending = !this.sort_descending;
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
+    fn render_search_row(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .child(
+                div().flex_1().min_w(px(120.)).child(
+                    Input::new(&self.filter_input)
+                        .small()
+                        .cleanable(true)
+                        .prefix(
+                            Icon::new(IconName::Search)
+                                .small()
+                                .text_color(cx.theme().muted_foreground),
+                        ),
+                ),
             )
     }
 }
 
 impl Render for LogsPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let background = cx.theme().sidebar;
         let foreground = cx.theme().foreground;
+        let win_w = f32::from(window.bounds().size.width);
+        // The reference draws no toolbar on empty Logs — only the banner — so
+        // the toolbar band (and its search row toggle) stays hidden until the
+        // first entry exists. The banner below always renders.
+        let has_entries = !self.entries.is_empty();
         div()
             .flex()
             .flex_col()
@@ -840,8 +944,12 @@ impl Render for LogsPane {
             .text_color(foreground)
             .text_size(px(14.))
             .track_focus(&self.focus_handle)
+            .when(has_entries, |el| el.child(self.render_toolbar(cx)))
+            .when(self.search_open && has_entries, |el| {
+                el.child(self.render_search_row(cx))
+            })
             .child(self.render_upgrade_banner(cx))
-            .child(self.render_body(cx))
+            .child(self.render_body(win_w, cx))
     }
 }
 
@@ -926,6 +1034,17 @@ mod tests {
             "ssh, root",
             level,
         )
+    }
+
+    #[test]
+    fn responsive_breakpoints_hide_columns_then_cards() {
+        assert!(show_saved_col(650.0));
+        assert!(!show_saved_col(649.9));
+        assert!(show_user_col(500.0));
+        assert!(!show_user_col(499.9));
+        assert_eq!(card_cols(400.0), 1);
+        assert_eq!(card_cols(520.0), 2);
+        assert_eq!(card_cols(860.0), 3);
     }
 
     #[test]

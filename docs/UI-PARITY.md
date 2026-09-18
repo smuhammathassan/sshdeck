@@ -95,8 +95,8 @@ Shipped as data in `crates/sshdeck-app/themes/sshdeck.json` (a gpui-kit
 | `tab.active.background` | grey-3 / grey-7 | `#282b3d` | `#f7f9fa` |
 | `tab.foreground` | grey-7 / grey-1 | `#8d91a5` | `#798c94` |
 | `list.active.border` | blue | `#2091f6` | `#2091f6` |
-| `radius` / `radius.lg` | small / medium | 5 / 10 | 5 / 10 |
-| `font.size` | UI base | 13 | 13 |
+| `radius` / `radius.lg` | small-increased / medium | 6 / 10 | 6 / 10 |
+| `font.size` | UI base | 14 | 14 |
 | `mono_font.size` | terminal base | 13 | 13 |
 
 `shadow: false` — Termius surfaces are flat; borders carry the separation.
