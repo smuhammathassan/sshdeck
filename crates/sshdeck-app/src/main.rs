@@ -38,14 +38,26 @@ use settings::SettingsView;
 use sftp_pane::SftpPane;
 use snippets_pane::SnippetsPane;
 use sshdeck_core::session::{Session as SshSession, SessionConfig, SessionEvent};
-use sshdeck_core::{Host, HostId, HostStore, SessionState};
+use sshdeck_core::{AuthMethod, Host, HostId, HostStore, SessionState};
 use sshdeck_sftp::SftpClient;
 use sshdeck_vault::Vault;
 use terminal::{
     PaneHeaderAction, PaneStatus, TerminalOptions, TerminalPane, TerminalScheme, SCHEMES,
 };
 
-actions!(sshdeck, [OpenPalette, FindInTerminal]);
+actions!(
+    sshdeck,
+    [
+        OpenPalette,
+        FindInTerminal,
+        NewTabAction,
+        CloseTabAction,
+        OpenSettingsAction,
+        ZoomInAction,
+        ZoomOutAction,
+        ResetZoomAction
+    ]
+);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -71,6 +83,16 @@ fn main() {
                 KeyBinding::new("ctrl-k", OpenPalette, None),
                 KeyBinding::new("cmd-f", FindInTerminal, None),
                 KeyBinding::new("ctrl-f", FindInTerminal, None),
+                KeyBinding::new("cmd-t", NewTabAction, None),
+                KeyBinding::new("ctrl-t", NewTabAction, None),
+                KeyBinding::new("cmd-w", CloseTabAction, None),
+                KeyBinding::new("ctrl-w", CloseTabAction, None),
+                KeyBinding::new("cmd-,", OpenSettingsAction, None),
+                KeyBinding::new("ctrl-,", OpenSettingsAction, None),
+                KeyBinding::new("cmd-=", ZoomInAction, None),
+                KeyBinding::new("cmd-+", ZoomInAction, None),
+                KeyBinding::new("cmd--", ZoomOutAction, None),
+                KeyBinding::new("cmd-0", ResetZoomAction, None),
             ]);
             cx.spawn(async move |cx| {
                 cx.open_window(window_options(), |window, cx| {
@@ -237,6 +259,122 @@ fn autoconnect_targets(value: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|target| !target.is_empty())
         .collect()
+}
+
+/// Parses a quick-connect string (`user@host:port`, `ssh ...`, `ip:port`, `ip`, or domain)
+/// into an ephemeral [`Host`] ready for connection.
+///
+/// Returns `None` if the input is a plain search term rather than a connection target.
+pub fn parse_quick_connect(raw: &str) -> Option<Host> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut username = String::new();
+    let mut address = String::new();
+    let mut port = 22u16;
+
+    if let Some(rest) = raw.strip_prefix("ssh ") {
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        let mut idx = 0;
+        let mut target = None;
+        while idx < parts.len() {
+            let part = parts[idx];
+            if part == "-p" && idx + 1 < parts.len() {
+                if let Ok(p) = parts[idx + 1].parse::<u16>() {
+                    port = p;
+                }
+                idx += 2;
+            } else if part.starts_with("-p") && part.len() > 2 {
+                if let Ok(p) = part[2..].parse::<u16>() {
+                    port = p;
+                }
+                idx += 1;
+            } else if part == "-l" && idx + 1 < parts.len() {
+                username = parts[idx + 1].to_string();
+                idx += 2;
+            } else if !part.starts_with('-') && target.is_none() {
+                target = Some(part);
+                idx += 1;
+            } else {
+                idx += 1;
+            }
+        }
+        let target = target?;
+        if let Some((user, host_part)) = target.split_once('@') {
+            if username.is_empty() {
+                username = user.to_string();
+            }
+            if let Some((host, p)) = host_part.rsplit_once(':') {
+                if let Ok(parsed_port) = p.parse::<u16>() {
+                    address = host.to_string();
+                    port = parsed_port;
+                } else {
+                    address = host_part.to_string();
+                }
+            } else {
+                address = host_part.to_string();
+            }
+        } else if let Some((host, p)) = target.rsplit_once(':') {
+            if let Ok(parsed_port) = p.parse::<u16>() {
+                address = host.to_string();
+                port = parsed_port;
+            } else {
+                address = target.to_string();
+            }
+        } else {
+            address = target.to_string();
+        }
+    } else if raw.contains('@') {
+        let (user, host_part) = raw.split_once('@')?;
+        username = user.to_string();
+        if let Some((host, p)) = host_part.rsplit_once(':') {
+            if let Ok(parsed_port) = p.parse::<u16>() {
+                address = host.to_string();
+                port = parsed_port;
+            } else {
+                address = host_part.to_string();
+            }
+        } else {
+            address = host_part.to_string();
+        }
+    } else if let Some((host, p)) = raw.rsplit_once(':') {
+        if let Ok(parsed_port) = p.parse::<u16>() {
+            address = host.to_string();
+            port = parsed_port;
+        } else {
+            return None;
+        }
+    } else if raw.parse::<std::net::IpAddr>().is_ok() {
+        address = raw.to_string();
+    } else if raw.eq_ignore_ascii_case("localhost") {
+        address = "localhost".to_string();
+    } else if raw.contains('.') && !raw.contains(' ') && raw.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
+        address = raw.to_string();
+    } else {
+        return None;
+    }
+
+    if address.is_empty() {
+        return None;
+    }
+
+    let label = if !username.is_empty() && port != 22 {
+        format!("{username}@{address}:{port}")
+    } else if !username.is_empty() {
+        format!("{username}@{address}")
+    } else if port != 22 {
+        format!("{address}:{port}")
+    } else {
+        address.clone()
+    };
+
+    let mut host = Host::new(label, address);
+    host.username = username;
+    host.port = port;
+    host.auth = AuthMethod::Agent;
+    Some(host)
 }
 
 /// A surface `SSHDECK_START_PANE` can open at startup: a left-rail pane, or the
@@ -1380,6 +1518,8 @@ struct SshDeck {
     workspace_direction: Option<SplitDir>,
     /// When true the workspace shows only the focused tile.
     workspace_maximized: bool,
+    /// When true, input in any workspace pane or snippet execution broadcasts to all open panes.
+    broadcast_mode: bool,
     /// Dragged tab state `(from_pane_leaf_index, from_tab_index)` when moving/splitting.
     dragged_tab: Option<(usize, usize)>,
     /// Sidebar suggestion history (bounded by [`MAX_HISTORY_ENTRIES`]) and its
@@ -1535,9 +1675,16 @@ impl SshDeck {
         // Re-render the list as the query changes; the filter itself is applied
         // in `render`, so no filtered copy needs to be kept in state.
         let subscriptions = vec![
-            cx.subscribe_in(&filter, window, |_, _, event, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
+            cx.subscribe_in(&filter, window, |this, _, event, window, cx| {
+                match event {
+                    InputEvent::Change => cx.notify(),
+                    InputEvent::PressEnter { .. } => {
+                        let filter_val = this.filter.read(cx).value().trim().to_string();
+                        if let Some(host) = parse_quick_connect(&filter_val) {
+                            this.connect(host, window, cx);
+                        }
+                    }
+                    _ => {}
                 }
             }),
             cx.subscribe_in(&new_tab_query, window, |_, _, event, _, cx| {
@@ -1649,6 +1796,7 @@ impl SshDeck {
             workspace_focus: 0,
             workspace_direction: None,
             workspace_maximized: false,
+            broadcast_mode: false,
             dragged_tab: None,
             history: Vec::new(),
             history_form_open: false,
@@ -1715,6 +1863,64 @@ impl SshDeck {
                 session.pane.update(cx, |pane, cx| pane.open_search(cx));
             }
         }
+    }
+
+    fn handle_new_tab(&mut self, _: &NewTabAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = MainTab::NewTab;
+        self.new_tab_query.update(cx, |input, cx| {
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn handle_close_tab(
+        &mut self,
+        _: &CloseTabAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overlay.is_some() {
+            self.close_overlay(window, cx);
+            return;
+        }
+        if self.palette.is_some() {
+            self.palette = None;
+            cx.notify();
+            return;
+        }
+        if self.add_host_open {
+            self.close_add_host(cx);
+            return;
+        }
+        if let Some(active) = self.active {
+            if active < self.sessions.len() {
+                self.close_session(active, window, cx);
+            }
+        }
+    }
+
+    fn handle_open_settings(
+        &mut self,
+        _: &OpenSettingsAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(window, cx);
+    }
+
+    fn handle_zoom_in(&mut self, _: &ZoomInAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_terminal_font_size(self.terminal_font_size + 1.0, window, cx);
+        cx.notify();
+    }
+
+    fn handle_zoom_out(&mut self, _: &ZoomOutAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_terminal_font_size(self.terminal_font_size - 1.0, window, cx);
+        cx.notify();
+    }
+
+    fn handle_reset_zoom(&mut self, _: &ResetZoomAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_terminal_font_size(14.0, window, cx);
+        cx.notify();
     }
 
     /// Connects to one `SSHDECK_AUTOCONNECT` target by id or label, if it exists.
@@ -2187,11 +2393,31 @@ impl SshDeck {
         // The pane header reports split/max/close back through a weak handle,
         // the same shape as the palette's `set_on_select`.
         let weak = cx.entity().downgrade();
+        let pane_handle = pane.clone();
         pane.update(cx, |pane, _| {
             pane.set_header_title(host.label.clone());
             pane.set_on_pane_action(move |action, pane, window, cx| {
                 weak.update(cx, |this, cx| {
                     this.pane_action(action, pane, window, cx);
+                })
+                .ok();
+            });
+            let weak_bc = weak.clone();
+            let pane_entity = pane_handle.clone();
+            pane.set_on_broadcast(move |bytes, _pane, cx| {
+                weak_bc.update(cx, |this, cx| {
+                    if this.broadcast_mode {
+                        let leaves = workspace_leaves(&this.workspace);
+                        for &idx in &leaves {
+                            if let Some(s) = this.sessions.get(idx) {
+                                if s.pane != pane_entity {
+                                    s.pane.update(cx, |p, _| {
+                                        p.write(bytes);
+                                    });
+                                }
+                            }
+                        }
+                    }
                 })
                 .ok();
             });
@@ -2371,6 +2597,31 @@ impl SshDeck {
         pane
     }
 
+    /// Sends text into the active session terminal, or broadcasts to all open
+    /// workspace leaves if broadcast mode is active.
+    pub fn broadcast_send_text(&self, text: &str, cx: &mut Context<Self>) {
+        if self.broadcast_mode {
+            let leaves = workspace_leaves(&self.workspace);
+            if !leaves.is_empty() {
+                for &index in &leaves {
+                    if let Some(session) = self.sessions.get(index) {
+                        session.pane.update(cx, |p, _| {
+                            p.send_text(text);
+                        });
+                    }
+                }
+                return;
+            }
+        }
+        if let Some(active) = self.active {
+            if let Some(session) = self.sessions.get(active) {
+                session.pane.update(cx, |p, _| {
+                    p.send_text(text);
+                });
+            }
+        }
+    }
+
     fn ensure_snippets_pane(
         &mut self,
         window: &mut Window,
@@ -2385,21 +2636,23 @@ impl SshDeck {
             p.set_on_execute(move |text, window, cx| {
                 let text = text.to_string();
                 root.update(cx, |this, cx| {
-                    if let Some(active) = this.active {
-                        if let Some(session) = this.sessions.get(active) {
-                            session.pane.update(cx, |p, cx| {
-                                p.send_text(&text);
-                                p.focus(window, cx);
-                            });
-                            window.push_notification(
-                                Notification::success("Snippet sent to terminal"),
-                                cx,
-                            );
-                            return;
-                        }
+                    this.broadcast_send_text(&text, cx);
+                    if this.broadcast_mode {
+                        window.push_notification(
+                            Notification::success("Snippet broadcasted to workspace terminals"),
+                            cx,
+                        );
+                    } else if this.active.is_some() {
+                        window.push_notification(
+                            Notification::success("Snippet sent to terminal"),
+                            cx,
+                        );
+                    } else {
+                        window.push_notification(
+                            Notification::warning("No active terminal session"),
+                            cx,
+                        );
                     }
-                    window
-                        .push_notification(Notification::warning("No active terminal session"), cx);
                 })
                 .ok();
             });
@@ -3681,9 +3934,13 @@ impl SshDeck {
         let has_selection = self.selected.is_some();
         let selected_id = self.selected.clone();
 
+        let filter_val = self.filter.read(cx).value().trim().to_string();
+        let quick_connect_host = parse_quick_connect(&filter_val);
+
         // Top search row: the Connect pill lives inside the search field's
-        // right edge, grey and disabled-looking until a host is selected —
-        // never solid blue up here (the blue Connect belongs to Host Details).
+        // right edge. When a quick-connect string is typed, it illuminates
+        // as an active primary blue "Quick Connect" button. Otherwise it is
+        // grey and disabled-looking until a saved host is selected.
         let mut connect_pill = div()
             .id("vault-connect")
             .absolute()
@@ -3694,15 +3951,26 @@ impl SshDeck {
             .rounded(px(7.))
             .flex()
             .items_center()
-            .bg(rgb(0xdfe5e7))
-            .text_size(px(13.))
-            .text_color(rgb(0x9aa5ab))
-            .child("Connect");
-        if has_selection {
+            .text_size(px(13.));
+
+        if let Some(quick_host) = quick_connect_host {
+            connect_pill = connect_pill
+                .bg(rgb(0x2091f6))
+                .text_color(rgb(0xffffff))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x1976d2)))
+                .child("Quick Connect")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.connect(quick_host.clone(), window, cx);
+                }));
+        } else if has_selection {
             let connect_target = selected_id.clone();
             connect_pill = connect_pill
+                .bg(rgb(0xdfe5e7))
+                .text_color(rgb(0x9aa5ab))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(0xd5dde0)))
+                .child("Connect")
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if let Some(host) = connect_target
                         .clone()
@@ -3711,6 +3979,11 @@ impl SshDeck {
                         this.connect(host, window, cx);
                     }
                 }));
+        } else {
+            connect_pill = connect_pill
+                .bg(rgb(0xdfe5e7))
+                .text_color(rgb(0x9aa5ab))
+                .child("Connect");
         }
         let search_row = div().flex().flex_row().items_center().w_full().p_2().child(
             div()
@@ -5884,6 +6157,7 @@ impl SshDeck {
             .map(|(id, label, secondary)| {
                 let select_id = id.clone();
                 let row_pane = pane.clone();
+                let cmd = pane.read(cx).command_of(&id).unwrap_or_else(|| secondary.clone());
                 div()
                     .id(SharedString::from(format!(
                         "side-snippet-{}",
@@ -5943,6 +6217,17 @@ impl SshDeck {
                                     .font_family("Menlo")
                                     .child(SharedString::from(secondary)),
                             ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("run-side-snip-{}", id.as_str())))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Play)
+                            .tooltip("Run in Terminal")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.broadcast_send_text(&cmd, cx);
+                                window.push_notification(Notification::success("Snippet sent to terminal"), cx);
+                            }))
                     )
                     .into_any_element()
             })
@@ -6162,18 +6447,62 @@ impl SshDeck {
                         .child("No saved suggestions yet"),
                 )
             })
-            .children(self.history.iter().rev().map(|entry| {
+            .children(self.history.iter().rev().enumerate().map(|(idx, entry)| {
+                let cmd = entry.clone();
+                let copy_cmd = entry.clone();
                 div()
-                    .id(SharedString::from(format!("side-history-{entry}")))
+                    .id(SharedString::from(format!("side-history-{idx}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
                     .w_full()
                     .px_3()
                     .py_2()
-                    .min_h(px(44.))
+                    .min_h(px(40.))
                     .border_b_1()
                     .border_color(rgba(0x8d91a51a))
-                    .text_sm()
-                    .text_color(cx.theme().foreground)
-                    .child(SharedString::from(entry.clone()))
+                    .rounded(px(4.))
+                    .hover(|s| s.bg(cx.theme().muted))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .truncate()
+                            .font_family("Menlo")
+                            .text_color(cx.theme().foreground)
+                            .child(SharedString::from(entry.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Button::new(SharedString::from(format!("copy-hist-{idx}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Copy)
+                                    .tooltip("Copy command")
+                                    .on_click(cx.listener(move |_, _, window, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(copy_cmd.clone()));
+                                        window.push_notification(Notification::info("Copied to clipboard"), cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("run-hist-{idx}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Play)
+                                    .tooltip("Run in Terminal")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.broadcast_send_text(&cmd, cx);
+                                        window.push_notification(Notification::success("Command sent to terminal"), cx);
+                                    })),
+                            ),
+                    )
             }))
             .child(
                 div().p_3().child(
@@ -6491,6 +6820,22 @@ impl SshDeck {
                 )
             })
             .child(div().flex_1())
+            .child(
+                Button::new("ws-broadcast")
+                    .small()
+                    .when(self.broadcast_mode, |btn| {
+                        btn.primary()
+                    })
+                    .when(!self.broadcast_mode, |btn| {
+                        btn.ghost()
+                    })
+                    .label(if self.broadcast_mode { "Broadcast: ON" } else { "Broadcast" })
+                    .tooltip(if self.broadcast_mode { "Broadcast mode is active: typing goes to all panes" } else { "Toggle broadcast mode (send input to all open panes)" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.broadcast_mode = !this.broadcast_mode;
+                        cx.notify();
+                    })),
+            )
             .child(
                 Button::new("ws-direction")
                     .ghost()
@@ -6820,6 +7165,22 @@ impl SshDeck {
                     .items_center()
                     .gap_0p5()
                     .flex_shrink_0()
+                    .when(self.broadcast_mode, |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded(px(3.))
+                                .bg(rgba(0xf59e0b25))
+                                .text_xs()
+                                .text_color(rgb(0xf59e0b))
+                                .child("● Broadcast"),
+                        )
+                    })
                     .child(add_btn)
                     .child(split_h_btn)
                     .child(split_v_btn)
@@ -7393,6 +7754,12 @@ impl Render for SshDeck {
             .on_action(cx.listener(Self::on_palette_cancel))
             .on_action(cx.listener(Self::handle_open_palette))
             .on_action(cx.listener(Self::handle_find_in_terminal))
+            .on_action(cx.listener(Self::handle_new_tab))
+            .on_action(cx.listener(Self::handle_close_tab))
+            .on_action(cx.listener(Self::handle_open_settings))
+            .on_action(cx.listener(Self::handle_zoom_in))
+            .on_action(cx.listener(Self::handle_zoom_out))
+            .on_action(cx.listener(Self::handle_reset_zoom))
             .child(header)
             .child(
                 div()
@@ -7827,5 +8194,52 @@ mod tests {
         // Second run is a no-op: the stable id already resolves.
         assert_eq!(migrate_legacy_password_refs(&mut store, &mut vault), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_quick_connect() {
+        // User and host
+        let h1 = parse_quick_connect("root@192.168.1.50").unwrap();
+        assert_eq!(h1.username, "root");
+        assert_eq!(h1.address, "192.168.1.50");
+        assert_eq!(h1.port, 22);
+
+        // User, host and custom port
+        let h2 = parse_quick_connect("ubuntu@ec2.aws.com:2222").unwrap();
+        assert_eq!(h2.username, "ubuntu");
+        assert_eq!(h2.address, "ec2.aws.com");
+        assert_eq!(h2.port, 2222);
+
+        // ssh command syntax with -p
+        let h3 = parse_quick_connect("ssh -p 2200 admin@myserver.local").unwrap();
+        assert_eq!(h3.username, "admin");
+        assert_eq!(h3.address, "myserver.local");
+        assert_eq!(h3.port, 2200);
+
+        let h4 = parse_quick_connect("ssh debian@example.com -p 222").unwrap();
+        assert_eq!(h4.username, "debian");
+        assert_eq!(h4.address, "example.com");
+        assert_eq!(h4.port, 222);
+
+        // IP with port
+        let h5 = parse_quick_connect("10.0.0.1:8022").unwrap();
+        assert_eq!(h5.username, "");
+        assert_eq!(h5.address, "10.0.0.1");
+        assert_eq!(h5.port, 8022);
+
+        // Plain IP
+        let h6 = parse_quick_connect("192.168.1.1").unwrap();
+        assert_eq!(h6.address, "192.168.1.1");
+        assert_eq!(h6.port, 22);
+
+        // Domain
+        let h7 = parse_quick_connect("my-box.lan").unwrap();
+        assert_eq!(h7.address, "my-box.lan");
+        assert_eq!(h7.port, 22);
+
+        // Plain search query (should NOT parse as quick connect)
+        assert!(parse_quick_connect("production").is_none());
+        assert!(parse_quick_connect("database").is_none());
+        assert!(parse_quick_connect("").is_none());
     }
 }

@@ -778,6 +778,8 @@ pub struct TerminalPane {
     show_header: bool,
     /// Split/maximize/close handler the shell installs; `None` until then.
     on_pane_action: Option<PaneActionHandler>,
+    /// Broadcast handler called when keystrokes are sent to the shell; `None` when disabled.
+    on_broadcast: Option<InputBroadcastHandler>,
 }
 
 impl TerminalPane {
@@ -854,6 +856,7 @@ impl TerminalPane {
             header_title: None,
             show_header: false,
             on_pane_action: None,
+            on_broadcast: None,
         };
 
         if let Some(events) = events {
@@ -1004,6 +1007,11 @@ impl TerminalPane {
         self.options = self.options.with_scheme(scheme);
     }
 
+    /// Current terminal font size in pixels.
+    pub fn font_size(&self) -> f32 {
+        self.options.font_size()
+    }
+
     /// Applies a font size live, clamped into `MIN_FONT_SIZE..=MAX_FONT_SIZE`.
     /// The next frame re-measures the cell from it (see `render`), so the grid
     /// and `line_height` scale together. Only the scrollback cap still needs a
@@ -1029,6 +1037,14 @@ impl TerminalPane {
         handler: impl Fn(PaneHeaderAction, Entity<TerminalPane>, &mut Window, &mut App) + 'static,
     ) {
         self.on_pane_action = Some(Rc::new(handler));
+    }
+
+    /// Installs the broadcast handler called whenever raw key bytes are forwarded to this pane's session.
+    pub fn set_on_broadcast(
+        &mut self,
+        handler: impl Fn(&[u8], Entity<TerminalPane>, &mut App) + 'static,
+    ) {
+        self.on_broadcast = Some(Rc::new(handler));
     }
 
     /// Opens the in-pane find box over the visible grid.
@@ -1220,6 +1236,9 @@ impl TerminalPane {
         // Backpressure or a closed transport must not wedge the UI; the next
         // keystroke simply tries again.
         if session.write(&bytes).is_ok() {
+            if let Some(broadcast) = self.on_broadcast.clone() {
+                broadcast(&bytes, cx.entity(), cx);
+            }
             cx.notify();
         }
     }
@@ -1590,6 +1609,9 @@ pub enum PaneHeaderAction {
 
 /// The shell's split/maximize/close handler for a pane header button.
 type PaneActionHandler = Rc<dyn Fn(PaneHeaderAction, Entity<TerminalPane>, &mut Window, &mut App)>;
+
+/// Handler for broadcasting raw keystrokes to peer panes in workspace broadcast mode.
+type InputBroadcastHandler = Rc<dyn Fn(&[u8], Entity<TerminalPane>, &mut App)>;
 
 /// Maps a GPUI key code to a [`Key`].
 ///

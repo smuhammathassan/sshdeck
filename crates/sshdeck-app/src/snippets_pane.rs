@@ -907,6 +907,11 @@ impl SnippetsPane {
         self.select_id(id, window, cx);
     }
 
+    /// Returns the raw command template for a snippet by id.
+    pub fn command_of(&self, id: &SnippetId) -> Option<String> {
+        self.store.get(id).map(|s| s.template().raw().to_string())
+    }
+
     fn render_grid(&self, win_w: f32, cx: &mut Context<Self>) -> AnyElement {
         let query = self.search_input.read(cx).value().trim().to_lowercase();
         let snippets: Vec<Snippet> = self.filtered(&query);
