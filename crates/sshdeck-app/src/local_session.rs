@@ -54,6 +54,22 @@ impl LocalSession {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
 
+        // Ensure common command paths are present in macOS GUI environment
+        if cfg!(target_os = "macos") {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            let mut add_paths = Vec::new();
+            for dir in ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"] {
+                if !current_path.split(':').any(|p| p == dir) && std::path::Path::new(dir).exists()
+                {
+                    add_paths.push(dir);
+                }
+            }
+            if !add_paths.is_empty() {
+                let new_path = format!("{}:{}", add_paths.join(":"), current_path);
+                cmd.env("PATH", new_path);
+            }
+        }
+
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -186,4 +202,6 @@ fn supervise(
             }
         }
     }
+    kill_child(&mut *child);
+    let _ = child.wait();
 }

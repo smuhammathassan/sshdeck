@@ -67,6 +67,7 @@ pub enum CommandId {
     KnownHosts,
     Logs,
     ToggleSidebar,
+    OpenLocalTerminal,
 }
 
 impl CommandId {
@@ -85,6 +86,7 @@ impl CommandId {
             CommandId::KnownHosts => "known-hosts",
             CommandId::Logs => "logs",
             CommandId::ToggleSidebar => "toggle-sidebar",
+            CommandId::OpenLocalTerminal => "open-local-terminal",
         }
     }
 }
@@ -309,6 +311,13 @@ fn registry() -> Vec<Command> {
             Category::Appearance,
             "Toggle Left Sidebar",
             &["sidebar", "collapse", "expand", "rail"],
+        )
+        .kind(Kind::Host),
+        Command::new(
+            CommandId::OpenLocalTerminal,
+            Category::Navigation,
+            "Open Local Terminal",
+            &["terminal", "local", "shell", "bash", "zsh", "prompt"],
         )
         .kind(Kind::Host),
     ]

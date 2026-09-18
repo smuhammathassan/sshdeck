@@ -887,11 +887,6 @@ impl TerminalPane {
         pane
     }
 
-    /// Spawns a local terminal session running the system shell with default options.
-    pub fn new_local(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_local_with_options(TerminalOptions::default(), window, cx)
-    }
-
     /// Spawns a local terminal session running the system shell with the given options.
     pub fn new_local_with_options(
         options: TerminalOptions,
@@ -903,7 +898,7 @@ impl TerminalPane {
 
         let connected = crate::local_session::LocalSession::spawn(80, 24);
         let (status, ended) = match &connected {
-            Ok(_) => (SessionState::Connecting, None),
+            Ok(_) => (SessionState::Connected, None),
             Err(error) => (
                 SessionState::Failed {
                     message: error.clone(),
@@ -1008,7 +1003,11 @@ impl TerminalPane {
             }
             SessionEvent::Closed(code) => {
                 self.status = SessionState::Closed { code };
-                let target_name = if self.is_local() { "local shell" } else { "remote shell" };
+                let target_name = if self.is_local() {
+                    "local shell"
+                } else {
+                    "remote shell"
+                };
                 self.ended = Some(match code {
                     Some(code) => format!("{target_name} exited with status {code}"),
                     None => format!("{target_name} closed the session"),

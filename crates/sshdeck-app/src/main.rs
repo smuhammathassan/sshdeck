@@ -30,7 +30,8 @@ use gpui_kit::{
     actions, div, point, px, rgb, rgba, AnyElement, App, AppContext as _, ClipboardItem, Context,
     Entity, Focusable as _, Hsla, InteractiveElement as _, IntoElement, KeyBinding, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render, Rgba,
-    SharedString, Styled as _, Subscription, TitlebarOptions, Window, WindowControlArea, WindowOptions,
+    SharedString, Styled as _, Subscription, TitlebarOptions, Window, WindowControlArea,
+    WindowOptions,
 };
 use keys_pane::KeysPane;
 use logs_pane::LogsPane;
@@ -1754,8 +1755,10 @@ impl SshDeck {
                 }
                 _ => {}
             }),
-            cx.subscribe_in(&new_tab_query, window, |this, _, event, window, cx| {
-                match event {
+            cx.subscribe_in(
+                &new_tab_query,
+                window,
+                |this, _, event, window, cx| match event {
                     InputEvent::Change => cx.notify(),
                     InputEvent::PressEnter { .. } => {
                         let query = this.new_tab_query.read(cx).value().trim().to_string();
@@ -1771,8 +1774,8 @@ impl SshDeck {
                         }
                     }
                     _ => {}
-                }
-            }),
+                },
+            ),
             // Details editors commit each keystroke to the selected host, so the
             // card label follows the edit live. The store save is the same
             // write-every-mutation rule the rest of the view follows.
@@ -1903,7 +1906,8 @@ impl SshDeck {
                 }
                 if std::env::var("SSHDECK_START_TILED").is_ok() && this.sessions.len() >= 2 {
                     this.tile_sessions_side_by_side(1, window, cx);
-                } else if std::env::var("SSHDECK_DRAG_OVERLAY").is_ok() && this.sessions.len() >= 2 {
+                } else if std::env::var("SSHDECK_DRAG_OVERLAY").is_ok() && this.sessions.len() >= 2
+                {
                     this.dragged_session = Some(1);
                     cx.notify();
                 }
@@ -3344,6 +3348,9 @@ impl SshDeck {
             palette::CommandId::ToggleSidebar => {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
             }
+            palette::CommandId::OpenLocalTerminal => {
+                self.open_local_terminal(window, cx);
+            }
         }
         cx.notify();
     }
@@ -3411,21 +3418,37 @@ impl SshDeck {
         let header_bg = rgb(0x1a1d2d);
         let header_fg = rgb(0xffffff);
 
+        let update_btn = div()
+            .id("header-update-btn")
+            .flex()
+            .items_center()
+            .h(px(26.))
+            .px_2p5()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(rgba(0xffffff20))
+            .bg(rgb(0x25293d))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0x2d3148)).border_color(rgba(0xffffff30)))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(rgb(0xffffff))
+                    .child("Update"),
+            )
+            .tooltip("Check for updates")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.push_notification(Notification::info("SshDeck is up to date (v0.1.0)"), cx);
+            }));
+
         let actions = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
             .flex_shrink_0()
-            .child(
-                Button::new("command-palette-btn")
-                    .ghost()
-                    .icon(IconName::Search)
-                    .tooltip("Command Palette (⌘K)")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_palette(window, cx);
-                    })),
-            )
+            .child(update_btn)
             .child(
                 Button::new("notifications")
                     .ghost()
@@ -3445,11 +3468,7 @@ impl SshDeck {
                             .icon(
                                 Icon::new(IconName::PanelRight)
                                     .size(px(16.))
-                                    .text_color(if open {
-                                        rgb(0x10b981)
-                                    } else {
-                                        rgb(0x8d91a5)
-                                    }),
+                                    .text_color(if open { rgb(0x10b981) } else { rgb(0x8d91a5) }),
                             )
                             .tooltip(if open {
                                 "Hide sidebar (⌘B)"
@@ -3699,6 +3718,7 @@ impl SshDeck {
     /// open session tabs, New Tab (+ New Tab without close button), and the quick-add + button.
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = rgb(0x8d91a5);
+        let unselected_fg = rgb(0xd0d4e4);
         let selected_bg = rgb(0x25293d);
         let selected_border = rgba(0xffffff1a);
         let selected_fg = rgb(0xffffff);
@@ -3732,15 +3752,23 @@ impl SshDeck {
             .hover(|s| s.bg(rgb(0x2a2e44)).border_color(rgba(0xffffff2e)))
             .child(
                 Icon::default()
-                    .data(glyph::VAULT)
+                    .data(glyph::ID_BADGE)
                     .size(px(14.))
-                    .text_color(if is_vaults_active { selected_fg } else { rgb(0xd0d4e4) }),
+                    .text_color(if is_vaults_active {
+                        selected_fg
+                    } else {
+                        unselected_fg
+                    }),
             )
             .child(
                 div()
                     .text_size(px(12.))
                     .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .text_color(if is_vaults_active { selected_fg } else { rgb(0xd0d4e4) })
+                    .text_color(if is_vaults_active {
+                        selected_fg
+                    } else {
+                        unselected_fg
+                    })
                     .child("Vaults"),
             )
             .child(
@@ -3749,6 +3777,7 @@ impl SshDeck {
                     .size(px(13.))
                     .text_color(muted),
             )
+            .child(div().w(px(1.)).h(px(12.)).bg(rgba(0xffffff20)))
             .child(
                 Icon::new(IconName::ChevronDown)
                     .size(px(12.))
@@ -3771,7 +3800,11 @@ impl SshDeck {
             .rounded(px(6.))
             .cursor_pointer()
             .flex_shrink_0()
-            .text_color(if is_sftp_active { selected_fg } else { muted })
+            .text_color(if is_sftp_active {
+                selected_fg
+            } else {
+                unselected_fg
+            })
             .when(is_sftp_active, |el| {
                 el.bg(selected_bg).border_1().border_color(selected_border)
             })
@@ -3780,7 +3813,11 @@ impl SshDeck {
                 Icon::default()
                     .data(glyph::FOLDER)
                     .size(px(14.))
-                    .text_color(if is_sftp_active { selected_fg } else { muted }),
+                    .text_color(if is_sftp_active {
+                        selected_fg
+                    } else {
+                        unselected_fg
+                    }),
             )
             .child(
                 div()
@@ -3800,66 +3837,68 @@ impl SshDeck {
         } else {
             "Workspace".to_string()
         };
-        let ws_btn = div()
-            .id("tab-workspace")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1p5()
-            .h(px(28.))
-            .px_2p5()
-            .rounded(px(6.))
-            .cursor_pointer()
-            .flex_shrink_0()
-            .text_color(if is_ws_active { rgb(0x10b981) } else { muted })
-            .when(is_ws_active, |el| {
-                el.bg(selected_bg).border_1().border_color(selected_border)
-            })
-            .when(!is_ws_active, |el| el.hover(move |s| s.bg(hover_bg)))
-            .child(
-                Icon::default()
-                    .data(glyph::GRID)
-                    .size(px(13.))
-                    .text_color(if is_ws_active { rgb(0x10b981) } else { muted }),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .child(ws_title),
-            )
-            .when(is_ws_active, |el| {
-                el.child(
-                    div()
-                        .size(px(5.))
-                        .rounded_full()
-                        .bg(rgb(0x10b981)),
-                )
-            })
-            .when(is_ws_active, |el| {
-                el.child(
-                    Button::new("close-workspace-tab")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
-                        .tooltip("Close workspace")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.workspace = WorkspaceNode::Empty;
-                            let fallback = this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
-                            this.select_tab(fallback, window, cx);
-                        })),
-                )
-            })
-            .on_click(cx.listener(|this, _, window, cx| {
-                if workspace_panes_count(&this.workspace) <= 1 && this.sessions.len() >= 2 {
-                    let active = this.active.unwrap_or(0);
-                    let other = if active == 0 { 1 } else { 0 };
-                    this.tile_sessions_side_by_side(other, window, cx);
+        let ws_btn =
+            div()
+                .id("tab-workspace")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .h(px(28.))
+                .px_2p5()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .flex_shrink_0()
+                .text_color(if is_ws_active {
+                    rgb(0x10b981)
                 } else {
-                    this.select_tab(MainTab::Workspace, window, cx);
-                }
-            }));
+                    unselected_fg
+                })
+                .when(is_ws_active, |el| {
+                    el.bg(selected_bg).border_1().border_color(rgba(0x10b98160))
+                })
+                .when(!is_ws_active, |el| el.hover(move |s| s.bg(hover_bg)))
+                .child(Icon::default().data(glyph::GRID).size(px(13.)).text_color(
+                    if is_ws_active {
+                        rgb(0x10b981)
+                    } else {
+                        unselected_fg
+                    },
+                ))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .child(ws_title),
+                )
+                .when(is_ws_active, |el| {
+                    el.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)))
+                })
+                .when(is_ws_active, |el| {
+                    el.child(
+                        Button::new("close-workspace-tab")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Close workspace")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.workspace = WorkspaceNode::Empty;
+                                let fallback =
+                                    this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
+                                this.select_tab(fallback, window, cx);
+                            })),
+                    )
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if workspace_panes_count(&this.workspace) <= 1 && this.sessions.len() >= 2 {
+                        let active = this.active.unwrap_or(0);
+                        let other = if active == 0 { 1 } else { 0 };
+                        this.tile_sessions_side_by_side(other, window, cx);
+                    } else {
+                        this.select_tab(MainTab::Workspace, window, cx);
+                    }
+                }));
 
         let mut strip = div()
             .id("tab-strip")
@@ -3888,12 +3927,28 @@ impl SshDeck {
                     .unwrap_or_else(|| session.host.to_string())
             };
             let label = session.status.title.clone().unwrap_or_else(|| {
-                let same_host_count = self.sessions.iter().filter(|s| s.host == session.host).count();
-                if same_host_count > 1 {
-                    let instance_num = self.sessions[..=index].iter().filter(|s| s.host == session.host).count();
-                    format!("{host_label} ({instance_num})")
+                if is_local {
+                    let num = session
+                        .host
+                        .as_str()
+                        .strip_prefix("local-terminal-")
+                        .unwrap_or("1");
+                    format!("Local Terminal ({num})")
                 } else {
-                    host_label
+                    let same_host_count = self
+                        .sessions
+                        .iter()
+                        .filter(|s| s.host == session.host)
+                        .count();
+                    if same_host_count > 1 {
+                        let instance_num = self.sessions[..=index]
+                            .iter()
+                            .filter(|s| s.host == session.host)
+                            .count();
+                        format!("{host_label} ({instance_num})")
+                    } else {
+                        host_label
+                    }
                 }
             });
 
@@ -3929,17 +3984,24 @@ impl SshDeck {
                     )
             } else {
                 div()
+                    .size(px(18.))
+                    .rounded(px(4.))
+                    .bg(if is_active {
+                        rgba(0xffffff28)
+                    } else {
+                        rgba(0xffffff14)
+                    })
                     .flex()
                     .items_center()
                     .justify_center()
                     .child(
                         Icon::default()
                             .data(glyph::TERMINAL_PROMPT)
-                            .size(px(14.))
+                            .size(px(11.))
                             .text_color(if is_active {
-                                Hsla::from(selected_fg)
+                                selected_fg
                             } else {
-                                glyph_color
+                                unselected_fg
                             }),
                     )
             };
@@ -3966,7 +4028,11 @@ impl SshDeck {
                 .cursor_pointer()
                 .min_w(px(0.))
                 .flex_shrink_0()
-                .text_color(if is_active { selected_fg } else { muted })
+                .text_color(if is_active {
+                    selected_fg
+                } else {
+                    unselected_fg
+                })
                 .when(is_active, |el| {
                     el.bg(selected_bg).border_1().border_color(selected_border)
                 })
@@ -3987,19 +4053,23 @@ impl SshDeck {
                         cx.notify();
                     }),
                 )
-                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
-                    if let Some((start_idx, start_pos)) = this.tab_drag_start {
-                        if event.dragging() && start_idx == index {
-                            let dx = (f32::from(event.position.x) - f32::from(start_pos.x)).abs();
-                            let dy = (f32::from(event.position.y) - f32::from(start_pos.y)).abs();
-                            if dx > 4.0 || dy > 4.0 {
-                                this.dragged_session = Some(index);
-                                this.dragged_tab = None;
-                                cx.notify();
+                .on_mouse_move(
+                    cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                        if let Some((start_idx, start_pos)) = this.tab_drag_start {
+                            if event.dragging() && start_idx == index {
+                                let dx =
+                                    (f32::from(event.position.x) - f32::from(start_pos.x)).abs();
+                                let dy =
+                                    (f32::from(event.position.y) - f32::from(start_pos.y)).abs();
+                                if dx > 4.0 || dy > 4.0 {
+                                    this.dragged_session = Some(index);
+                                    this.dragged_tab = None;
+                                    cx.notify();
+                                }
                             }
                         }
-                    }
-                }))
+                    }),
+                )
                 .child(os_tile)
                 .child(
                     div()
@@ -4028,14 +4098,12 @@ impl SshDeck {
                 );
             }
 
-            strip = strip.child(
-                tab_div.on_click(cx.listener(move |this, _, window, cx| {
-                    this.select_tab(MainTab::Session(index), window, cx);
-                })),
-            );
+            strip = strip.child(tab_div.on_click(cx.listener(move |this, _, window, cx| {
+                this.select_tab(MainTab::Session(index), window, cx);
+            })));
         }
 
-        // 5. [ + New Tab ] tab (with + icon and text New Tab, not >_ New Tab, always present!)
+        // 5. [ + New Tab ] tab (with + icon badge and text New Tab, matching Termius)
         let is_new_tab_active = self.tab == MainTab::NewTab && self.overlay.is_none();
         let new_tab_item = div()
             .id("tab-new-tab")
@@ -4048,15 +4116,34 @@ impl SshDeck {
             .rounded(px(6.))
             .cursor_pointer()
             .flex_shrink_0()
-            .text_color(if is_new_tab_active { selected_fg } else { muted })
+            .text_color(if is_new_tab_active {
+                selected_fg
+            } else {
+                unselected_fg
+            })
             .when(is_new_tab_active, |el| {
                 el.bg(selected_bg).border_1().border_color(selected_border)
             })
             .when(!is_new_tab_active, |el| el.hover(move |s| s.bg(hover_bg)))
             .child(
-                Icon::new(IconName::Plus)
-                    .size(px(13.))
-                    .text_color(if is_new_tab_active { selected_fg } else { muted }),
+                div()
+                    .size(px(15.))
+                    .rounded(px(3.))
+                    .bg(if is_new_tab_active {
+                        rgba(0xffffff28)
+                    } else {
+                        rgba(0xffffff18)
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Icon::new(IconName::Plus).size(px(10.)).text_color(
+                        if is_new_tab_active {
+                            selected_fg
+                        } else {
+                            unselected_fg
+                        },
+                    )),
             )
             .child(
                 div()
@@ -4076,7 +4163,11 @@ impl SshDeck {
         let add_btn = Button::new("add-tab-btn")
             .ghost()
             .xsmall()
-            .icon(Icon::new(IconName::Plus).size(px(14.)).text_color(muted))
+            .icon(
+                Icon::new(IconName::Plus)
+                    .size(px(14.))
+                    .text_color(unselected_fg),
+            )
             .tooltip("New tab (⌘T)")
             .on_click(cx.listener(|this, _, window, cx| {
                 this.select_tab(MainTab::NewTab, window, cx);
@@ -4429,11 +4520,7 @@ impl SshDeck {
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .child(
-                        Input::new(&self.filter)
-                            .small()
-                            .bordered(false),
-                    ),
+                    .child(Input::new(&self.filter).small().bordered(false)),
             )
             .child(connect_pill);
 
@@ -6066,7 +6153,11 @@ impl SshDeck {
                                             Button::new("new-tab-terminal")
                                                 .ghost()
                                                 .small()
-                                                .icon(Icon::default().data(glyph::TERMINAL_PROMPT).size(px(14.)))
+                                                .icon(
+                                                    Icon::default()
+                                                        .data(glyph::TERMINAL_PROMPT)
+                                                        .size(px(14.)),
+                                                )
                                                 .label("Terminal")
                                                 .tooltip("Open Local Terminal")
                                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -6152,7 +6243,9 @@ impl SshDeck {
                                     .min_w(px(0.))
                                     .px_4()
                                     .py_3()
-                                    .when(!is_last, |el| el.border_b_1().border_color(rgba(0xd5dde060)))
+                                    .when(!is_last, |el| {
+                                        el.border_b_1().border_color(rgba(0xd5dde060))
+                                    })
                                     .hover(|s| s.bg(rgb(0xf4f7f9)))
                                     .cursor_pointer()
                                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -6202,7 +6295,7 @@ impl SshDeck {
                                             .child("Personal"),
                                     )
                             }))
-                    })
+                    }),
             )
             .into_any_element()
     }
@@ -6468,14 +6561,25 @@ impl SshDeck {
                     div()
                         .text_xs()
                         .text_color(rgb(0x93c5fd))
-                        .child(SharedString::from(format!("Run \"{dragged_label}\" on left"))),
+                        .child(SharedString::from(format!(
+                            "Run \"{dragged_label}\" on left"
+                        ))),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.split_with_dragged_session(dragged_sess, SplitDir::Row, false, window, cx);
                 }))
-                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                    this.split_with_dragged_session(dragged_sess, SplitDir::Row, false, window, cx);
-                }));
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.split_with_dragged_session(
+                            dragged_sess,
+                            SplitDir::Row,
+                            false,
+                            window,
+                            cx,
+                        );
+                    }),
+                );
 
             let drop_right = div()
                 .id("session-drop-right")
@@ -6508,14 +6612,25 @@ impl SshDeck {
                     div()
                         .text_xs()
                         .text_color(rgb(0x93c5fd))
-                        .child(SharedString::from(format!("Run \"{dragged_label}\" on right"))),
+                        .child(SharedString::from(format!(
+                            "Run \"{dragged_label}\" on right"
+                        ))),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.split_with_dragged_session(dragged_sess, SplitDir::Row, true, window, cx);
                 }))
-                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                    this.split_with_dragged_session(dragged_sess, SplitDir::Row, true, window, cx);
-                }));
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.split_with_dragged_session(
+                            dragged_sess,
+                            SplitDir::Row,
+                            true,
+                            window,
+                            cx,
+                        );
+                    }),
+                );
 
             let drop_top = div()
                 .id("session-drop-top")
@@ -6546,9 +6661,18 @@ impl SshDeck {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.split_with_dragged_session(dragged_sess, SplitDir::Col, false, window, cx);
                 }))
-                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                    this.split_with_dragged_session(dragged_sess, SplitDir::Col, false, window, cx);
-                }));
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.split_with_dragged_session(
+                            dragged_sess,
+                            SplitDir::Col,
+                            false,
+                            window,
+                            cx,
+                        );
+                    }),
+                );
 
             let drop_bottom = div()
                 .id("session-drop-bottom")
@@ -6579,9 +6703,18 @@ impl SshDeck {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.split_with_dragged_session(dragged_sess, SplitDir::Col, true, window, cx);
                 }))
-                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                    this.split_with_dragged_session(dragged_sess, SplitDir::Col, true, window, cx);
-                }));
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.split_with_dragged_session(
+                            dragged_sess,
+                            SplitDir::Col,
+                            true,
+                            window,
+                            cx,
+                        );
+                    }),
+                );
 
             Some(
                 div()
@@ -6776,18 +6909,20 @@ impl SshDeck {
                                 cx,
                             ))
                             .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .child(
-                                        Button::new("side-close-btn")
-                                            .ghost()
-                                            .icon(Icon::new(IconName::Close).size(px(14.)).text_color(muted))
-                                            .tooltip("Close sidebar (⌘B)")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.sidebar_open = false;
-                                                cx.notify();
-                                            })),
-                                    ),
+                                div().flex_shrink_0().child(
+                                    Button::new("side-close-btn")
+                                        .ghost()
+                                        .icon(
+                                            Icon::new(IconName::Close)
+                                                .size(px(14.))
+                                                .text_color(muted),
+                                        )
+                                        .tooltip("Close sidebar (⌘B)")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.sidebar_open = false;
+                                            cx.notify();
+                                        })),
+                                ),
                             ),
                     )
                     .child(
@@ -7556,34 +7691,37 @@ impl SshDeck {
                     .text_color(muted)
                     .child("Workspace"),
             )
-            .when(self.dragged_tab.is_some() || self.dragged_session.is_some(), |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py_0p5()
-                        .rounded(px(4.))
-                        .bg(rgb(0x2091f6))
-                        .text_xs()
-                        .text_color(rgb(0xffffff))
-                        .child("Moving tab — click a drop zone or")
-                        .child(
-                            Button::new("cancel-drag")
-                                .ghost()
-                                .xsmall()
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.dragged_tab = None;
-                                    this.dragged_session = None;
-                                    this.tab_drag_start = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-            })
+            .when(
+                self.dragged_tab.is_some() || self.dragged_session.is_some(),
+                |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(4.))
+                            .bg(rgb(0x2091f6))
+                            .text_xs()
+                            .text_color(rgb(0xffffff))
+                            .child("Moving tab — click a drop zone or")
+                            .child(
+                                Button::new("cancel-drag")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dragged_tab = None;
+                                        this.dragged_session = None;
+                                        this.tab_drag_start = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                },
+            )
             .child(div().flex_1())
             .child(
                 Button::new("ws-broadcast")
@@ -7817,19 +7955,23 @@ impl SshDeck {
                         cx.notify();
                     }),
                 )
-                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
-                    if let Some((start_idx, start_pos)) = this.tab_drag_start {
-                        if event.dragging() && start_idx == session_idx {
-                            let dx = (f32::from(event.position.x) - f32::from(start_pos.x)).abs();
-                            let dy = (f32::from(event.position.y) - f32::from(start_pos.y)).abs();
-                            if dx > 4.0 || dy > 4.0 {
-                                this.dragged_tab = Some((pane_index, tab_idx));
-                                this.dragged_session = Some(session_idx);
-                                cx.notify();
+                .on_mouse_move(
+                    cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                        if let Some((start_idx, start_pos)) = this.tab_drag_start {
+                            if event.dragging() && start_idx == session_idx {
+                                let dx =
+                                    (f32::from(event.position.x) - f32::from(start_pos.x)).abs();
+                                let dy =
+                                    (f32::from(event.position.y) - f32::from(start_pos.y)).abs();
+                                if dx > 4.0 || dy > 4.0 {
+                                    this.dragged_tab = Some((pane_index, tab_idx));
+                                    this.dragged_session = Some(session_idx);
+                                    cx.notify();
+                                }
                             }
                         }
-                    }
-                }))
+                    }),
+                )
                 .child(div().size(px(6.)).rounded_full().bg(if is_connected {
                     cx.theme().success
                 } else {
@@ -7926,7 +8068,8 @@ impl SshDeck {
 
         let single_session_info = if tabs.len() == 1 {
             let session_idx = tabs[0];
-            let (label, username, host_opt) = if let Some(session) = self.sessions.get(session_idx) {
+            let (label, username, host_opt) = if let Some(session) = self.sessions.get(session_idx)
+            {
                 let host_opt = self.store.inventory().get(&session.host).cloned();
                 let title = host_opt
                     .as_ref()
@@ -7935,14 +8078,23 @@ impl SshDeck {
                     .unwrap_or_else(|| session.host.to_string());
                 let user = host_opt
                     .as_ref()
-                    .map(|h| if h.username.is_empty() { "root".to_string() } else { h.username.clone() })
+                    .map(|h| {
+                        if h.username.is_empty() {
+                            "root".to_string()
+                        } else {
+                            h.username.clone()
+                        }
+                    })
                     .unwrap_or_else(|| "root".to_string());
                 (title, user, host_opt)
             } else {
                 (format!("Session {session_idx}"), "root".to_string(), None)
             };
             let orange = rgb(0xe95420);
-            let tint = host_opt.as_ref().map(|h| host_os_tint(h, orange.into())).unwrap_or_else(|| orange.into());
+            let tint = host_opt
+                .as_ref()
+                .map(|h| host_os_tint(h, orange.into()))
+                .unwrap_or_else(|| orange.into());
             Some((session_idx, label, username, tint))
         } else {
             None
@@ -8117,19 +8269,22 @@ impl SshDeck {
                     this.tab_drag_start = None;
                     cx.notify();
                 }))
-                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                    this.workspace = workspace_split_pane_with_session(
-                        &this.workspace,
-                        pane_index,
-                        moving_session,
-                        SplitDir::Row,
-                        false,
-                    );
-                    this.dragged_tab = None;
-                    this.dragged_session = None;
-                    this.tab_drag_start = None;
-                    cx.notify();
-                }));
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.workspace = workspace_split_pane_with_session(
+                            &this.workspace,
+                            pane_index,
+                            moving_session,
+                            SplitDir::Row,
+                            false,
+                        );
+                        this.dragged_tab = None;
+                        this.dragged_session = None;
+                        this.tab_drag_start = None;
+                        cx.notify();
+                    }),
+                );
 
             let drop_right = div()
                 .id(SharedString::from(format!("ws-drop-right-{pane_index}")))
@@ -8170,19 +8325,22 @@ impl SshDeck {
                     this.tab_drag_start = None;
                     cx.notify();
                 }))
-                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                    this.workspace = workspace_split_pane_with_session(
-                        &this.workspace,
-                        pane_index,
-                        moving_session,
-                        SplitDir::Row,
-                        true,
-                    );
-                    this.dragged_tab = None;
-                    this.dragged_session = None;
-                    this.tab_drag_start = None;
-                    cx.notify();
-                }));
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.workspace = workspace_split_pane_with_session(
+                            &this.workspace,
+                            pane_index,
+                            moving_session,
+                            SplitDir::Row,
+                            true,
+                        );
+                        this.dragged_tab = None;
+                        this.dragged_session = None;
+                        this.tab_drag_start = None;
+                        cx.notify();
+                    }),
+                );
 
             let drop_top = div()
                 .id(SharedString::from(format!("ws-drop-top-{pane_index}")))
@@ -8216,19 +8374,22 @@ impl SshDeck {
                     this.tab_drag_start = None;
                     cx.notify();
                 }))
-                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                    this.workspace = workspace_split_pane_with_session(
-                        &this.workspace,
-                        pane_index,
-                        moving_session,
-                        SplitDir::Col,
-                        false,
-                    );
-                    this.dragged_tab = None;
-                    this.dragged_session = None;
-                    this.tab_drag_start = None;
-                    cx.notify();
-                }));
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.workspace = workspace_split_pane_with_session(
+                            &this.workspace,
+                            pane_index,
+                            moving_session,
+                            SplitDir::Col,
+                            false,
+                        );
+                        this.dragged_tab = None;
+                        this.dragged_session = None;
+                        this.tab_drag_start = None;
+                        cx.notify();
+                    }),
+                );
 
             let drop_bottom = div()
                 .id(SharedString::from(format!("ws-drop-bottom-{pane_index}")))
@@ -8267,19 +8428,22 @@ impl SshDeck {
                     this.tab_drag_start = None;
                     cx.notify();
                 }))
-                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                    this.workspace = workspace_split_pane_with_session(
-                        &this.workspace,
-                        pane_index,
-                        moving_session,
-                        SplitDir::Col,
-                        true,
-                    );
-                    this.dragged_tab = None;
-                    this.dragged_session = None;
-                    this.tab_drag_start = None;
-                    cx.notify();
-                }));
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.workspace = workspace_split_pane_with_session(
+                            &this.workspace,
+                            pane_index,
+                            moving_session,
+                            SplitDir::Col,
+                            true,
+                        );
+                        this.dragged_tab = None;
+                        this.dragged_session = None;
+                        this.tab_drag_start = None;
+                        cx.notify();
+                    }),
+                );
 
             let tabs_len = tabs.len();
             let drop_center = div()
@@ -8318,27 +8482,30 @@ impl SshDeck {
                     this.tab_drag_start = None;
                     cx.notify();
                 }))
-                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                    if let Some((from_pane, from_tab)) = from_pane_opt {
-                        this.workspace = workspace_move_tab(
-                            &this.workspace,
-                            from_pane,
-                            from_tab,
-                            pane_index,
-                            tabs_len,
-                        );
-                    } else {
-                        this.workspace = workspace_insert_tab_into_pane(
-                            &this.workspace,
-                            pane_index,
-                            moving_session,
-                        );
-                    }
-                    this.dragged_tab = None;
-                    this.dragged_session = None;
-                    this.tab_drag_start = None;
-                    cx.notify();
-                }));
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some((from_pane, from_tab)) = from_pane_opt {
+                            this.workspace = workspace_move_tab(
+                                &this.workspace,
+                                from_pane,
+                                from_tab,
+                                pane_index,
+                                tabs_len,
+                            );
+                        } else {
+                            this.workspace = workspace_insert_tab_into_pane(
+                                &this.workspace,
+                                pane_index,
+                                moving_session,
+                            );
+                        }
+                        this.dragged_tab = None;
+                        this.dragged_session = None;
+                        this.tab_drag_start = None;
+                        cx.notify();
+                    }),
+                );
 
             Some(
                 div()
@@ -8372,7 +8539,9 @@ impl SshDeck {
             .overflow_hidden()
             .rounded(px(6.))
             .when(is_focused, |el| el.border_2().border_color(rgb(0x10b981)))
-            .when(!is_focused, |el| el.border_1().border_color(rgba(0x8d91a530)))
+            .when(!is_focused, |el| {
+                el.border_1().border_color(rgba(0x8d91a530))
+            })
             .child(tab_bar)
             .child(
                 div()
@@ -8750,19 +8919,20 @@ impl Render for SshDeck {
                     if event.dragging() {
                         let dx = (f32::from(event.position.x) - f32::from(start_pos.x)).abs();
                         let dy = (f32::from(event.position.y) - f32::from(start_pos.y)).abs();
-                        if dx > 4.0 || dy > 4.0 {
-                            if this.dragged_session != Some(start_idx) {
-                                this.dragged_session = Some(start_idx);
-                                this.dragged_tab = None;
-                                cx.notify();
-                            }
+                        if (dx > 4.0 || dy > 4.0) && this.dragged_session != Some(start_idx) {
+                            this.dragged_session = Some(start_idx);
+                            this.dragged_tab = None;
+                            cx.notify();
                         }
                     }
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
-                this.tab_drag_start = None;
-            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
+                    this.tab_drag_start = None;
+                }),
+            )
             .child(header)
             .child(
                 div()
@@ -9260,7 +9430,10 @@ mod tests {
         let mut titles: Vec<String> = Vec::new();
         let get_next_title = |titles: &[String]| {
             let mut instance_num = 1;
-            while titles.iter().any(|t| t == &format!("Local Terminal ({instance_num})")) {
+            while titles
+                .iter()
+                .any(|t| t == &format!("Local Terminal ({instance_num})"))
+            {
                 instance_num += 1;
             }
             format!("Local Terminal ({instance_num})")
