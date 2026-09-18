@@ -23,11 +23,11 @@ pub const SECURITY_KEY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" view
 
 pub const CERTIFICATE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="20" x="4" y="2" rx="2"/><path d="M8 7h8"/><path d="M8 11h8"/><path d="M8 15h4"/></svg>"#;
 
-pub const UBUNTU: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><circle cx="4.5" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="15.75" cy="5.5" r="1.6" fill="currentColor" stroke="none"/><circle cx="15.75" cy="18.5" r="1.6" fill="currentColor" stroke="none"/><path d="M8.2 10.2a5.5 5.5 0 0 1 4.3-3.7"/><path d="M14.5 8.5a5.5 5.5 0 0 1 0 7"/><path d="M12.5 17.5a5.5 5.5 0 0 1-4.3-3.7"/></svg>"#;
+pub const UBUNTU: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><circle cx="4.5" cy="12" r="1.8" fill="currentColor" stroke="none"/><circle cx="15.75" cy="5.5" r="1.8" fill="currentColor" stroke="none"/><circle cx="15.75" cy="18.5" r="1.8" fill="currentColor" stroke="none"/><path d="M8.2 10.2a5.5 5.5 0 0 1 4.3-3.7"/><path d="M14.5 8.5a5.5 5.5 0 0 1 0 7"/><path d="M12.5 17.5a5.5 5.5 0 0 1-4.3-3.7"/></svg>"#;
 
 // Solid-fill variant for the orange host tiles and session tabs: Termius
 // renders the OS emblem as a clean white glyph on vibrant orange background.
-pub const UBUNTU_SOLID: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><circle cx="4.5" cy="12" r="1.8" fill="currentColor" stroke="none"/><circle cx="15.75" cy="5.5" r="1.8" fill="currentColor" stroke="none"/><circle cx="15.75" cy="18.5" r="1.8" fill="currentColor" stroke="none"/><path d="M8.2 10.2a5.5 5.5 0 0 1 4.3-3.7"/><path d="M14.5 8.5a5.5 5.5 0 0 1 0 7"/><path d="M12.5 17.5a5.5 5.5 0 0 1-4.3-3.7"/></svg>"#;
+pub const UBUNTU_SOLID: &[u8] = UBUNTU;
 
 pub const BACKSPACE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 4H8l-7 8 7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"/><line x1="18" x2="12" y1="9" y2="15"/><line x1="12" x2="18" y1="9" y2="15"/></svg>"#;
 

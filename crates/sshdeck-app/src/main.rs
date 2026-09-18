@@ -4024,7 +4024,7 @@ impl SshDeck {
             div()
                 .relative()
                 .flex_1()
-                .child(Input::new(&self.filter).small().cleanable(true))
+                .child(Input::new(&self.filter).small())
                 .child(connect_pill),
         );
 
@@ -4175,7 +4175,7 @@ impl SshDeck {
                 div().flex().flex_row().items_center().gap_1().child(
                     div()
                         .size(px(32.))
-                        .rounded(px(8.))
+                        .rounded_full()
                         .bg(rgb(0xe67e22))
                         .border_2()
                         .border_color(rgb(0x2091f6))
@@ -4432,6 +4432,8 @@ impl SshDeck {
 
         let tags_str = host_subtitle(host);
 
+        let tint = host_os_tint(host, orange.into());
+
         div()
             .id(SharedString::from(format!("vault-card-{id}")))
             .flex()
@@ -4443,7 +4445,7 @@ impl SshDeck {
             .overflow_hidden()
             .h(px(card_h))
             .px_3()
-            .rounded(px(10.))
+            .rounded(px(12.))
             .bg(card_bg)
             .border_1()
             .border_color(if is_selected {
@@ -4465,9 +4467,9 @@ impl SshDeck {
             }))
             .child(
                 div()
-                    .size(if is_list { px(32.) } else { px(44.) })
+                    .size(if is_list { px(32.) } else { px(42.) })
                     .rounded(px(10.))
-                    .bg(orange)
+                    .bg(tint)
                     .flex()
                     .items_center()
                     .justify_center()
@@ -4847,41 +4849,48 @@ impl SshDeck {
                         .child(
                             div()
                                 .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_3()
+                                .flex_col()
+                                .gap_2()
                                 .p_3()
                                 .rounded(px(14.))
                                 .bg(card_bg)
                                 .child(
                                     div()
-                                        .size(px(40.))
-                                        .rounded(px(8.))
-                                        .bg(orange)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            Icon::default()
-                                                .data(glyph::UBUNTU)
-                                                .size(px(24.))
-                                                .text_color(rgb(0xffffff)),
-                                        ),
+                                        .text_sm()
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .text_color(fg)
+                                        .child("Address"),
                                 )
                                 .child(
                                     div()
                                         .flex()
-                                        .flex_col()
-                                        .flex_1()
-                                        .gap_1()
-                                        .child(div().text_xs().text_color(muted).child("Address"))
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_3()
                                         .child(
-                                            Input::new(&self.details_address).small().prefix(
-                                                div()
-                                                    .size(px(16.))
-                                                    .rounded(px(4.))
-                                                    .bg(orange),
-                                            ),
+                                            div()
+                                                .size(px(40.))
+                                                .rounded(px(8.))
+                                                .bg(orange)
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    Icon::default()
+                                                        .data(glyph::UBUNTU_SOLID)
+                                                        .size(px(24.))
+                                                        .text_color(rgb(0xffffff)),
+                                                ),
+                                        )
+                                        .child(
+                                            details_box()
+                                                .flex_1()
+                                                .child(
+                                                    Input::new(&self.details_address)
+                                                        .small()
+                                                        .appearance(false)
+                                                        .flex_1(),
+                                                ),
                                         ),
                                 ),
                         )
@@ -4908,36 +4917,6 @@ impl SshDeck {
                                             .appearance(false)
                                             .flex_1(),
                                     ),
-                                )
-                                // Key-setting row: static disclosure, never a reset control.
-                                .child(
-                                    details_box()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_2()
-                                                .child(
-                                                    Icon::default()
-                                                        .data(glyph::BACKSPACE)
-                                                        .size(px(14.))
-                                                        .text_color(muted),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(muted)
-                                                        .child("Backspace"),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(muted)
-                                                .child("Default"),
-                                        ),
                                 )
                                 .child(
                                     details_box()
@@ -4967,6 +4946,36 @@ impl SshDeck {
                                                 .small()
                                                 .appearance(false)
                                                 .flex_1(),
+                                        ),
+                                )
+                                // Key-setting row: Backspace Default at bottom of General card
+                                .child(
+                                    details_box()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    Icon::default()
+                                                        .data(glyph::BACKSPACE)
+                                                        .size(px(14.))
+                                                        .text_color(muted),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(muted)
+                                                        .child("Backspace"),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(muted)
+                                                .child("Default"),
                                         ),
                                 )
                         )
@@ -5640,7 +5649,7 @@ impl SshDeck {
                                                 .small()
                                                 .label("Create a workspace")
                                                 .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.open_add_host(window, cx);
+                                                    this.select_tab(MainTab::Workspace, window, cx);
                                                 })),
                                         ),
                                     )
@@ -5685,78 +5694,83 @@ impl SshDeck {
                                     ),
                             ),
                     )
-                    // Host list: zebra rows (white / `#f3f5f6`), single-line
-                    // (22px tile + name), bare grey vault label, no hover ring.
-                    .child(div().flex().flex_col().gap_2().children(
-                        filtered.into_iter().enumerate().map(|(row, host)| {
-                            let connect_host = host.clone();
-                            let id = host.id.clone();
-                            let row_bg: Hsla = if row % 2 == 0 {
-                                card_bg
-                            } else {
-                                rgb(0xf3f5f6).into()
-                            };
-                            div()
-                                .id(SharedString::from(format!("new-tab-host-{id}")))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .min_w(px(0.))
-                                .p_3()
-                                .rounded(px(10.))
-                                .bg(row_bg)
-                                .hover(|s| s.bg(rgb(0xe4e9ec)))
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.connect(connect_host.clone(), window, cx);
-                                }))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_3()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .overflow_hidden()
-                                        .child(
-                                            div()
-                                                .size(px(24.))
-                                                .flex_shrink_0()
-                                                .rounded(px(7.))
-                                                .bg(rgb(0xe95420))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(
-                                                    Icon::default()
-                                                        .data(glyph::UBUNTU_SOLID)
-                                                        .size(px(15.))
-                                                        .text_color(rgb(0xffffff)),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(14.))
-                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                .text_color(fg)
-                                                .flex_1()
-                                                .min_w(px(0.))
-                                                .truncate()
-                                                .child(SharedString::from(host.label)),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_size(px(12.))
-                                        .text_color(muted)
-                                        .child("Personal"),
-                                )
-                        }),
-                    )),
+                    // Recent connections unified card container matching Termius 3.09.49 PM.
+                    .child({
+                        let filtered_count = filtered.len();
+                        div()
+                            .flex()
+                            .flex_col()
+                            .rounded(px(14.))
+                            .bg(card_bg)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .shadow_xs()
+                            .overflow_hidden()
+                            .children(filtered.into_iter().enumerate().map(move |(row, host)| {
+                                let connect_host = host.clone();
+                                let id = host.id.clone();
+                                let is_last = row + 1 == filtered_count;
+                                div()
+                                    .id(SharedString::from(format!("new-tab-host-{id}")))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .min_w(px(0.))
+                                    .px_4()
+                                    .py_3()
+                                    .when(!is_last, |el| el.border_b_1().border_color(rgba(0xd5dde060)))
+                                    .hover(|s| s.bg(rgb(0xf4f7f9)))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.connect(connect_host.clone(), window, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_3()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
+                                            .child(
+                                                div()
+                                                    .size(px(26.))
+                                                    .flex_shrink_0()
+                                                    .rounded(px(7.))
+                                                    .bg(rgb(0xe95420))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(
+                                                        Icon::default()
+                                                            .data(glyph::UBUNTU_SOLID)
+                                                            .size(px(16.))
+                                                            .text_color(rgb(0xffffff)),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(14.))
+                                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                    .text_color(fg)
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .child(SharedString::from(host.label)),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(12.))
+                                            .text_color(muted)
+                                            .child("Personal"),
+                                    )
+                            }))
+                    })
             )
             .into_any_element()
     }

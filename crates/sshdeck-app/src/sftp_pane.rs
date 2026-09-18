@@ -1776,7 +1776,7 @@ impl SftpPane {
                             .child(
                                 Icon::default()
                                     .data(glyph::UBUNTU)
-                                    .small()
+                                    .size(px(22.))
                                     .text_color(Hsla::from(rgb(0xffffff))),
                             ),
                     )
