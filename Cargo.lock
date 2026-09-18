@@ -7485,6 +7485,7 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "gpui-kit",
+ "portable-pty",
  "sshdeck-autocomplete",
  "sshdeck-config",
  "sshdeck-core",

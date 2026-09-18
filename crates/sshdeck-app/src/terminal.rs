@@ -736,12 +736,33 @@ struct Search {
     current: usize,
 }
 
+/// Transport backing a terminal pane: either a remote SSH session or a local PTY session.
+enum SessionHandle {
+    Remote(Arc<Session>),
+    Local(Arc<crate::local_session::LocalSession>),
+}
+
+impl SessionHandle {
+    fn write(&self, data: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Remote(s) => s.write(data).map_err(|e| e.to_string()),
+            Self::Local(s) => s.write(data),
+        }
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        match self {
+            Self::Remote(s) => s.resize(cols, rows).map_err(|e| e.to_string()),
+            Self::Local(s) => s.resize(cols, rows),
+        }
+    }
+}
+
 /// The visible grid of a session, rendered as text runs.
 pub struct TerminalPane {
     /// `None` when the transport rejected the configuration outright; the pane
-    /// then renders the failure instead of a live grid. Shared so the shell can
-    /// open an SFTP subsystem on the same authenticated connection.
-    session: Option<Arc<Session>>,
+    /// then renders the failure instead of a live grid.
+    session: Option<SessionHandle>,
     terminal: Terminal,
     options: TerminalOptions,
     focus_handle: FocusHandle,
@@ -836,7 +857,7 @@ impl TerminalPane {
         // pane keeps no handle. `.ok()` after the failure has been recorded is
         // not a silent discard: the error is preserved in the pane's state.
         let mut pane = Self {
-            session: connected.ok().map(Arc::new),
+            session: connected.ok().map(Arc::new).map(SessionHandle::Remote),
             terminal: Terminal::new(80, 24, options.scrollback_lines()),
             options,
             focus_handle,
@@ -860,15 +881,66 @@ impl TerminalPane {
         };
 
         if let Some(events) = events {
-            // One task per pane awaits the session's events and notifies the view
-            // on arrival. This is the invalidation-driven path docs/BUDGET.md
-            // asks for: when the remote is quiet nothing arrives, no frame is
-            // scheduled, and the process is genuinely idle. A polling loop would
-            // draw 60 times a second to show text that has not changed, which is
-            // the exact failure mode this port exists to avoid.
-            //
-            // The shared borrow is taken up front so the closure captures `&Window`
-            // rather than the caller's `&mut Window`.
+            let window: &Window = window;
+            pane.watch(events, window, cx);
+        }
+        pane
+    }
+
+    /// Spawns a local terminal session running the system shell with default options.
+    pub fn new_local(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_local_with_options(TerminalOptions::default(), window, cx)
+    }
+
+    /// Spawns a local terminal session running the system shell with the given options.
+    pub fn new_local_with_options(
+        options: TerminalOptions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let cell = measure_cell(window, options.font_size());
+        let focus_handle = cx.focus_handle();
+
+        let connected = crate::local_session::LocalSession::spawn(80, 24);
+        let (status, ended) = match &connected {
+            Ok(_) => (SessionState::Connecting, None),
+            Err(error) => (
+                SessionState::Failed {
+                    message: error.clone(),
+                },
+                Some(error.clone()),
+            ),
+        };
+        let events = connected
+            .as_ref()
+            .ok()
+            .map(crate::local_session::LocalSession::events);
+
+        let mut pane = Self {
+            session: connected.ok().map(Arc::new).map(SessionHandle::Local),
+            terminal: Terminal::new(80, 24, options.scrollback_lines()),
+            options,
+            focus_handle,
+            cell,
+            grid_origin: point(px(0.0), px(0.0)),
+            sent: (80, 24),
+            status,
+            title: None,
+            ended,
+            dragging: false,
+            selection: None,
+            search: None,
+            pending_scroll: 0.0,
+            blink_on: true,
+            blink_parked: false,
+            blink_task: None,
+            header_title: None,
+            show_header: false,
+            on_pane_action: None,
+            on_broadcast: None,
+        };
+
+        if let Some(events) = events {
             let window: &Window = window;
             pane.watch(events, window, cx);
         }
@@ -936,9 +1008,10 @@ impl TerminalPane {
             }
             SessionEvent::Closed(code) => {
                 self.status = SessionState::Closed { code };
+                let target_name = if self.is_local() { "local shell" } else { "remote shell" };
                 self.ended = Some(match code {
-                    Some(code) => format!("remote shell exited with status {code}"),
-                    None => "remote shell closed the session".to_string(),
+                    Some(code) => format!("{target_name} exited with status {code}"),
+                    None => format!("{target_name} closed the session"),
                 });
                 true
             }
@@ -983,7 +1056,20 @@ impl TerminalPane {
     /// The shell clones this to open an SFTP subsystem on the same session; the
     /// `Arc` is what lets the SFTP connect task own the handle across an await.
     pub fn session(&self) -> Option<Arc<Session>> {
-        self.session.clone()
+        match &self.session {
+            Some(SessionHandle::Remote(s)) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether this pane is running a local terminal session.
+    pub fn is_local(&self) -> bool {
+        matches!(&self.session, Some(SessionHandle::Local(_)))
+    }
+
+    /// Sets the tab/status title for this pane.
+    pub fn set_title(&mut self, title: impl Into<String>) {
+        self.title = Some(title.into());
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {

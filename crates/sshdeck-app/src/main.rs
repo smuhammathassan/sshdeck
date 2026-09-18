@@ -7,6 +7,7 @@
 mod forward_pane;
 pub mod glyph;
 mod keys_pane;
+mod local_session;
 mod logs_pane;
 mod palette;
 mod settings;
@@ -2593,6 +2594,107 @@ impl SshDeck {
         cx.notify();
     }
 
+    /// Spawns a local terminal session running the system shell and adds it as a tab.
+    fn open_local_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let font_size = self.terminal_font_size;
+        let scheme = TerminalScheme::by_name(&self.selected_theme).unwrap_or_default();
+        let options = TerminalOptions::new(font_size, 10_000, true).with_scheme(scheme);
+
+        let pane = cx.new(|cx| TerminalPane::new_local_with_options(options, window, cx));
+
+        let mut instance_num = 1;
+        while self.sessions.iter().any(|s| {
+            s.status.title.as_deref() == Some(&format!("Local Terminal ({instance_num})"))
+                || s.host.as_str() == format!("local-terminal-{instance_num}")
+        }) {
+            instance_num += 1;
+        }
+        let title = format!("Local Terminal ({instance_num})");
+        let host_id = HostId::new(format!("local-terminal-{instance_num}"));
+
+        let weak = cx.entity().downgrade();
+        let pane_handle = pane.clone();
+        let title_for_header = title.clone();
+        pane.update(cx, |pane, _| {
+            pane.set_title(title_for_header.clone());
+            pane.set_header_title(title_for_header);
+            let weak_action = weak.clone();
+            pane.set_on_pane_action(move |action, pane, window, cx| {
+                weak_action
+                    .update(cx, |this, cx| {
+                        this.pane_action(action, pane, window, cx);
+                    })
+                    .ok();
+            });
+            let weak_bc = weak.clone();
+            let pane_entity = pane_handle.clone();
+            pane.set_on_broadcast(move |bytes, _pane, cx| {
+                weak_bc
+                    .update(cx, |this, cx| {
+                        if this.broadcast_mode {
+                            let leaves = workspace_leaves(&this.workspace);
+                            for &idx in &leaves {
+                                if let Some(s) = this.sessions.get(idx) {
+                                    if s.pane != pane_entity {
+                                        s.pane.update(cx, |p, _| {
+                                            p.write(bytes);
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    })
+                    .ok();
+            });
+        });
+
+        let subscription = cx.observe_in(&pane, window, |this, pane, window, cx| {
+            let status = pane.read(cx).status();
+            if let Some(session) = this.sessions.iter_mut().find(|s| s.pane == pane) {
+                session.status = status;
+            }
+            this.reconcile_sftp(window, cx);
+            this.reconcile_forward(cx);
+            cx.notify();
+        });
+        self._subscriptions.push(subscription);
+
+        let mut status = pane.read(cx).status();
+        if status.title.is_none() {
+            status.title = Some(title.clone());
+        }
+        self.sessions.push(Session {
+            host: host_id.clone(),
+            pane: pane.clone(),
+            status,
+        });
+        self.last_session_host = Some(host_id);
+        let index = self.sessions.len() - 1;
+        self.active = Some(index);
+        self.tab = MainTab::Session(index);
+        self.overlay = None;
+        pane.update(cx, |pane, cx| pane.focus(window, cx));
+        self.reconcile_sftp(window, cx);
+        self.reconcile_forward(cx);
+
+        let logs_pane = self.ensure_logs_pane(window, cx);
+        let time_str = current_time_str();
+        logs_pane.update(cx, |p, cx| {
+            p.append(
+                &time_str,
+                "Connected",
+                "local".to_string(),
+                "terminal",
+                title,
+                "local".to_string(),
+                logs_pane::LogLevel::Success,
+                cx,
+            );
+        });
+
+        cx.notify();
+    }
+
     #[allow(dead_code)]
     fn connected_count(&self) -> usize {
         self.sessions
@@ -3306,7 +3408,7 @@ impl SshDeck {
         // in Light mode the theme's `muted`/`foreground` would turn the tabs
         // light-grey-on-light. Ceiling: a dedicated header token in
         // `themes/sshdeck.json`; upgrade by adding one and using it here.
-        let header_bg = rgb(0x1d2033);
+        let header_bg = rgb(0x1a1d2d);
         let header_fg = rgb(0xffffff);
 
         let actions = div()
@@ -3378,7 +3480,7 @@ impl SshDeck {
             })
             .pr_3()
             .border_b_1()
-            .border_color(rgba(0x8d91a540))
+            .border_color(rgba(0xffffff, 0.08))
             .window_control_area(WindowControlArea::Drag)
             .child(self.render_tabs(cx))
             .child(actions)
@@ -3593,82 +3695,171 @@ impl SshDeck {
     /// One fixed header tab (Vaults or SFTP): 30px tall inside the 40px header,
     /// 6px radius, transparent until selected. Uses 16px icons throughout the
     /// chrome (medium, the default) with the heavier glyph choice for each tab.
-    fn render_fixed_tab(
-        &mut self,
-        label: &'static str,
-        glyph_data: &'static [u8],
-        target: MainTab,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let is_active = self.tab == target && self.overlay.is_none();
-        // ponytail: tabs live in the always-dark header (see `render_header`),
-        // so they use the fixed dark hexes, not theme tokens. Ceiling: a
-        // header token in `themes/sshdeck.json`.
-        let muted: Hsla = rgb(0x8d91a5).into();
-        let selected_bg = rgb(0x282b3d);
-        let selected_fg: Hsla = rgb(0xffffff).into();
-        let hover_bg = rgb(0x3e4257);
+    /// The tab row: Vaults dropdown pill, SFTP tab, Workspace tab (always present),
+    /// open session tabs, New Tab (+ New Tab without close button), and the quick-add + button.
+    fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = rgb(0x8d91a5);
+        let selected_bg = rgb(0x25293d);
+        let selected_border = rgba(0xffffff, 0.10);
+        let selected_fg = rgb(0xffffff);
+        let hover_bg = rgb(0x222638);
+        let active = self.active;
 
-        let mut tab_div = div()
-            .id(SharedString::from(format!("tab-{label}")))
+        // 1. [ ⚿ Vaults ☁ ⌵ ] dropdown button pill
+        let is_vaults_active = self.tab == MainTab::Vaults && self.overlay.is_none();
+        let vaults_btn = div()
+            .id("tab-vaults")
             .flex()
             .flex_row()
             .items_center()
             .gap_1p5()
-            .px_3()
-            .h(px(30.))
-            .rounded_md()
+            .h(px(28.))
+            .px_2p5()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(if is_vaults_active {
+                rgba(0xffffff, 0.18)
+            } else {
+                rgba(0xffffff, 0.10)
+            })
+            .bg(if is_vaults_active {
+                rgb(0x282c3f)
+            } else {
+                rgb(0x222638)
+            })
             .cursor_pointer()
-            .min_w(px(0.))
-            .flex_shrink_1()
-            .overflow_hidden()
-            .text_color(if is_active { selected_fg } else { muted })
-            .when(is_active, |el| el.bg(selected_bg))
-            .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
+            .flex_shrink_0()
+            .hover(|s| s.bg(rgb(0x2a2e44)).border_color(rgba(0xffffff, 0.18)))
             .child(
                 Icon::default()
-                    .data(glyph_data)
-                    .size(px(16.))
-                    .text_color(if is_active { selected_fg } else { muted }),
+                    .data(glyph::VAULT)
+                    .size(px(14.))
+                    .text_color(if is_vaults_active { selected_fg } else { rgb(0xd0d4e4) }),
             )
-            .child(div().min_w(px(0.)).flex_shrink_1().truncate().child(label));
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(if is_vaults_active { selected_fg } else { rgb(0xd0d4e4) })
+                    .child("Vaults"),
+            )
+            .child(
+                Icon::default()
+                    .data(glyph::CLOUD)
+                    .size(px(13.))
+                    .text_color(muted),
+            )
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .size(px(12.))
+                    .text_color(muted),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.select_tab(MainTab::Vaults, window, cx);
+            }));
 
-        if label == "Vaults" {
-            tab_div = tab_div
-                .child(
-                    Icon::default()
-                        .data(glyph::CLOUD)
-                        .size(px(14.))
-                        .text_color(muted),
+        // 2. [ 📁 SFTP ] tab button
+        let is_sftp_active = self.tab == MainTab::Sftp && self.overlay.is_none();
+        let sftp_btn = div()
+            .id("tab-sftp")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            .h(px(28.))
+            .px_2p5()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .flex_shrink_0()
+            .text_color(if is_sftp_active { selected_fg } else { muted })
+            .when(is_sftp_active, |el| {
+                el.bg(selected_bg).border_1().border_color(selected_border)
+            })
+            .when(!is_sftp_active, |el| el.hover(move |s| s.bg(hover_bg)))
+            .child(
+                Icon::default()
+                    .data(glyph::FOLDER)
+                    .size(px(14.))
+                    .text_color(if is_sftp_active { selected_fg } else { muted }),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .child("SFTP"),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.select_tab(MainTab::Sftp, window, cx);
+            }));
+
+        // 3. [ ⚏ Workspace ] tab button with 2x2 grid icon (always present!)
+        let is_ws_active = self.tab == MainTab::Workspace && self.overlay.is_none();
+        let ws_panes = workspace_panes_count(&self.workspace);
+        let ws_title = if ws_panes > 1 {
+            format!("Workspace ({ws_panes})")
+        } else {
+            "Workspace".to_string()
+        };
+        let ws_btn = div()
+            .id("tab-workspace")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            .h(px(28.))
+            .px_2p5()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .flex_shrink_0()
+            .text_color(if is_ws_active { rgb(0x10b981) } else { muted })
+            .when(is_ws_active, |el| {
+                el.bg(selected_bg).border_1().border_color(selected_border)
+            })
+            .when(!is_ws_active, |el| el.hover(move |s| s.bg(hover_bg)))
+            .child(
+                Icon::default()
+                    .data(glyph::GRID)
+                    .size(px(13.))
+                    .text_color(if is_ws_active { rgb(0x10b981) } else { muted }),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .child(ws_title),
+            )
+            .when(is_ws_active, |el| {
+                el.child(
+                    div()
+                        .size(px(5.))
+                        .rounded_full()
+                        .bg(rgb(0x10b981)),
                 )
-                .child(
-                    Icon::new(IconName::ChevronDown)
-                        .size(px(12.))
-                        .text_color(muted),
-                );
-        }
-
-        tab_div
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.select_tab(target, window, cx);
-            }))
-            .into_any_element()
-    }
-
-    /// The tab row: the two fixed tabs (Vaults, SFTP), then one tab per open
-    /// session, New Tab if open, then the add tab `+` control.
-    fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // ponytail: same always-dark header exception as `render_fixed_tab` —
-        // fixed dark hexes, not theme tokens. Ceiling: a header token in
-        // `themes/sshdeck.json`.
-        let muted: Hsla = rgb(0x8d91a5).into();
-        let selected_bg = rgb(0x282b3d);
-        let selected_fg: Hsla = rgb(0xffffff).into();
-        let hover_bg = rgb(0x3e4257); // --list-hover
-        let active = self.active;
-
-        let vaults = self.render_fixed_tab("Vaults", glyph::VAULT, MainTab::Vaults, cx);
-        let sftp = self.render_fixed_tab("SFTP", glyph::FOLDER, MainTab::Sftp, cx);
+            })
+            .when(is_ws_active, |el| {
+                el.child(
+                    Button::new("close-workspace-tab")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip("Close workspace")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.workspace = WorkspaceNode::Empty;
+                            let fallback = this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
+                            this.select_tab(fallback, window, cx);
+                        })),
+                )
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                if workspace_panes_count(&this.workspace) <= 1 && this.sessions.len() >= 2 {
+                    let active = this.active.unwrap_or(0);
+                    let other = if active == 0 { 1 } else { 0 };
+                    this.tile_sessions_side_by_side(other, window, cx);
+                } else {
+                    this.select_tab(MainTab::Workspace, window, cx);
+                }
+            }));
 
         let mut strip = div()
             .id("tab-strip")
@@ -3679,88 +3870,23 @@ impl SshDeck {
             .h(px(30.))
             .min_w(px(0.))
             .overflow_x_scrollbar()
-            .child(vaults)
-            .child(sftp);
+            .child(vaults_btn)
+            .child(sftp_btn)
+            .child(ws_btn);
 
-        let is_ws_active = self.tab == MainTab::Workspace;
-        let ws_panes = workspace_panes_count(&self.workspace);
-        if ws_panes > 1 || is_ws_active || !self.sessions.is_empty() {
-            let ws_title = if ws_panes > 1 {
-                format!("Workspace ({ws_panes})")
-            } else {
-                "Workspace".to_string()
-            };
-            let ws_tab = div()
-                .id("tab-workspace")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1p5()
-                .px_3()
-                .h(px(30.))
-                .rounded_md()
-                .cursor_pointer()
-                .min_w(px(0.))
-                .flex_shrink_0()
-                .text_color(if is_ws_active { selected_fg } else { muted })
-                .when(is_ws_active, |el| el.bg(selected_bg))
-                .when(!is_ws_active, |el| el.hover(move |s| s.bg(hover_bg)))
-                .child(
-                    Icon::default()
-                        .data(glyph::SPLIT_HORIZONTAL)
-                        .size(px(14.))
-                        .text_color(if is_ws_active { Hsla::from(rgb(0x10b981)) } else { muted }),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .child(ws_title),
-                )
-                .when(is_ws_active, |el| {
-                    el.child(
-                        div()
-                            .size(px(6.))
-                            .rounded_full()
-                            .bg(rgb(0x10b981)),
-                    )
-                })
-                .when(is_ws_active, |el| {
-                    el.child(
-                        Button::new("close-workspace-tab")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .tooltip("Close workspace")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.workspace = WorkspaceNode::Empty;
-                                let fallback = this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
-                                this.select_tab(fallback, window, cx);
-                            })),
-                    )
-                })
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if workspace_panes_count(&this.workspace) <= 1 && this.sessions.len() >= 2 {
-                        let active = this.active.unwrap_or(0);
-                        let other = if active == 0 { 1 } else { 0 };
-                        this.tile_sessions_side_by_side(other, window, cx);
-                    } else {
-                        this.select_tab(MainTab::Workspace, window, cx);
-                    }
-                }));
-            strip = strip.child(ws_tab);
-        }
-
+        // 4. Session tabs
         let has_multi = self.sessions.len() > 1;
-
         for (index, session) in self.sessions.iter().enumerate() {
-            let host_label = self
-                .store
-                .inventory()
-                .get(&session.host)
-                .map(|host| host.label.clone())
-                .unwrap_or_else(|| session.host.to_string());
+            let is_local = session.host.as_str().starts_with("local-terminal");
+            let host_label = if is_local {
+                "Local Terminal".to_string()
+            } else {
+                self.store
+                    .inventory()
+                    .get(&session.host)
+                    .map(|host| host.label.clone())
+                    .unwrap_or_else(|| session.host.to_string())
+            };
             let label = session.status.title.clone().unwrap_or_else(|| {
                 let same_host_count = self.sessions.iter().filter(|s| s.host == session.host).count();
                 if same_host_count > 1 {
@@ -3770,18 +3896,15 @@ impl SshDeck {
                     host_label
                 }
             });
-            // A session tab is only selected while no pane overlay covers it.
+
             let is_active = self.overlay.is_none() && active == Some(index) && !is_ws_active;
             let is_this_dragged = self.dragged_session == Some(index);
-            // Glyph tint carries connection state (connected #21b568 via
-            // `success`, connecting #f2c94c via `warning`, failed #f25e61 via
-            // `danger`, idle #8d91a5 via `muted_foreground`).
             let glyph_color = match &session.status.state {
-                SessionState::Connected => cx.theme().success, // #21b568
-                SessionState::Connecting | SessionState::Authenticating => cx.theme().warning, // #f2c94c
-                SessionState::Failed { .. } => cx.theme().danger, // #f25e61
+                SessionState::Connected => cx.theme().success,
+                SessionState::Connecting | SessionState::Authenticating => cx.theme().warning,
+                SessionState::Failed { .. } => cx.theme().danger,
                 SessionState::Disconnected | SessionState::Closed { .. } => {
-                    cx.theme().muted_foreground // #8d91a5
+                    cx.theme().muted_foreground
                 }
             };
             let state_label = session.status.state.label();
@@ -3792,8 +3915,8 @@ impl SshDeck {
             let os_tile = if let Some(host) = host_opt {
                 let tint = host_os_tint(host, rgb(0xe95420).into());
                 div()
-                    .size(px(20.))
-                    .rounded(px(6.))
+                    .size(px(18.))
+                    .rounded(px(4.))
                     .bg(tint)
                     .flex()
                     .items_center()
@@ -3801,14 +3924,11 @@ impl SshDeck {
                     .child(
                         Icon::default()
                             .data(glyph::UBUNTU_SOLID)
-                            .size(px(13.))
+                            .size(px(12.))
                             .text_color(rgb(0xffffff)),
                     )
             } else {
                 div()
-                    .size(px(20.))
-                    .rounded(px(6.))
-                    .bg(rgb(0x282b3d))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -3816,7 +3936,7 @@ impl SshDeck {
                         Icon::default()
                             .data(glyph::TERMINAL_PROMPT)
                             .size(px(14.))
-                            .text_color(glyph_color),
+                            .text_color(if is_active { selected_fg } else { glyph_color }),
                     )
             };
 
@@ -3830,43 +3950,22 @@ impl SshDeck {
                     this.tile_sessions_side_by_side(index, window, cx);
                 }));
 
-            let drag_btn = Button::new(SharedString::from(format!("drag-tab-header-{index}")))
-                .ghost()
-                .xsmall()
-                .label("⋮⋮")
-                .tooltip(if is_this_dragged {
-                    "Cancel tiling"
-                } else {
-                    "Drag to tile side-by-side"
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    if this.dragged_session == Some(index) {
-                        this.dragged_session = None;
-                        this.dragged_tab = None;
-                        this.tab_drag_start = None;
-                    } else {
-                        this.dragged_session = Some(index);
-                        this.dragged_tab = None;
-                    }
-                    cx.notify();
-                }));
-
             let mut tab_div = div()
                 .id(SharedString::from(format!("tab-{index}-{id}")))
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_1p5()
-                .px_2()
-                .h(px(30.))
-                .rounded_md()
+                .px_2p5()
+                .h(px(28.))
+                .rounded(px(6.))
                 .cursor_pointer()
                 .min_w(px(0.))
-                .flex_shrink_1()
-                .overflow_hidden()
+                .flex_shrink_0()
                 .text_color(if is_active { selected_fg } else { muted })
-                .when(is_active, |el| el.bg(selected_bg))
+                .when(is_active, |el| {
+                    el.bg(selected_bg).border_1().border_color(selected_border)
+                })
                 .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
                 .when(is_this_dragged, |el| {
                     el.bg(rgba(0x2091f630))
@@ -3897,12 +3996,12 @@ impl SshDeck {
                         }
                     }
                 }))
-                .child(drag_btn)
                 .child(os_tile)
                 .child(
                     div()
+                        .text_size(px(12.))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .min_w(px(0.))
-                        .flex_shrink_1()
                         .truncate()
                         .child(SharedString::from(label)),
                 );
@@ -3915,6 +4014,7 @@ impl SshDeck {
                 tab_div = tab_div.child(
                     Button::new(SharedString::from(format!("close-tab-{index}-{close_id}")))
                         .ghost()
+                        .xsmall()
                         .icon(IconName::Close)
                         .tooltip("Close session")
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -3931,70 +4031,62 @@ impl SshDeck {
             );
         }
 
-        if self.tab == MainTab::NewTab {
-            strip = strip.child(
+        // 5. [ + New Tab ] tab (with + icon and text New Tab, not >_ New Tab, always present!)
+        let is_new_tab_active = self.tab == MainTab::NewTab && self.overlay.is_none();
+        let new_tab_item = div()
+            .id("tab-new-tab")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            .h(px(28.))
+            .px_2p5()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .flex_shrink_0()
+            .text_color(if is_new_tab_active { selected_fg } else { muted })
+            .when(is_new_tab_active, |el| {
+                el.bg(selected_bg).border_1().border_color(selected_border)
+            })
+            .when(!is_new_tab_active, |el| el.hover(move |s| s.bg(hover_bg)))
+            .child(
+                Icon::new(IconName::Plus)
+                    .size(px(13.))
+                    .text_color(if is_new_tab_active { selected_fg } else { muted }),
+            )
+            .child(
                 div()
-                    .id("tab-new-tab")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .h(px(30.))
-                    .rounded_md()
-                    .bg(selected_bg)
-                    .text_color(selected_fg)
+                    .text_size(px(12.))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
                     .min_w(px(0.))
-                    .flex_shrink_1()
-                    .overflow_hidden()
-                    .child(
-                        Icon::default()
-                            .data(glyph::TERMINAL_PROMPT)
-                            .size(px(16.))
-                            .text_color(selected_fg),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .flex_shrink_1()
-                            .truncate()
-                            .child("New Tab"),
-                    )
-                    .child(
-                        Button::new("close-new-tab")
-                            .ghost()
-                            .icon(IconName::Close)
-                            .tooltip("Close tab")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                cx.stop_propagation();
-                                let fallback = this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
-                                this.select_tab(fallback, window, cx);
-                            })),
-                    ),
-            );
-        }
+                    .truncate()
+                    .child("New Tab"),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.select_tab(MainTab::NewTab, window, cx);
+            }));
 
-        // The `+` control lives outside the scrolling strip so it stays
-        // visible right next to the tabs across all views.
+        strip = strip.child(new_tab_item);
+
+        // 6. Quick add tab `+` button right next to `New Tab`
+        let add_btn = Button::new("add-tab-btn")
+            .ghost()
+            .xsmall()
+            .icon(Icon::new(IconName::Plus).size(px(14.)).text_color(muted))
+            .tooltip("New tab (⌘T)")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.select_tab(MainTab::NewTab, window, cx);
+            }));
+
+        strip = strip.child(div().flex_shrink_0().child(add_btn));
+
         div()
             .flex()
             .flex_row()
             .items_center()
             .flex_1()
             .min_w(px(0.))
-            .gap_1()
-            .child(strip.flex_shrink_1())
-            .child(
-                div().flex_shrink_0().child(
-                    Button::new("add-tab-btn")
-                        .ghost()
-                        .icon(Icon::new(IconName::Plus).size(px(15.)).text_color(muted))
-                        .tooltip("New tab (⌘T)")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.select_tab(MainTab::NewTab, window, cx);
-                        })),
-                ),
-            )
+            .child(strip)
     }
 
     /// ~28px band directly under the 40px header, spanning **only the pane
@@ -4415,9 +4507,9 @@ impl SshDeck {
                     .ghost()
                     .icon(Icon::default().data(glyph::TERMINAL_PROMPT).size(px(18.)))
                     .label("Terminal")
-                    .tooltip("Terminal")
+                    .tooltip("Open Local Terminal")
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.select_tab(MainTab::NewTab, window, cx);
+                        this.open_local_terminal(window, cx);
                     })),
             )
             .child(div().flex_1())
@@ -5965,6 +6057,19 @@ impl SshDeck {
                                     .items_center()
                                     .gap_2()
                                     // `#e6ebed` pills behind the ghost buttons.
+                                    .child(
+                                        div().bg(rgb(0xe6ebed)).rounded(px(8.)).child(
+                                            Button::new("new-tab-terminal")
+                                                .ghost()
+                                                .small()
+                                                .icon(Icon::default().data(glyph::TERMINAL_PROMPT).size(px(14.)))
+                                                .label("Terminal")
+                                                .tooltip("Open Local Terminal")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.open_local_terminal(window, cx);
+                                                })),
+                                        ),
+                                    )
                                     .child(
                                         div().bg(rgb(0xe6ebed)).rounded(px(8.)).child(
                                             Button::new("new-tab-workspace")
@@ -9149,5 +9254,30 @@ mod tests {
         assert!(parse_quick_connect("production").is_none());
         assert!(parse_quick_connect("database").is_none());
         assert!(parse_quick_connect("").is_none());
+    }
+
+    #[test]
+    fn local_terminal_instance_naming() {
+        let mut titles: Vec<String> = Vec::new();
+        let get_next_title = |titles: &[String]| {
+            let mut instance_num = 1;
+            while titles.iter().any(|t| t == &format!("Local Terminal ({instance_num})")) {
+                instance_num += 1;
+            }
+            format!("Local Terminal ({instance_num})")
+        };
+
+        let t1 = get_next_title(&titles);
+        assert_eq!(t1, "Local Terminal (1)");
+        titles.push(t1);
+
+        let t2 = get_next_title(&titles);
+        assert_eq!(t2, "Local Terminal (2)");
+        titles.push(t2);
+
+        // Remove (1), next should reuse (1)
+        titles.remove(0);
+        let t3 = get_next_title(&titles);
+        assert_eq!(t3, "Local Terminal (1)");
     }
 }
