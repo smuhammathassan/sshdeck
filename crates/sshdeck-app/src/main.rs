@@ -22,7 +22,7 @@ use gpui_kit::component::{
     scroll::ScrollableElement as _,
     tooltip::Tooltip,
     ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _, Root,
-    Sizable as _, Size, Theme, ThemeMode, ThemeRegistry, WindowExt,
+    Selectable as _, Sizable as _, Size, Theme, ThemeMode, ThemeRegistry, WindowExt,
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
@@ -3124,7 +3124,6 @@ impl SshDeck {
         // `themes/sshdeck.json`; upgrade by adding one and using it here.
         let header_bg = rgb(0x1d2033);
         let header_fg = rgb(0xffffff);
-        let win_w = f32::from(window.bounds().size.width);
 
         let actions = div()
             .flex()

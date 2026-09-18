@@ -1491,7 +1491,7 @@ impl SnippetsPane {
         )
     }
 
-    fn render_shell_history(&self, cx: &mut Context<Self>) -> Div {
+    fn render_shell_history(&self, cx: &mut Context<Self>) -> AnyElement {
         let filter_query = self.search_input.read(cx).value().to_lowercase();
         let entries: Vec<String> = self
             .history_entries
@@ -1639,6 +1639,7 @@ impl SnippetsPane {
                             }),
                     )
             }))
+            .into_any_element()
     }
 }
 
@@ -1655,7 +1656,7 @@ impl Render for SnippetsPane {
         let body: AnyElement = if form_open {
             self.render_form(cx).into_any_element()
         } else if self.show_shell_history {
-            self.render_shell_history(cx).into_any_element()
+            self.render_shell_history(cx)
         } else if !has_snippets {
             self.render_empty(cx).into_any_element()
         } else {
