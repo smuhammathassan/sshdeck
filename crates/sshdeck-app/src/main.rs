@@ -3348,6 +3348,10 @@ impl SshDeck {
             )
             .children(rows);
 
+        // The secret prompt must render here, not only in session view:
+        // password hosts stop at `prompt_for_secret` without opening a tab,
+        // so without this row the toast is a dead end with nowhere to type.
+        let secret = self.render_secret_prompt(cx);
         let centre = div()
             .flex()
             .flex_col()
@@ -3355,6 +3359,7 @@ impl SshDeck {
             .min_w(px(0.))
             .bg(content_bg)
             .overflow_hidden()
+            .when_some(secret, |el, prompt| el.child(prompt))
             .child(search_row)
             .child(toolbar)
             .child(grid);
