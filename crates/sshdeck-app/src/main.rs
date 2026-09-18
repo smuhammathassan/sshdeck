@@ -272,7 +272,7 @@ pub fn parse_quick_connect(raw: &str) -> Option<Host> {
     }
 
     let mut username = String::new();
-    let mut address = String::new();
+    let mut address;
     let mut port = 22u16;
 
     if let Some(rest) = raw.strip_prefix("ssh ") {
@@ -2396,8 +2396,9 @@ impl SshDeck {
         let pane_handle = pane.clone();
         pane.update(cx, |pane, _| {
             pane.set_header_title(host.label.clone());
+            let weak_action = weak.clone();
             pane.set_on_pane_action(move |action, pane, window, cx| {
-                weak.update(cx, |this, cx| {
+                weak_action.update(cx, |this, cx| {
                     this.pane_action(action, pane, window, cx);
                 })
                 .ok();
