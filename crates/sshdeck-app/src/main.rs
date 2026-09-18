@@ -3480,7 +3480,7 @@ impl SshDeck {
             })
             .pr_3()
             .border_b_1()
-            .border_color(rgba(0xffffff, 0.08))
+            .border_color(rgba(0xffffff14))
             .window_control_area(WindowControlArea::Drag)
             .child(self.render_tabs(cx))
             .child(actions)
@@ -3700,7 +3700,7 @@ impl SshDeck {
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = rgb(0x8d91a5);
         let selected_bg = rgb(0x25293d);
-        let selected_border = rgba(0xffffff, 0.10);
+        let selected_border = rgba(0xffffff1a);
         let selected_fg = rgb(0xffffff);
         let hover_bg = rgb(0x222638);
         let active = self.active;
@@ -3718,9 +3718,9 @@ impl SshDeck {
             .rounded(px(7.))
             .border_1()
             .border_color(if is_vaults_active {
-                rgba(0xffffff, 0.18)
+                rgba(0xffffff2e)
             } else {
-                rgba(0xffffff, 0.10)
+                rgba(0xffffff1a)
             })
             .bg(if is_vaults_active {
                 rgb(0x282c3f)
@@ -3729,7 +3729,7 @@ impl SshDeck {
             })
             .cursor_pointer()
             .flex_shrink_0()
-            .hover(|s| s.bg(rgb(0x2a2e44)).border_color(rgba(0xffffff, 0.18)))
+            .hover(|s| s.bg(rgb(0x2a2e44)).border_color(rgba(0xffffff2e)))
             .child(
                 Icon::default()
                     .data(glyph::VAULT)
@@ -3936,7 +3936,11 @@ impl SshDeck {
                         Icon::default()
                             .data(glyph::TERMINAL_PROMPT)
                             .size(px(14.))
-                            .text_color(if is_active { selected_fg } else { glyph_color }),
+                            .text_color(if is_active {
+                                Hsla::from(selected_fg)
+                            } else {
+                                glyph_color
+                            }),
                     )
             };
 
@@ -7739,11 +7743,6 @@ impl SshDeck {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_focused = self.workspace_focus == pane_index;
-        let border_color = if is_focused {
-            rgb(0x10b981)
-        } else {
-            rgba(0x8d91a530)
-        };
         let tabs_vec = tabs.to_vec();
 
         // 1. Tab headers
