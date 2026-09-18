@@ -1704,8 +1704,8 @@ impl SshDeck {
                                 this.connect(host, window, cx);
                             } else {
                                 let filtered = this.store.inventory().filtered(&query);
-                                if let Some(first) = filtered.first().cloned() {
-                                    this.connect(first, window, cx);
+                                if let Some(first) = filtered.first() {
+                                    this.connect((*first).clone(), window, cx);
                                 }
                             }
                         }
@@ -3138,7 +3138,7 @@ impl SshDeck {
     ///   "Connect to Selected Host", or double-clicking the host row.
     /// - `SSH keys & known hosts` → sidebar "Keys" button and the palette.
     /// - Theme toggle → palette "Toggle Light / Dark Theme".
-    fn render_header(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&mut self, _window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         // ponytail: the header is an always-dark chrome strip (`--main-bg`
         // `#1d2033`), so it keeps fixed dark hexes instead of theme tokens —
         // in Light mode the theme's `muted`/`foreground` would turn the tabs
