@@ -125,6 +125,7 @@ enum Kind {
     /// The host performs the action through `set_on_select`.
     Host,
     /// The app cannot do this yet; the reason is shown on the row.
+    #[allow(dead_code)]
     Unavailable(&'static str),
 }
 
