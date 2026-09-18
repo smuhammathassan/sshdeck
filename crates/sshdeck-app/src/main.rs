@@ -26,10 +26,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::{
-    div, point, px, rgb, rgba, AnyElement, App, AppContext as _, ClipboardItem, Context, Entity,
-    Focusable as _, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render, Rgba,
-    SharedString, Styled as _, Subscription, TitlebarOptions, Window, WindowControlArea,
-    WindowOptions,
+    actions, div, point, px, rgb, rgba, AnyElement, App, AppContext as _, ClipboardItem, Context,
+    Entity, Focusable as _, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
+    ParentElement as _, Render, Rgba, SharedString, Styled as _, Subscription, TitlebarOptions,
+    Window, WindowControlArea, WindowOptions,
 };
 use keys_pane::KeysPane;
 use logs_pane::LogsPane;
@@ -44,6 +44,8 @@ use sshdeck_vault::Vault;
 use terminal::{
     PaneHeaderAction, PaneStatus, TerminalOptions, TerminalPane, TerminalScheme, SCHEMES,
 };
+
+actions!(sshdeck, [OpenPalette, FindInTerminal]);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -64,6 +66,12 @@ fn main() {
         .run(|cx| {
             gpui_kit::init(cx);
             init_theme(cx);
+            cx.bind_keys([
+                KeyBinding::new("cmd-k", OpenPalette, None),
+                KeyBinding::new("ctrl-k", OpenPalette, None),
+                KeyBinding::new("cmd-f", FindInTerminal, None),
+                KeyBinding::new("ctrl-f", FindInTerminal, None),
+            ]);
             cx.spawn(async move |cx| {
                 cx.open_window(window_options(), |window, cx| {
                     let view = cx.new(|cx| SshDeck::new(window, cx));
@@ -170,6 +178,7 @@ fn env_password() -> Option<String> {
 const DEFAULT_THEME: &str = "sshdeck Dark";
 
 /// The light theme name — the app now defaults to Light, header stays dark.
+#[allow(dead_code)]
 const DEFAULT_LIGHT_THEME: &str = "sshdeck Light";
 
 /// Registers the bundled Termius-matched theme and makes [`DEFAULT_THEME`] the
@@ -253,12 +262,7 @@ const START_PANE_VALUES: &str =
 /// the value is not a known pane; the caller warns and keeps the default rather
 /// than refusing to start.
 fn parse_start_pane(value: &str) -> Option<StartPane> {
-    let normalized = value
-        .trim()
-        .to_lowercase()
-        .replace('-', "")
-        .replace('_', "")
-        .replace(' ', "");
+    let normalized = value.trim().to_lowercase().replace(['-', '_', ' '], "");
     match normalized.as_str() {
         "hosts" => Some(StartPane::Nav(LeftNav::Hosts)),
         "keychain" => Some(StartPane::Nav(LeftNav::Keychain)),
@@ -303,7 +307,7 @@ fn host_subtitle(host: &Host) -> String {
     }
     if !host.username.is_empty() {
         // One login per protocol: `ssh, telnet, root, root`.
-        let logins = std::iter::repeat(host.username.clone()).take(tokens.len());
+        let logins = std::iter::repeat_n(host.username.clone(), tokens.len());
         tokens.extend(logins);
     }
     tokens.join(", ")
@@ -371,7 +375,7 @@ fn details_width(win_w: f32) -> f32 {
 /// Max popover width: 320px capped at 90vw so popovers never overflow narrow
 /// windows. Pure so the clamp has a test.
 fn popover_max_w(win_w: f32) -> f32 {
-    (win_w * 0.9).min(320.0).max(160.0)
+    (win_w * 0.9).clamp(160.0, 320.0)
 }
 
 /// Max popover height: 70vh, always paired with `overflow_y_scrollbar` at the
@@ -602,8 +606,8 @@ fn push_history(history: &mut Vec<String>, entry: String) {
 enum WorkspaceNode {
     /// No tiles yet; the workspace seeds it from the focused session.
     Empty,
-    /// One tiled session, by index into `sessions`.
-    Pane(usize),
+    /// One tiled pane with one or more tabs and the active tab index.
+    Pane { tabs: Vec<usize>, active: usize },
     /// A split of two or more nested tilings.
     Split {
         dir: SplitDir,
@@ -630,118 +634,560 @@ impl SplitDir {
     }
 }
 
-/// Flattens the tiling into session indexes in tile order. Pure so the tree
+/// Flattens the tiling into session indexes in tab order. Pure so the tree
 /// bookkeeping has a test.
 fn workspace_leaves(node: &WorkspaceNode) -> Vec<usize> {
     match node {
         WorkspaceNode::Empty => Vec::new(),
-        WorkspaceNode::Pane(index) => vec![*index],
+        WorkspaceNode::Pane { tabs, .. } => tabs.clone(),
         WorkspaceNode::Split { children, .. } => {
             children.iter().flat_map(workspace_leaves).collect()
         }
     }
 }
 
-/// Splits the focused tile to show `index`: the focused leaf becomes a
-/// two-child split across the parent axis holding the old and new tiles, so
-/// repeated splits nest instead of flattening. An already-tiled session is
-/// focused, not duplicated, so every tile keeps its own `TerminalPane`
-/// entity. Pure so the split bookkeeping has a test. Returns the tree and
-/// the new focus as a flattened leaf position.
-fn workspace_insert(node: &WorkspaceNode, focus: usize, index: usize) -> (WorkspaceNode, usize) {
-    let leaves = workspace_leaves(node);
-    if let Some(position) = leaves.iter().position(|&tile| tile == index) {
-        return (node.clone(), position);
+/// Returns the total number of pane leaves in the split tree.
+fn workspace_panes_count(node: &WorkspaceNode) -> usize {
+    match node {
+        WorkspaceNode::Empty => 0,
+        WorkspaceNode::Pane { .. } => 1,
+        WorkspaceNode::Split { children, .. } => children.iter().map(workspace_panes_count).sum(),
     }
-    if leaves.is_empty() {
-        return (WorkspaceNode::Pane(index), 0);
-    }
-    // A stale focus splits the last tile rather than panicking.
-    let target = leaves
-        .get(focus)
-        .copied()
-        .unwrap_or(leaves[leaves.len() - 1]);
-    let (out, _) = insert_at(node, target, index, SplitDir::Row);
-    // The insert above always plants `index`, so this cannot fail.
-    let position = workspace_leaves(&out)
-        .iter()
-        .position(|&tile| tile == index)
-        .unwrap_or(0);
-    (out, position)
 }
 
-/// Replaces the leaf showing `target` with a two-child split across the
-/// parent axis. Returns the tree and whether the swap happened.
-fn insert_at(
+/// Returns the active session in each pane leaf.
+#[allow(dead_code)]
+fn workspace_active_leaves(node: &WorkspaceNode) -> Vec<usize> {
+    match node {
+        WorkspaceNode::Empty => Vec::new(),
+        WorkspaceNode::Pane { tabs, active } => {
+            if let Some(&s) = tabs.get(*active) {
+                vec![s]
+            } else if let Some(&s) = tabs.first() {
+                vec![s]
+            } else {
+                Vec::new()
+            }
+        }
+        WorkspaceNode::Split { children, .. } => {
+            children.iter().flat_map(workspace_active_leaves).collect()
+        }
+    }
+}
+
+/// Activates `target` session in whichever pane contains it.
+/// Returns the updated tree and the pane index if found.
+fn workspace_activate_session(
     node: &WorkspaceNode,
     target: usize,
-    index: usize,
-    dir: SplitDir,
-) -> (WorkspaceNode, bool) {
-    match node {
-        WorkspaceNode::Pane(shown) if *shown == target => (
-            WorkspaceNode::Split {
-                dir,
-                weights: vec![1.0, 1.0],
-                children: vec![WorkspaceNode::Pane(*shown), WorkspaceNode::Pane(index)],
-            },
-            true,
-        ),
-        WorkspaceNode::Split {
-            dir: parent,
-            weights,
-            children,
-        } => {
-            let mut out = Vec::with_capacity(children.len());
-            let mut done = false;
-            for child in children {
-                if done {
-                    out.push(child.clone());
+) -> (WorkspaceNode, Option<usize>) {
+    let mut pane_counter = 0;
+    let mut found_pane = None;
+
+    fn rec(
+        node: &WorkspaceNode,
+        target: usize,
+        counter: &mut usize,
+        found: &mut Option<usize>,
+    ) -> WorkspaceNode {
+        match node {
+            WorkspaceNode::Empty => WorkspaceNode::Empty,
+            WorkspaceNode::Pane { tabs, active } => {
+                let current_pane = *counter;
+                *counter += 1;
+                if let Some(pos) = tabs.iter().position(|&s| s == target) {
+                    *found = Some(current_pane);
+                    WorkspaceNode::Pane {
+                        tabs: tabs.clone(),
+                        active: pos,
+                    }
                 } else {
-                    let (next, hit) = insert_at(child, target, index, parent.other());
-                    out.push(next);
-                    done = hit;
+                    WorkspaceNode::Pane {
+                        tabs: tabs.clone(),
+                        active: *active,
+                    }
                 }
             }
-            (
+            WorkspaceNode::Split {
+                dir,
+                weights,
+                children,
+            } => {
+                let next_children = children
+                    .iter()
+                    .map(|c| rec(c, target, counter, found))
+                    .collect();
                 WorkspaceNode::Split {
-                    dir: *parent,
+                    dir: *dir,
                     weights: weights.clone(),
-                    children: out,
-                },
-                done,
-            )
+                    children: next_children,
+                }
+            }
         }
-        _ => (node.clone(), false),
     }
+
+    let out = rec(node, target, &mut pane_counter, &mut found_pane);
+    (out, found_pane)
 }
 
-/// Repairs the tiling after the session at `closed` is removed: tiles showing
-/// it are dropped, later indexes shift down, emptied splits are pruned and
-/// single-child splits collapse. Structural edits reset to equal shares (no
-/// writer of uneven weights exists yet). Pure so the bookkeeping has a test.
-/// Returns the tree and the focus clamped into the remaining tiles.
-fn workspace_remove(node: &WorkspaceNode, focus: usize, closed: usize) -> (WorkspaceNode, usize) {
-    let out = remove_at(node, closed).unwrap_or(WorkspaceNode::Empty);
-    let end = workspace_leaves(&out).len().saturating_sub(1);
-    (out, focus.min(end))
+/// Splits the focused pane or seeds the workspace with `index`.
+/// If `index` is already tiled, its tab is activated.
+fn workspace_insert(node: &WorkspaceNode, focus: usize, index: usize) -> (WorkspaceNode, usize) {
+    let (activated, found) = workspace_activate_session(node, index);
+    if let Some(p) = found {
+        return (activated, p);
+    }
+    let panes = workspace_panes_count(node);
+    if panes == 0 {
+        return (
+            WorkspaceNode::Pane {
+                tabs: vec![index],
+                active: 0,
+            },
+            0,
+        );
+    }
+    let target = focus.min(panes.saturating_sub(1));
+    let mut counter = 0;
+    let mut new_focus = 0;
+
+    fn split_at(
+        node: &WorkspaceNode,
+        target_pane: usize,
+        new_session: usize,
+        dir: SplitDir,
+        counter: &mut usize,
+        new_focus: &mut usize,
+    ) -> WorkspaceNode {
+        match node {
+            WorkspaceNode::Empty => WorkspaceNode::Pane {
+                tabs: vec![new_session],
+                active: 0,
+            },
+            WorkspaceNode::Pane { tabs, active } => {
+                let current = *counter;
+                *counter += 1;
+                if current == target_pane {
+                    *new_focus = current + 1;
+                    WorkspaceNode::Split {
+                        dir,
+                        weights: vec![1.0, 1.0],
+                        children: vec![
+                            WorkspaceNode::Pane {
+                                tabs: tabs.clone(),
+                                active: *active,
+                            },
+                            WorkspaceNode::Pane {
+                                tabs: vec![new_session],
+                                active: 0,
+                            },
+                        ],
+                    }
+                } else {
+                    WorkspaceNode::Pane {
+                        tabs: tabs.clone(),
+                        active: *active,
+                    }
+                }
+            }
+            WorkspaceNode::Split {
+                dir: parent_dir,
+                weights,
+                children,
+            } => {
+                let next_dir = parent_dir.other();
+                let next_children = children
+                    .iter()
+                    .map(|c| split_at(c, target_pane, new_session, next_dir, counter, new_focus))
+                    .collect();
+                WorkspaceNode::Split {
+                    dir: *parent_dir,
+                    weights: weights.clone(),
+                    children: next_children,
+                }
+            }
+        }
+    }
+
+    let out = split_at(
+        node,
+        target,
+        index,
+        SplitDir::Row,
+        &mut counter,
+        &mut new_focus,
+    );
+    (out, new_focus)
 }
 
-/// Drops the closed session and shifts later indexes down. `None` means
-/// nothing remains; a split left with one child collapses into it.
-fn remove_at(node: &WorkspaceNode, closed: usize) -> Option<WorkspaceNode> {
+/// Adds a session tab into a specific pane leaf.
+#[allow(dead_code)]
+fn workspace_add_tab_to_pane(
+    node: &WorkspaceNode,
+    target_pane: usize,
+    session: usize,
+) -> WorkspaceNode {
+    let mut counter = 0;
+    fn rec(
+        node: &WorkspaceNode,
+        target: usize,
+        session: usize,
+        counter: &mut usize,
+    ) -> WorkspaceNode {
+        match node {
+            WorkspaceNode::Empty => WorkspaceNode::Pane {
+                tabs: vec![session],
+                active: 0,
+            },
+            WorkspaceNode::Pane { tabs, .. } => {
+                let cur = *counter;
+                *counter += 1;
+                if cur == target {
+                    let mut next_tabs = tabs.clone();
+                    if !next_tabs.contains(&session) {
+                        next_tabs.push(session);
+                    }
+                    let active = next_tabs.iter().position(|&s| s == session).unwrap_or(0);
+                    WorkspaceNode::Pane {
+                        tabs: next_tabs,
+                        active,
+                    }
+                } else {
+                    node.clone()
+                }
+            }
+            WorkspaceNode::Split {
+                dir,
+                weights,
+                children,
+            } => {
+                let next_ch = children
+                    .iter()
+                    .map(|c| rec(c, target, session, counter))
+                    .collect();
+                WorkspaceNode::Split {
+                    dir: *dir,
+                    weights: weights.clone(),
+                    children: next_ch,
+                }
+            }
+        }
+    }
+    rec(node, target_pane, session, &mut counter)
+}
+
+/// Switches active tab in a specific pane leaf.
+fn workspace_switch_tab(
+    node: &WorkspaceNode,
+    target_pane: usize,
+    tab_index: usize,
+) -> WorkspaceNode {
+    let mut counter = 0;
+    fn rec(node: &WorkspaceNode, target: usize, tab: usize, counter: &mut usize) -> WorkspaceNode {
+        match node {
+            WorkspaceNode::Empty => WorkspaceNode::Empty,
+            WorkspaceNode::Pane { tabs, .. } => {
+                let cur = *counter;
+                *counter += 1;
+                if cur == target {
+                    let active = tab.min(tabs.len().saturating_sub(1));
+                    WorkspaceNode::Pane {
+                        tabs: tabs.clone(),
+                        active,
+                    }
+                } else {
+                    node.clone()
+                }
+            }
+            WorkspaceNode::Split {
+                dir,
+                weights,
+                children,
+            } => {
+                let next_ch = children
+                    .iter()
+                    .map(|c| rec(c, target, tab, counter))
+                    .collect();
+                WorkspaceNode::Split {
+                    dir: *dir,
+                    weights: weights.clone(),
+                    children: next_ch,
+                }
+            }
+        }
+    }
+    rec(node, target_pane, tab_index, &mut counter)
+}
+
+/// Moves a tab from `(from_pane, from_tab)` to `(to_pane, to_pos)`.
+fn workspace_move_tab(
+    node: &WorkspaceNode,
+    from_pane: usize,
+    from_tab: usize,
+    to_pane: usize,
+    to_pos: usize,
+) -> WorkspaceNode {
+    let mut counter = 0;
+    let mut extracted_session = None;
+    fn extract(
+        node: &WorkspaceNode,
+        target_pane: usize,
+        tab_idx: usize,
+        counter: &mut usize,
+        extracted: &mut Option<usize>,
+    ) -> Option<WorkspaceNode> {
+        match node {
+            WorkspaceNode::Empty => None,
+            WorkspaceNode::Pane { tabs, active } => {
+                let cur = *counter;
+                *counter += 1;
+                if cur == target_pane {
+                    let mut next_tabs = tabs.clone();
+                    if tab_idx < next_tabs.len() {
+                        let sess = next_tabs.remove(tab_idx);
+                        *extracted = Some(sess);
+                    }
+                    if next_tabs.is_empty() {
+                        None
+                    } else {
+                        let next_active = (*active).min(next_tabs.len() - 1);
+                        Some(WorkspaceNode::Pane {
+                            tabs: next_tabs,
+                            active: next_active,
+                        })
+                    }
+                } else {
+                    Some(node.clone())
+                }
+            }
+            WorkspaceNode::Split { dir, children, .. } => {
+                let kept: Vec<WorkspaceNode> = children
+                    .iter()
+                    .filter_map(|c| extract(c, target_pane, tab_idx, counter, extracted))
+                    .collect();
+                match kept.len() {
+                    0 => None,
+                    1 => kept.into_iter().next(),
+                    _ => Some(WorkspaceNode::Split {
+                        dir: *dir,
+                        weights: vec![1.0; kept.len()],
+                        children: kept,
+                    }),
+                }
+            }
+        }
+    }
+
+    let without_tab = extract(
+        node,
+        from_pane,
+        from_tab,
+        &mut counter,
+        &mut extracted_session,
+    )
+    .unwrap_or(WorkspaceNode::Empty);
+    let Some(session) = extracted_session else {
+        return node.clone();
+    };
+
+    let mut insert_counter = 0;
+    fn insert(
+        node: &WorkspaceNode,
+        target_pane: usize,
+        pos: usize,
+        session: usize,
+        counter: &mut usize,
+    ) -> WorkspaceNode {
+        match node {
+            WorkspaceNode::Empty => WorkspaceNode::Pane {
+                tabs: vec![session],
+                active: 0,
+            },
+            WorkspaceNode::Pane { tabs, .. } => {
+                let cur = *counter;
+                *counter += 1;
+                if cur == target_pane {
+                    let mut next_tabs = tabs.clone();
+                    let clamped = pos.min(next_tabs.len());
+                    next_tabs.insert(clamped, session);
+                    WorkspaceNode::Pane {
+                        tabs: next_tabs,
+                        active: clamped,
+                    }
+                } else {
+                    node.clone()
+                }
+            }
+            WorkspaceNode::Split {
+                dir,
+                weights,
+                children,
+            } => {
+                let next_ch = children
+                    .iter()
+                    .map(|c| insert(c, target_pane, pos, session, counter))
+                    .collect();
+                WorkspaceNode::Split {
+                    dir: *dir,
+                    weights: weights.clone(),
+                    children: next_ch,
+                }
+            }
+        }
+    }
+
+    insert(&without_tab, to_pane, to_pos, session, &mut insert_counter)
+}
+
+/// Splits `target_pane` with `session` across `dir` (before or after).
+fn workspace_split_pane_with_session(
+    node: &WorkspaceNode,
+    target_pane: usize,
+    session: usize,
+    dir: SplitDir,
+    place_after: bool,
+) -> WorkspaceNode {
+    let clean = remove_session_no_renumber(node, session).unwrap_or(WorkspaceNode::Empty);
+    if clean == WorkspaceNode::Empty {
+        return WorkspaceNode::Pane {
+            tabs: vec![session],
+            active: 0,
+        };
+    }
+
+    let mut counter = 0;
+    fn split_pane(
+        node: &WorkspaceNode,
+        target: usize,
+        sess: usize,
+        dir: SplitDir,
+        place_after: bool,
+        counter: &mut usize,
+    ) -> WorkspaceNode {
+        match node {
+            WorkspaceNode::Empty => WorkspaceNode::Pane {
+                tabs: vec![sess],
+                active: 0,
+            },
+            WorkspaceNode::Pane { tabs, active } => {
+                let cur = *counter;
+                *counter += 1;
+                if cur == target {
+                    let old_pane = WorkspaceNode::Pane {
+                        tabs: tabs.clone(),
+                        active: *active,
+                    };
+                    let new_pane = WorkspaceNode::Pane {
+                        tabs: vec![sess],
+                        active: 0,
+                    };
+                    let children = if place_after {
+                        vec![old_pane, new_pane]
+                    } else {
+                        vec![new_pane, old_pane]
+                    };
+                    WorkspaceNode::Split {
+                        dir,
+                        weights: vec![1.0, 1.0],
+                        children,
+                    }
+                } else {
+                    node.clone()
+                }
+            }
+            WorkspaceNode::Split {
+                dir: parent_dir,
+                weights,
+                children,
+            } => {
+                let next_ch = children
+                    .iter()
+                    .map(|c| split_pane(c, target, sess, dir, place_after, counter))
+                    .collect();
+                WorkspaceNode::Split {
+                    dir: *parent_dir,
+                    weights: weights.clone(),
+                    children: next_ch,
+                }
+            }
+        }
+    }
+
+    split_pane(&clean, target_pane, session, dir, place_after, &mut counter)
+}
+
+/// Removes a session without renumbering other sessions (used for drag & drop).
+fn remove_session_no_renumber(node: &WorkspaceNode, target: usize) -> Option<WorkspaceNode> {
     match node {
         WorkspaceNode::Empty => None,
-        WorkspaceNode::Pane(index) if *index == closed => None,
-        WorkspaceNode::Pane(index) => Some(WorkspaceNode::Pane(if *index > closed {
-            index - 1
-        } else {
-            *index
-        })),
+        WorkspaceNode::Pane { tabs, active } => {
+            let next_tabs: Vec<usize> = tabs.iter().copied().filter(|&s| s != target).collect();
+            if next_tabs.is_empty() {
+                None
+            } else {
+                let next_active = (*active).min(next_tabs.len() - 1);
+                Some(WorkspaceNode::Pane {
+                    tabs: next_tabs,
+                    active: next_active,
+                })
+            }
+        }
         WorkspaceNode::Split { dir, children, .. } => {
             let kept: Vec<WorkspaceNode> = children
                 .iter()
-                .filter_map(|child| remove_at(child, closed))
+                .filter_map(|c| remove_session_no_renumber(c, target))
+                .collect();
+            match kept.len() {
+                0 => None,
+                1 => kept.into_iter().next(),
+                _ => Some(WorkspaceNode::Split {
+                    dir: *dir,
+                    weights: vec![1.0; kept.len()],
+                    children: kept,
+                }),
+            }
+        }
+    }
+}
+
+/// Repairs the tiling after session `closed` is removed:
+/// closed tab is dropped, later indexes shift down, empty panes pruned,
+/// single-child splits collapse.
+fn workspace_remove(node: &WorkspaceNode, focus: usize, closed: usize) -> (WorkspaceNode, usize) {
+    let out = remove_session(node, closed).unwrap_or(WorkspaceNode::Empty);
+    let panes = workspace_panes_count(&out);
+    (out, focus.min(panes.saturating_sub(1)))
+}
+
+fn remove_session(node: &WorkspaceNode, closed: usize) -> Option<WorkspaceNode> {
+    match node {
+        WorkspaceNode::Empty => None,
+        WorkspaceNode::Pane { tabs, active } => {
+            let mut next_tabs: Vec<usize> = Vec::new();
+            for &s in tabs {
+                if s == closed {
+                    continue;
+                }
+                if s > closed {
+                    next_tabs.push(s - 1);
+                } else {
+                    next_tabs.push(s);
+                }
+            }
+            if next_tabs.is_empty() {
+                None
+            } else {
+                let next_active = (*active).min(next_tabs.len() - 1);
+                Some(WorkspaceNode::Pane {
+                    tabs: next_tabs,
+                    active: next_active,
+                })
+            }
+        }
+        WorkspaceNode::Split { dir, children, .. } => {
+            let kept: Vec<WorkspaceNode> = children
+                .iter()
+                .filter_map(|child| remove_session(child, closed))
                 .collect();
             match kept.len() {
                 0 => None,
@@ -827,6 +1273,7 @@ impl HostSort {
 /// holds a transport never outlives its own visibility.
 enum Overlay {
     Settings(Entity<SettingsView>),
+    #[allow(dead_code)]
     Keys(Entity<KeysPane>),
 }
 
@@ -933,6 +1380,8 @@ struct SshDeck {
     workspace_direction: Option<SplitDir>,
     /// When true the workspace shows only the focused tile.
     workspace_maximized: bool,
+    /// Dragged tab state `(from_pane_leaf_index, from_tab_index)` when moving/splitting.
+    dragged_tab: Option<(usize, usize)>,
     /// Sidebar suggestion history (bounded by [`MAX_HISTORY_ENTRIES`]) and its
     /// inline form: three inputs plus a visibility flag.
     history: Vec<String>,
@@ -996,6 +1445,43 @@ fn migrate_legacy_password_refs(store: &mut HostStore, vault: &mut Vault) -> usi
         let _ = store.save();
     }
     migrated
+}
+
+fn current_time_str() -> String {
+    use std::time::SystemTime;
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+fn current_user_initials() -> String {
+    if let Ok(user) = std::env::var("USER") {
+        let parts: Vec<&str> = user.split('.').collect();
+        if parts.len() >= 2 {
+            let first = parts[0].chars().next().unwrap_or('U').to_ascii_uppercase();
+            let second = parts[1].chars().next().unwrap_or('S').to_ascii_uppercase();
+            return format!("{first}{second}");
+        }
+        let mut chars = user.chars();
+        if let Some(c) = chars.next() {
+            let second = chars.next().unwrap_or(' ').to_ascii_uppercase();
+            return format!(
+                "{}{}",
+                c.to_ascii_uppercase(),
+                if second != ' ' {
+                    second.to_string()
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+    "U".to_string()
 }
 
 impl SshDeck {
@@ -1163,6 +1649,7 @@ impl SshDeck {
             workspace_focus: 0,
             workspace_direction: None,
             workspace_maximized: false,
+            dragged_tab: None,
             history: Vec::new(),
             history_form_open: false,
             hist_who,
@@ -1206,6 +1693,28 @@ impl SshDeck {
             });
         }
         view
+    }
+
+    fn handle_open_palette(
+        &mut self,
+        _: &OpenPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_palette(window, cx);
+    }
+
+    fn handle_find_in_terminal(
+        &mut self,
+        _: &FindInTerminal,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = self.active {
+            if let Some(session) = self.sessions.get(active) {
+                session.pane.update(cx, |pane, cx| pane.open_search(cx));
+            }
+        }
     }
 
     /// Connects to one `SSHDECK_AUTOCONNECT` target by id or label, if it exists.
@@ -1705,14 +2214,10 @@ impl SshDeck {
         self._subscriptions.push(subscription);
 
         let status = pane.read(cx).status();
-        let failed = match &status.state {
-            SessionState::Failed { message } => Some(message.clone()),
-            _ => None,
-        };
         self.sessions.push(Session {
             host: host.id.clone(),
             pane: pane.clone(),
-            status,
+            status: status.clone(),
         });
         self.last_session_host = Some(host.id.clone());
         let index = self.sessions.len() - 1;
@@ -1733,9 +2238,10 @@ impl SshDeck {
             host.username.clone()
         };
         let logs_pane = self.ensure_logs_pane(window, cx);
+        let time_str = current_time_str();
         logs_pane.update(cx, |p, cx| {
             p.append(
-                "Today",
+                &time_str,
                 "Connected",
                 user,
                 "session",
@@ -1746,6 +2252,10 @@ impl SshDeck {
             );
         });
 
+        let failed = match &status.state {
+            SessionState::Failed { message } => Some(message.clone()),
+            _ => None,
+        };
         if let Some(message) = failed {
             window.push_notification(
                 Notification::error(format!("{} could not connect: {message}", host.label)),
@@ -1755,6 +2265,7 @@ impl SshDeck {
         cx.notify();
     }
 
+    #[allow(dead_code)]
     fn connected_count(&self) -> usize {
         self.sessions
             .iter()
@@ -1790,6 +2301,7 @@ impl SshDeck {
         self.show_overlay(Some(Overlay::Settings(view)), window, cx);
     }
 
+    #[allow(dead_code)]
     fn open_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.overlay, Some(Overlay::Keys(_))) {
             self.close_overlay(window, cx);
@@ -1868,6 +2380,30 @@ impl SshDeck {
             return pane;
         }
         let pane = cx.new(|cx| SnippetsPane::new(window, cx));
+        let root = cx.entity().downgrade();
+        pane.update(cx, |p, _| {
+            p.set_on_execute(move |text, window, cx| {
+                let text = text.to_string();
+                root.update(cx, |this, cx| {
+                    if let Some(active) = this.active {
+                        if let Some(session) = this.sessions.get(active) {
+                            session.pane.update(cx, |p, cx| {
+                                p.send_text(&text);
+                                p.focus(window, cx);
+                            });
+                            window.push_notification(
+                                Notification::success("Snippet sent to terminal"),
+                                cx,
+                            );
+                            return;
+                        }
+                    }
+                    window
+                        .push_notification(Notification::warning("No active terminal session"), cx);
+                })
+                .ok();
+            });
+        });
         self.snippets_pane = Some(pane.clone());
         pane
     }
@@ -1931,7 +2467,10 @@ impl SshDeck {
             // Seed the workspace from the focused session on first entry.
             if workspace_leaves(&self.workspace).is_empty() {
                 if let Some(active) = self.active {
-                    self.workspace = WorkspaceNode::Pane(active);
+                    self.workspace = WorkspaceNode::Pane {
+                        tabs: vec![active],
+                        active: 0,
+                    };
                     self.workspace_focus = 0;
                 }
             }
@@ -2043,9 +2582,10 @@ impl SshDeck {
             .unwrap_or_else(|| session.host.to_string());
         let host_ep = host_opt.as_ref().map(|h| h.endpoint()).unwrap_or_default();
         let logs_pane = self.ensure_logs_pane(window, cx);
+        let time_str = current_time_str();
         logs_pane.update(cx, |p, cx| {
             p.append(
-                "Today",
+                &time_str,
                 "Closed",
                 "user",
                 "session",
@@ -2348,6 +2888,15 @@ impl SshDeck {
             // The Update pill is decorative; hide it below ~700px so the tab
             // strip and the `+` control keep their room.
             .when(win_w >= 700.0, |el| el.child(update_pill))
+            .child(
+                Button::new("command-palette-btn")
+                    .ghost()
+                    .icon(IconName::Search)
+                    .tooltip("Command Palette (⌘K)")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_palette(window, cx);
+                    })),
+            )
             .child(
                 Button::new("notifications")
                     .ghost()
@@ -3240,45 +3789,6 @@ impl SshDeck {
                         this.select_tab(MainTab::NewTab, window, cx);
                     })),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        Button::new("vault-serial")
-                            .small()
-                            .ghost()
-                            .icon(Icon::default().data(glyph::SERIAL).size(px(18.)))
-                            .label("Serial")
-                            .tooltip("Open serial console")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.select_tab(MainTab::NewTab, window, cx);
-                                window.push_notification(
-                                    Notification::info(
-                                        "Serial connection: configure port in session",
-                                    ),
-                                    cx,
-                                );
-                            })),
-                    )
-                    // Up-arrow badge Termius pins to Serial: a text arrow
-                    // avoids an unproven `IconName` (missing assets render
-                    // as nothing — see AGENTS.md icon errata).
-                    .child(
-                        div()
-                            .size(px(16.))
-                            .rounded_full()
-                            .bg(rgb(0xd5dde0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(11.))
-                            .text_color(rgb(0x798c94))
-                            .child("↑"),
-                    ),
-            )
             .child(div().flex_1())
             .child(
                 Button::new("vault-view-grid")
@@ -3354,46 +3864,21 @@ impl SshDeck {
                     })),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .size(px(32.))
-                            .rounded(px(8.))
-                            .bg(rgb(0xe67e22))
-                            .border_2()
-                            .border_color(rgb(0x2091f6))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .text_color(rgb(0xffffff))
-                            .child("MH"),
-                    )
-                    .child(
-                        div()
-                            .id("btn-vault-add-member")
-                            .size(px(32.))
-                            .rounded(px(8.))
-                            .bg(rgb(0xd5dde0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .text_color(cx.theme().foreground)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0xa4b3ba)))
-                            .child("+")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.vault_info_open = !this.vault_info_open;
-                                cx.notify();
-                            })),
-                    ),
+                div().flex().flex_row().items_center().gap_1().child(
+                    div()
+                        .size(px(32.))
+                        .rounded(px(8.))
+                        .bg(rgb(0xe67e22))
+                        .border_2()
+                        .border_color(rgb(0x2091f6))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .font_weight(gpui_kit::FontWeight::BOLD)
+                        .text_color(rgb(0xffffff))
+                        .child(current_user_initials()),
+                ),
             );
 
         // Host cards — responsive column chunking based on available width
@@ -3430,10 +3915,10 @@ impl SshDeck {
 
         match self.host_sort {
             HostSort::LabelAsc => {
-                filtered.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+                filtered.sort_by_key(|a| a.label.to_lowercase());
             }
             HostSort::LabelDesc => {
-                filtered.sort_by(|a, b| b.label.to_lowercase().cmp(&a.label.to_lowercase()));
+                filtered.sort_by_key(|b| std::cmp::Reverse(b.label.to_lowercase()));
             }
             HostSort::Address => {
                 filtered.sort_by(|a, b| a.address.cmp(&b.address));
@@ -4805,13 +5290,19 @@ impl SshDeck {
                             )
                             .child(
                                 div()
+                                    .id("btn-new-tab-cmd-k")
                                     .px_2()
                                     .py_1()
                                     .rounded(px(4.))
                                     .bg(cx.theme().muted)
                                     .text_xs()
                                     .text_color(muted)
-                                    .child("⌘+K"),
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(cx.theme().border))
+                                    .child("⌘+K")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_palette(window, cx);
+                                    })),
                             ),
                     )
                     // Recent connections header
@@ -5874,9 +6365,12 @@ impl SshDeck {
     /// tile and toggles back. The right sidebar docks beside the tiles, as in
     /// the session view.
     fn render_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if workspace_leaves(&self.workspace).is_empty() {
+        if workspace_panes_count(&self.workspace) == 0 {
             if let Some(active) = self.active {
-                self.workspace = WorkspaceNode::Pane(active);
+                self.workspace = WorkspaceNode::Pane {
+                    tabs: vec![active],
+                    active: 0,
+                };
                 self.workspace_focus = 0;
             }
         }
@@ -5917,10 +6411,37 @@ impl SshDeck {
                 )
                 .into_any_element()
         } else if maximized {
-            // Only the focused tile; the leaf position doubles as its id.
-            let at = focus.min(leaves.len() - 1);
-            match leaves.get(at).copied() {
-                Some(index) => self.render_workspace_tile(index, at, cx),
+            let panes = workspace_panes_count(&self.workspace);
+            let at = focus.min(panes.saturating_sub(1));
+            let mut counter = 0;
+            fn find_pane(
+                node: &WorkspaceNode,
+                target: usize,
+                counter: &mut usize,
+            ) -> Option<(Vec<usize>, usize)> {
+                match node {
+                    WorkspaceNode::Empty => None,
+                    WorkspaceNode::Pane { tabs, active } => {
+                        let cur = *counter;
+                        *counter += 1;
+                        if cur == target {
+                            Some((tabs.clone(), *active))
+                        } else {
+                            None
+                        }
+                    }
+                    WorkspaceNode::Split { children, .. } => {
+                        for c in children {
+                            if let Some(res) = find_pane(c, target, counter) {
+                                return Some(res);
+                            }
+                        }
+                        None
+                    }
+                }
+            }
+            match find_pane(&self.workspace, at, &mut counter) {
+                Some((tabs, active)) => self.render_workspace_pane(&tabs, active, at, window, cx),
                 None => div().flex_1().into_any_element(),
             }
         } else {
@@ -5943,6 +6464,32 @@ impl SshDeck {
                     .text_color(muted)
                     .child("Workspace"),
             )
+            .when(self.dragged_tab.is_some(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py_0p5()
+                        .rounded(px(4.))
+                        .bg(rgb(0x2091f6))
+                        .text_xs()
+                        .text_color(rgb(0xffffff))
+                        .child("Moving tab — click a drop zone or")
+                        .child(
+                            Button::new("cancel-drag")
+                                .ghost()
+                                .xsmall()
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dragged_tab = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(div().flex_1())
             .child(
                 Button::new("ws-direction")
@@ -6014,11 +6561,7 @@ impl SshDeck {
             .into_any_element()
     }
 
-    /// Renders one tiling node: a pane becomes a click-to-focus tile, a split
-    /// becomes a flex row (or column) with an 8px gutter whose children flex
-    /// by their settled `weights` share. `root_dir` overrides only the
-    /// outermost split's axis; narrow windows stack every level. `pos` counts
-    /// flattened leaves so clicks land on the focused leaf.
+    /// Renders one tiling node: a multi-tab pane leaf or a split of children.
     fn render_workspace_node(
         &mut self,
         node: &WorkspaceNode,
@@ -6030,10 +6573,10 @@ impl SshDeck {
     ) -> AnyElement {
         match node {
             WorkspaceNode::Empty => div().flex_1().into_any_element(),
-            WorkspaceNode::Pane(index) => {
+            WorkspaceNode::Pane { tabs, active } => {
                 let position = *pos;
                 *pos += 1;
-                self.render_workspace_tile(*index, position, cx)
+                self.render_workspace_pane(tabs, *active, position, window, cx)
             }
             WorkspaceNode::Split {
                 dir,
@@ -6074,37 +6617,426 @@ impl SshDeck {
         }
     }
 
-    /// One workspace tile: a borderless click-to-focus wrapper around the
-    /// session's `TerminalPane`. The pane draws its own green focus border
-    /// and 28pt header, so the wrapper adds no chrome of its own.
-    fn render_workspace_tile(
+    /// One workspace pane leaf: a multi-tab container holding one or more session
+    /// tabs, a tab bar with add/split/maximize/close actions, and the active session's
+    /// `TerminalPane`. Supports drag-and-drop between panes and edge splitting.
+    fn render_workspace_pane(
         &mut self,
-        index: usize,
-        position: usize,
+        tabs: &[usize],
+        active_tab: usize,
+        pane_index: usize,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(session) = self.sessions.get(index) else {
-            return div().flex_1().into_any_element();
+        let is_focused = self.workspace_focus == pane_index;
+        let border_color = if is_focused {
+            cx.theme().primary
+        } else {
+            cx.theme().border
         };
-        let pane = session.pane.clone();
-        let focus_pane = pane.clone();
-        let host_id = session.host.clone();
+        let tabs_vec = tabs.to_vec();
+
+        // 1. Tab headers
+        let mut tab_elements = Vec::with_capacity(tabs.len());
+        for (tab_idx, &session_idx) in tabs.iter().enumerate() {
+            let is_active = tab_idx == active_tab;
+            let (label, is_connected) = if let Some(session) = self.sessions.get(session_idx) {
+                let host_opt = self.store.inventory().get(&session.host);
+                let title = host_opt
+                    .map(|h| h.label.clone())
+                    .or_else(|| session.status.title.clone())
+                    .unwrap_or_else(|| session.host.to_string());
+                let connected = matches!(session.status.state, SessionState::Connected);
+                (title, connected)
+            } else {
+                (format!("Session {session_idx}"), false)
+            };
+
+            let tab_bg = if is_active {
+                rgb(0x282b3d)
+            } else {
+                rgb(0x1d2033)
+            };
+            let tab_fg = if is_active {
+                rgb(0xffffff)
+            } else {
+                rgb(0x8d91a5)
+            };
+
+            let drag_btn = Button::new(SharedString::from(format!("drag-{pane_index}-{tab_idx}")))
+                .ghost()
+                .xsmall()
+                .label("⋮⋮")
+                .tooltip("Drag tab to move or split")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.dragged_tab = Some((pane_index, tab_idx));
+                    cx.notify();
+                }));
+
+            let close_btn = Button::new(SharedString::from(format!(
+                "close-tab-{pane_index}-{tab_idx}"
+            )))
+            .ghost()
+            .xsmall()
+            .label("×")
+            .tooltip("Close tab")
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.close_session(session_idx, window, cx);
+            }));
+
+            let tab_item = div()
+                .id(SharedString::from(format!(
+                    "pane-{pane_index}-tab-{tab_idx}"
+                )))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .h(px(26.))
+                .px_2()
+                .rounded_t(px(4.))
+                .bg(tab_bg)
+                .text_color(tab_fg)
+                .text_size(px(12.))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x32364c)))
+                .child(div().size(px(6.)).rounded_full().bg(if is_connected {
+                    cx.theme().success
+                } else {
+                    cx.theme().muted_foreground
+                }))
+                .child(drag_btn)
+                .child(div().max_w(px(140.)).overflow_hidden().child(label))
+                .child(close_btn)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.workspace = workspace_switch_tab(&this.workspace, pane_index, tab_idx);
+                    this.workspace_focus = pane_index;
+                    this.active = Some(session_idx);
+                    if let Some(session) = this.sessions.get(session_idx) {
+                        session.pane.update(cx, |pane, cx| pane.focus(window, cx));
+                    }
+                    cx.notify();
+                }));
+
+            tab_elements.push(tab_item.into_any_element());
+        }
+
+        // 2. Pane controls on the right
+        let add_btn = Button::new(SharedString::from(format!("pane-add-{pane_index}")))
+            .ghost()
+            .xsmall()
+            .icon(IconName::Plus)
+            .tooltip("New tab in this pane")
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_tab(MainTab::NewTab, window, cx);
+            }));
+
+        let split_h_btn = Button::new(SharedString::from(format!("pane-splith-{pane_index}")))
+            .ghost()
+            .xsmall()
+            .icon(Icon::default().data(glyph::SPLIT_HORIZONTAL).size(px(13.)))
+            .tooltip("Split side by side")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(active_sess) = this.active {
+                    this.workspace = workspace_split_pane_with_session(
+                        &this.workspace,
+                        pane_index,
+                        active_sess,
+                        SplitDir::Row,
+                        true,
+                    );
+                    cx.notify();
+                }
+            }));
+
+        let split_v_btn = Button::new(SharedString::from(format!("pane-splitv-{pane_index}")))
+            .ghost()
+            .xsmall()
+            .icon(Icon::default().data(glyph::SPLIT_VERTICAL).size(px(13.)))
+            .tooltip("Split stacked")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(active_sess) = this.active {
+                    this.workspace = workspace_split_pane_with_session(
+                        &this.workspace,
+                        pane_index,
+                        active_sess,
+                        SplitDir::Col,
+                        true,
+                    );
+                    cx.notify();
+                }
+            }));
+
+        let max_btn = Button::new(SharedString::from(format!("pane-max-{pane_index}")))
+            .ghost()
+            .xsmall()
+            .icon(IconName::Maximize)
+            .tooltip(if self.workspace_maximized {
+                "Tile all"
+            } else {
+                "Maximize pane"
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.workspace_focus = pane_index;
+                this.workspace_maximized = !this.workspace_maximized;
+                cx.notify();
+            }));
+
+        let close_pane_tabs = tabs_vec.clone();
+        let close_pane_btn = Button::new(SharedString::from(format!("pane-close-{pane_index}")))
+            .ghost()
+            .xsmall()
+            .icon(IconName::Close)
+            .tooltip("Close pane")
+            .on_click(cx.listener(move |this, _, window, cx| {
+                for &s in close_pane_tabs.iter().rev() {
+                    this.close_session(s, window, cx);
+                }
+            }));
+
+        let tab_bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(28.))
+            .bg(rgb(0x181b28))
+            .px_1()
+            .border_b_1()
+            .border_color(rgba(0x8d91a530))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .overflow_hidden()
+                    .flex_1()
+                    .children(tab_elements),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_0p5()
+                    .flex_shrink_0()
+                    .child(add_btn)
+                    .child(split_h_btn)
+                    .child(split_v_btn)
+                    .child(max_btn)
+                    .child(close_pane_btn),
+            );
+
+        // 3. Active session pane
+        let active_sess_idx = tabs
+            .get(active_tab)
+            .copied()
+            .or_else(|| tabs.first().copied());
+        let terminal_view = if let Some(idx) = active_sess_idx {
+            if let Some(session) = self.sessions.get(idx) {
+                session.pane.clone().into_any_element()
+            } else {
+                div().flex_1().into_any_element()
+            }
+        } else {
+            div().flex_1().into_any_element()
+        };
+
+        // 4. Drop zones when dragging
+        let drop_overlay = if let Some((from_pane, from_tab)) = self.dragged_tab {
+            let from_session = if from_pane == pane_index {
+                tabs.get(from_tab).copied()
+            } else {
+                let leaves = workspace_leaves(&self.workspace);
+                leaves.get(from_tab).copied()
+            };
+
+            if let Some(moving_session) = from_session {
+                let drop_left = div()
+                    .id(SharedString::from(format!("ws-drop-left-{pane_index}")))
+                    .w(px(56.))
+                    .bg(rgba(0x2091f630))
+                    .border_r_2()
+                    .border_color(cx.theme().primary)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgba(0x2091f660)))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xffffff))
+                            .child("Split Left"),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.workspace = workspace_split_pane_with_session(
+                            &this.workspace,
+                            pane_index,
+                            moving_session,
+                            SplitDir::Row,
+                            false,
+                        );
+                        this.dragged_tab = None;
+                        cx.notify();
+                    }));
+
+                let drop_right = div()
+                    .id(SharedString::from(format!("ws-drop-right-{pane_index}")))
+                    .w(px(56.))
+                    .bg(rgba(0x2091f630))
+                    .border_l_2()
+                    .border_color(cx.theme().primary)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgba(0x2091f660)))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xffffff))
+                            .child("Split Right"),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.workspace = workspace_split_pane_with_session(
+                            &this.workspace,
+                            pane_index,
+                            moving_session,
+                            SplitDir::Row,
+                            true,
+                        );
+                        this.dragged_tab = None;
+                        cx.notify();
+                    }));
+
+                let drop_top = div()
+                    .id(SharedString::from(format!("ws-drop-top-{pane_index}")))
+                    .h(px(36.))
+                    .bg(rgba(0x2091f630))
+                    .border_b_2()
+                    .border_color(cx.theme().primary)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgba(0x2091f660)))
+                    .child(div().text_xs().text_color(rgb(0xffffff)).child("Split Top"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.workspace = workspace_split_pane_with_session(
+                            &this.workspace,
+                            pane_index,
+                            moving_session,
+                            SplitDir::Col,
+                            false,
+                        );
+                        this.dragged_tab = None;
+                        cx.notify();
+                    }));
+
+                let drop_bottom = div()
+                    .id(SharedString::from(format!("ws-drop-bottom-{pane_index}")))
+                    .h(px(36.))
+                    .bg(rgba(0x2091f630))
+                    .border_t_2()
+                    .border_color(cx.theme().primary)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgba(0x2091f660)))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xffffff))
+                            .child("Split Bottom"),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.workspace = workspace_split_pane_with_session(
+                            &this.workspace,
+                            pane_index,
+                            moving_session,
+                            SplitDir::Col,
+                            true,
+                        );
+                        this.dragged_tab = None;
+                        cx.notify();
+                    }));
+
+                let tabs_len = tabs.len();
+                let drop_center = div()
+                    .id(SharedString::from(format!("ws-drop-center-{pane_index}")))
+                    .flex_1()
+                    .bg(rgba(0x2091f615))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgba(0x2091f640)))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xffffff))
+                            .child("Move Tab Here"),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.workspace = workspace_move_tab(
+                            &this.workspace,
+                            from_pane,
+                            from_tab,
+                            pane_index,
+                            tabs_len,
+                        );
+                        this.dragged_tab = None;
+                        cx.notify();
+                    }));
+
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .child(drop_top)
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_row()
+                                .child(drop_left)
+                                .child(drop_center)
+                                .child(drop_right),
+                        )
+                        .child(drop_bottom),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         div()
-            .id(SharedString::from(format!("ws-tile-{host_id}-{position}")))
+            .id(SharedString::from(format!("ws-pane-{pane_index}")))
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
             .flex()
             .flex_col()
             .overflow_hidden()
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.workspace_focus = position;
-                this.active = Some(index);
-                focus_pane.update(cx, |pane, cx| pane.focus(window, cx));
-                cx.notify();
-            }))
-            .child(pane)
+            .rounded(px(6.))
+            .border_1()
+            .border_color(border_color)
+            .child(tab_bar)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(terminal_view)
+                    .when_some(drop_overlay, |el, overlay| el.child(overlay)),
+            )
             .into_any_element()
     }
 
@@ -6459,6 +7391,8 @@ impl Render for SshDeck {
             .on_action(cx.listener(Self::on_palette_up))
             .on_action(cx.listener(Self::on_palette_down))
             .on_action(cx.listener(Self::on_palette_cancel))
+            .on_action(cx.listener(Self::handle_open_palette))
+            .on_action(cx.listener(Self::handle_find_in_terminal))
             .child(header)
             .child(
                 div()
@@ -6650,21 +7584,25 @@ mod tests {
         assert_eq!(history[MAX_HISTORY_ENTRIES - 1], "one-more");
     }
 
+    fn pane(id: usize) -> WorkspaceNode {
+        WorkspaceNode::Pane {
+            tabs: vec![id],
+            active: 0,
+        }
+    }
+
     #[test]
     fn closing_a_session_repairs_the_split_tree() {
         let flat = |tiles: &[usize]| WorkspaceNode::Split {
             dir: SplitDir::Row,
             weights: vec![1.0; tiles.len()],
-            children: tiles
-                .iter()
-                .map(|&tile| WorkspaceNode::Pane(tile))
-                .collect(),
+            children: tiles.iter().map(|&tile| pane(tile)).collect(),
         };
         // The closed tile drops out; later indexes shift down.
         let (tree, focus) = workspace_remove(&flat(&[0, 1, 2]), 2, 1);
         assert_eq!((workspace_leaves(&tree), focus), (vec![0, 1], 1));
         // Focus into a removed tile clamps to the last remaining tile.
-        let (tree, focus) = workspace_remove(&WorkspaceNode::Pane(3), 0, 3);
+        let (tree, focus) = workspace_remove(&pane(3), 0, 3);
         assert_eq!((tree, focus), (WorkspaceNode::Empty, 0));
         // An unrelated close leaves tiles and focus alone.
         let (tree, focus) = workspace_remove(&flat(&[0, 2]), 1, 5);
@@ -6683,11 +7621,11 @@ mod tests {
             dir: SplitDir::Row,
             weights: vec![1.0, 1.0],
             children: vec![
-                WorkspaceNode::Pane(0),
+                pane(0),
                 WorkspaceNode::Split {
                     dir: SplitDir::Col,
                     weights: vec![1.0, 1.0],
-                    children: vec![WorkspaceNode::Pane(1), WorkspaceNode::Pane(2)],
+                    children: vec![pane(1), pane(2)],
                 },
             ],
         };
@@ -6697,7 +7635,7 @@ mod tests {
             WorkspaceNode::Split {
                 dir: SplitDir::Col,
                 weights: vec![1.0, 1.0],
-                children: vec![WorkspaceNode::Pane(0), WorkspaceNode::Pane(1)],
+                children: vec![pane(0), pane(1)],
             }
         );
     }
@@ -6705,19 +7643,16 @@ mod tests {
     #[test]
     fn workspace_split_nests_without_duplicates() {
         // An empty tree tiles directly.
-        assert_eq!(
-            workspace_insert(&WorkspaceNode::Empty, 0, 1),
-            (WorkspaceNode::Pane(1), 0)
-        );
+        assert_eq!(workspace_insert(&WorkspaceNode::Empty, 0, 1), (pane(1), 0));
         // Splitting a lone pane wraps it across the row axis.
-        let (tree, focus) = workspace_insert(&WorkspaceNode::Pane(0), 0, 1);
+        let (tree, focus) = workspace_insert(&pane(0), 0, 1);
         assert_eq!(focus, 1);
         assert_eq!(
             tree,
             WorkspaceNode::Split {
                 dir: SplitDir::Row,
                 weights: vec![1.0, 1.0],
-                children: vec![WorkspaceNode::Pane(0), WorkspaceNode::Pane(1)],
+                children: vec![pane(0), pane(1)],
             }
         );
         // Splitting inside a row nests a column: the reference's
@@ -6743,7 +7678,7 @@ mod tests {
         let (same, focus) = workspace_insert(&tree, 0, 1);
         assert_eq!((same, focus), (tree, 1));
         // A stale focus splits the last tile rather than panicking.
-        let (tree, focus) = workspace_insert(&WorkspaceNode::Pane(0), 9, 1);
+        let (tree, focus) = workspace_insert(&pane(0), 9, 1);
         assert_eq!((workspace_leaves(&tree), focus), (vec![0, 1], 1));
     }
 

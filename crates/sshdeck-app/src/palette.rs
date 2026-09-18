@@ -172,11 +172,13 @@ impl Command {
     }
 
     /// Stable identity, for host dispatch.
+    #[allow(dead_code)]
     pub fn id(&self) -> CommandId {
         self.id
     }
 
     /// Section this command is filed under.
+    #[allow(dead_code)]
     pub fn category(&self) -> Category {
         self.category
     }
@@ -187,16 +189,19 @@ impl Command {
     }
 
     /// Extra terms that should match this command.
+    #[allow(dead_code)]
     pub fn keywords(&self) -> &'static [&'static str] {
         self.keywords
     }
 
     /// The observed shortcut, as a GPUI keystroke string, if it has one.
+    #[allow(dead_code)]
     pub fn shortcut(&self) -> Option<&'static str> {
         self.shortcut
     }
 
     /// Why the command cannot run, when it is explicitly unavailable.
+    #[allow(dead_code)]
     pub fn unavailable_reason(&self) -> Option<&'static str> {
         match self.kind {
             Kind::Unavailable(reason) => Some(reason),
@@ -205,11 +210,13 @@ impl Command {
     }
 
     /// Whether the host must perform this command through `set_on_select`.
+    #[allow(dead_code)]
     pub fn needs_host(&self) -> bool {
         matches!(self.kind, Kind::Host)
     }
 
     /// Whether the palette performs this command on its own.
+    #[allow(dead_code)]
     pub fn is_builtin(&self) -> bool {
         matches!(self.kind, Kind::Builtin(_))
     }
@@ -381,6 +388,9 @@ fn toggle_theme(window: &mut Window, cx: &mut App) {
 }
 
 /// A keyboard-first command palette. Construct it with [`PaletteView::new`].
+type SelectHandler = Box<dyn Fn(CommandId, &mut Window, &mut App)>;
+type CancelHandler = Box<dyn Fn(&mut Window, &mut App)>;
+
 pub struct PaletteView {
     query: Entity<InputState>,
     commands: Vec<Command>,
@@ -388,8 +398,8 @@ pub struct PaletteView {
     filtered: Vec<usize>,
     /// Position within `filtered`, not within `commands`.
     selected: Option<usize>,
-    on_select: Option<Box<dyn Fn(CommandId, &mut Window, &mut App)>>,
-    on_cancel: Option<Box<dyn Fn(&mut Window, &mut App)>>,
+    on_select: Option<SelectHandler>,
+    on_cancel: Option<CancelHandler>,
     /// Subscription handles must outlive construction, so they are owned here.
     _subscriptions: Vec<Subscription>,
 }
@@ -436,21 +446,25 @@ impl PaletteView {
     }
 
     /// The command registry, in display order.
+    #[allow(dead_code)]
     pub fn commands(&self) -> &[Command] {
         &self.commands
     }
 
     /// The current query text.
+    #[allow(dead_code)]
     pub fn query(&self, cx: &App) -> SharedString {
         self.query.read(cx).value()
     }
 
     /// How many commands match the current query.
+    #[allow(dead_code)]
     pub fn matched_count(&self) -> usize {
         self.filtered.len()
     }
 
     /// The highlighted command, if any.
+    #[allow(dead_code)]
     pub fn selected(&self) -> Option<CommandId> {
         self.selected_command().map(|command| command.id())
     }
@@ -684,7 +698,7 @@ impl Render for PaletteView {
         // reference width (or 90% of the window when narrower) so a narrow
         // window still has breathing room.
         let win_w = f32::from(window.bounds().size.width);
-        let cap = (win_w * 0.9).min(720.0).max(200.0);
+        let cap = (win_w * 0.9).clamp(200.0, 720.0);
         div()
             .flex()
             .flex_col()

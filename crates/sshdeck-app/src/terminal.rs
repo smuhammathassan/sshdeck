@@ -85,9 +85,6 @@ const MAX_FONT_SIZE: f32 = 24.0;
 /// unfocused, so a static app still has zero idle wake-ups.
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The largest 256-colour index with a defined value.
-const MAX_IDX: u8 = 255;
-
 /// Levels of the 6x6x6 colour cube used by xterm-256 palette entries 16-231.
 const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
@@ -203,7 +200,7 @@ impl TerminalScheme {
 
 /// The selectable schemes, each paired with its display name. The first entry is
 /// the [`Default`] scheme.
-pub const SCHEMES: [(&'static str, TerminalScheme); 10] = [
+pub const SCHEMES: [(&str, TerminalScheme); 10] = [
     (
         "Termius Dark",
         TerminalScheme {
@@ -1034,6 +1031,40 @@ impl TerminalPane {
         self.on_pane_action = Some(Rc::new(handler));
     }
 
+    /// Opens the in-pane find box over the visible grid.
+    pub fn open_search(&mut self, cx: &mut Context<Self>) {
+        self.search = Some(Search::default());
+        cx.notify();
+    }
+
+    /// Writes raw bytes into the active session transport, if connected.
+    pub fn write(&mut self, bytes: &[u8]) {
+        if let Some(session) = &self.session {
+            let _ = session.write(bytes);
+        }
+    }
+
+    /// Sends a text string as bytes into the active session transport, if connected.
+    pub fn send_text(&mut self, text: &str) {
+        self.write(text.as_bytes());
+    }
+
+    /// Updates the cursor blink setting live, adjusting the blink options and task.
+    #[allow(dead_code)]
+    pub fn set_cursor_blink(&mut self, blink: bool, cx: &mut Context<Self>) {
+        self.options = TerminalOptions::new(
+            self.options.font_size(),
+            self.options.scrollback_lines(),
+            blink,
+        )
+        .with_scheme(self.options.scheme());
+
+        self.blink_task = None;
+        self.blink_on = true;
+        self.blink_parked = false;
+        cx.notify();
+    }
+
     /// The 28pt per-pane header: glyph + truncating title + `~` + green focus
     /// dot, with a split/max/close cluster on the right.
     ///
@@ -1151,10 +1182,7 @@ impl TerminalPane {
             match keystroke.key.as_str() {
                 "c" => self.copy_selection(cx),
                 "v" => self.paste(cx),
-                "f" => {
-                    self.search = Some(Search::default());
-                    cx.notify();
-                }
+                "f" => self.open_search(cx),
                 _ => {}
             }
             return;
@@ -1221,9 +1249,7 @@ impl TerminalPane {
         if text.is_empty() {
             return;
         }
-        if let Some(session) = &self.session {
-            let _ = session.write(text.as_bytes());
-        }
+        self.send_text(&text);
     }
 
     /// Handles a keystroke while the find box is open.
@@ -2087,7 +2113,7 @@ mod tests {
     #[test]
     fn every_index_resolves_to_a_color() {
         let scheme = TerminalScheme::default();
-        for index in 0..=MAX_IDX {
+        for index in 0..=255u8 {
             assert!(
                 color_to_rgb(Color::Idx(index), &scheme).is_some(),
                 "index {index} has no colour"

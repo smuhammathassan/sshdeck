@@ -44,5 +44,6 @@ jobs:
           key: macos
       # GPUI builds its own Metal renderer, so this job is the slow one; the
       # cache above is what keeps it tolerable.
+      - run: cargo clippy -p sshdeck-app --all-targets -- -D warnings
       - run: cargo build -p sshdeck-app
       - run: cargo test -p sshdeck-app

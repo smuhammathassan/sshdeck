@@ -294,11 +294,13 @@ impl ForwardPane {
     }
 
     /// The live session forwards are created on, if one has been supplied.
+    #[allow(dead_code)]
     pub fn session(&self) -> Option<Arc<Session>> {
         self.session.clone()
     }
 
     /// How many forwards the pane is tracking, live or not.
+    #[allow(dead_code)]
     pub fn forward_count(&self) -> usize {
         self.forwards.len()
     }

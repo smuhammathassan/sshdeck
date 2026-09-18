@@ -183,6 +183,12 @@ pub struct Settings {
     theme_mode: ThemeMode,
     #[serde(default = "default_confirm_on_close")]
     confirm_on_close: bool,
+    #[serde(default)]
+    compact: bool,
+    #[serde(default)]
+    show_experimental: bool,
+    #[serde(default)]
+    autocomplete_enabled: bool,
 }
 
 impl Default for Settings {
@@ -193,6 +199,9 @@ impl Default for Settings {
             cursor_blink: DEFAULT_CURSOR_BLINK,
             theme_mode: ThemeMode::default(),
             confirm_on_close: DEFAULT_CONFIRM_ON_CLOSE,
+            compact: false,
+            show_experimental: false,
+            autocomplete_enabled: false,
         }
     }
 }
@@ -218,6 +227,18 @@ impl Settings {
         self.confirm_on_close
     }
 
+    pub fn compact(&self) -> bool {
+        self.compact
+    }
+
+    pub fn show_experimental(&self) -> bool {
+        self.show_experimental
+    }
+
+    pub fn autocomplete_enabled(&self) -> bool {
+        self.autocomplete_enabled
+    }
+
     /// Sets the font size, clamped to `MIN_FONT_SIZE..=MAX_FONT_SIZE`.
     pub fn set_font_size(&mut self, px: f32) {
         self.font_size = clamp_font_size(f64::from(px));
@@ -238,6 +259,41 @@ impl Settings {
 
     pub fn set_confirm_on_close(&mut self, on: bool) {
         self.confirm_on_close = on;
+    }
+
+    pub fn set_compact(&mut self, compact: bool) {
+        self.compact = compact;
+    }
+
+    pub fn set_show_experimental(&mut self, show: bool) {
+        self.show_experimental = show;
+    }
+
+    pub fn set_autocomplete_enabled(&mut self, on: bool) {
+        self.autocomplete_enabled = on;
+    }
+
+    /// Default location: `~/Library/Application Support/sshdeck/settings.json`
+    /// on macOS, `$XDG_CONFIG_HOME/sshdeck/settings.json` elsewhere.
+    pub fn default_path() -> PathBuf {
+        SettingsStore::default_path()
+    }
+
+    /// Reads settings from disk at the default location. A missing or unreadable
+    /// file falls back to defaults.
+    pub fn load() -> Self {
+        let mut store = SettingsStore::at_default_path();
+        let _ = store.load();
+        store.settings
+    }
+
+    /// Saves settings atomically to the default location.
+    pub fn save(&self) -> Result<(), SettingsError> {
+        let store = SettingsStore {
+            path: Self::default_path(),
+            settings: self.clone(),
+        };
+        store.save()
     }
 }
 
@@ -432,6 +488,9 @@ mod tests {
         assert!(settings.cursor_blink());
         assert!(settings.theme_mode().is_dark());
         assert!(settings.confirm_on_close());
+        assert!(!settings.compact());
+        assert!(!settings.show_experimental());
+        assert!(!settings.autocomplete_enabled());
         // The cap is the memory guard in docs/BUDGET.md; changing it is a
         // deliberate act, so fail loudly here too.
         assert_eq!(MAX_SCROLLBACK, 10_000);
@@ -459,6 +518,9 @@ mod tests {
         store.settings_mut().set_cursor_blink(false);
         store.settings_mut().set_theme_mode(ThemeMode::Light);
         store.settings_mut().set_confirm_on_close(false);
+        store.settings_mut().set_compact(true);
+        store.settings_mut().set_show_experimental(true);
+        store.settings_mut().set_autocomplete_enabled(true);
         store.save().expect("save succeeds");
 
         let mut reloaded = SettingsStore::new(&path);
@@ -469,6 +531,9 @@ mod tests {
         assert!(!settings.cursor_blink());
         assert_eq!(settings.theme_mode(), ThemeMode::Light);
         assert!(!settings.confirm_on_close());
+        assert!(settings.compact());
+        assert!(settings.show_experimental());
+        assert!(settings.autocomplete_enabled());
 
         std::fs::remove_dir_all(&dir).ok();
     }

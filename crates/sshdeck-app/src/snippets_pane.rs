@@ -10,6 +10,7 @@
 //! the typed `SnippetError` verbatim), and persists via `SnippetStore`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::glyph;
 use gpui_kit::component::alert::Alert;
@@ -145,6 +146,8 @@ fn secondary_line(snippet: &Snippet) -> String {
 }
 
 /// Snippets pane. Constructed by the root view.
+pub type SnippetExecuteFn = Arc<dyn Fn(&str, &mut Window, &mut Context<SnippetsPane>) + 'static>;
+
 pub struct SnippetsPane {
     store: SnippetStore,
     selected: Option<SnippetId>,
@@ -154,6 +157,8 @@ pub struct SnippetsPane {
     expanded: Option<String>,
     /// Last expand error, rendered verbatim from `SnippetError`.
     expand_error: Option<String>,
+    /// Callback to execute the expanded snippet in the active terminal.
+    on_execute: Option<SnippetExecuteFn>,
     /// Whether the create/edit form is open.
     form_open: bool,
     /// `Some` when editing an existing snippet.
@@ -213,6 +218,7 @@ impl SnippetsPane {
             variable_inputs: HashMap::new(),
             expanded: None,
             expand_error: None,
+            on_execute: None,
             form_open: false,
             editing: None,
             draft_label,
@@ -236,17 +242,28 @@ impl SnippetsPane {
         pane
     }
 
+    /// Sets the callback invoked when the user runs a snippet in the terminal.
+    pub fn set_on_execute<F>(&mut self, handler: F)
+    where
+        F: Fn(&str, &mut Window, &mut Context<Self>) + 'static,
+    {
+        self.on_execute = Some(Arc::new(handler));
+    }
+
     /// How many snippets are currently stored.
+    #[allow(dead_code)]
     pub fn snippet_count(&self) -> usize {
         self.store.len()
     }
 
     /// The live snippet slice from the store.
+    #[allow(dead_code)]
     pub fn snippets(&self) -> &[Snippet] {
         self.store.snippets()
     }
 
     /// The selected snippet id, if any.
+    #[allow(dead_code)]
     pub fn selected(&self) -> Option<&SnippetId> {
         self.selected.as_ref()
     }
@@ -282,21 +299,25 @@ impl SnippetsPane {
     }
 
     /// Whether the create/edit form is open.
+    #[allow(dead_code)]
     pub fn is_form_open(&self) -> bool {
         self.form_open
     }
 
     /// Whether an existing snippet is being edited.
+    #[allow(dead_code)]
     pub fn editing(&self) -> Option<&SnippetId> {
         self.editing.as_ref()
     }
 
     /// The last successful expansion, if any.
+    #[allow(dead_code)]
     pub fn expanded(&self) -> Option<&str> {
         self.expanded.as_deref()
     }
 
     /// The last expand error, if any.
+    #[allow(dead_code)]
     pub fn expand_error(&self) -> Option<&str> {
         self.expand_error.as_deref()
     }
@@ -1317,6 +1338,32 @@ impl SnippetsPane {
                                     }))
                                 })
                                 .disabled(expanded.is_none()),
+                        )
+                        .child(
+                            Button::new("snippet-run")
+                                .small()
+                                .primary()
+                                .icon(IconName::Play)
+                                .label("Run in Terminal")
+                                .disabled(expanded.is_none())
+                                .when_some(expanded.clone(), |button, value| {
+                                    let on_execute = self.on_execute.clone();
+                                    button.on_click(cx.listener(move |_, _, window, cx| {
+                                        if let Some(on_exec) = &on_execute {
+                                            on_exec(&value, window, cx);
+                                        } else {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                value.clone(),
+                                            ));
+                                            window.push_notification(
+                                                Notification::info(
+                                                    "No active terminal — copied snippet to clipboard",
+                                                ),
+                                                cx,
+                                            );
+                                        }
+                                    }))
+                                }),
                         )
                         .child(
                             Button::new("snippet-edit-detail")

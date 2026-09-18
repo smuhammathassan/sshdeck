@@ -142,6 +142,9 @@ fn read_local_dir(path: &Path) -> Result<Vec<LocalEntry>, String> {
     Ok(items)
 }
 
+type ConnectHandler = Box<dyn Fn(Host, &mut Window, &mut App)>;
+type ShowLogsHandler = Box<dyn Fn(&mut Window, &mut App)>;
+
 /// The dual-pane SFTP browser.
 pub struct SftpPane {
     /// `None` until a remote host is connected; the right pane then renders empty or host picker.
@@ -173,10 +176,10 @@ pub struct SftpPane {
     /// A picked host whose transport is still opening (`reconcile_sftp` sets
     /// this; `set_client` clears it). Renders the connecting branch.
     connecting: Option<String>,
-    on_connect: Option<Box<dyn Fn(Host, &mut Window, &mut App)>>,
+    on_connect: Option<ConnectHandler>,
     /// Invoked by the SFTP connecting block's "Show logs" pill; wired by
     /// `main.rs` (the pane cannot reach the left nav itself).
-    on_show_logs: Option<Box<dyn Fn(&mut Window, &mut App)>>,
+    on_show_logs: Option<ShowLogsHandler>,
     /// Which pane the narrow tab switcher shows. Ignored at wide widths.
     show_local: bool,
     // Browser chrome state: per-pane filter inputs, date sort direction,
@@ -265,18 +268,21 @@ impl SftpPane {
     }
 
     /// Supplies the list of inventory hosts for the right-hand "Select Host" picker.
+    #[allow(dead_code)]
     pub fn set_available_hosts(&mut self, hosts: Vec<Host>, cx: &mut Context<Self>) {
         self.available_hosts = hosts;
         cx.notify();
     }
 
     /// Sets the label of the connected remote host (e.g. "Ali Jawwad").
+    #[allow(dead_code)]
     pub fn set_remote_host_label(&mut self, label: Option<String>, cx: &mut Context<Self>) {
         self.remote_host_label = label;
         cx.notify();
     }
 
     /// Registers the callback invoked when the user selects a host in the right-pane picker.
+    #[allow(dead_code)]
     pub fn set_on_connect<F>(&mut self, f: F)
     where
         F: Fn(Host, &mut Window, &mut App) + 'static,
@@ -285,6 +291,7 @@ impl SftpPane {
     }
 
     /// Registers the callback behind the SFTP connecting block's "Show logs" pill.
+    #[allow(dead_code)]
     pub fn set_on_show_logs<F>(&mut self, f: F)
     where
         F: Fn(&mut Window, &mut App) + 'static,
@@ -307,11 +314,13 @@ impl SftpPane {
     }
 
     /// The live SFTP handle, if one has been supplied.
+    #[allow(dead_code)]
     pub fn client(&self) -> Option<&SftpClient> {
         self.client.as_deref()
     }
 
     /// The canonical path currently being listed on the remote server; empty until first load.
+    #[allow(dead_code)]
     pub fn current_path(&self) -> &str {
         &self.cwd
     }
@@ -319,6 +328,7 @@ impl SftpPane {
     /// Marks a picked host as connecting; cleared by [`Self::set_client`].
     /// The wiring pass sets this while the transport opens so the right pane
     /// shows a connecting branch instead of the empty state.
+    #[allow(dead_code)]
     pub fn set_connecting(&mut self, label: Option<String>, cx: &mut Context<Self>) {
         self.connecting = label;
         cx.notify();
@@ -539,6 +549,74 @@ impl SftpPane {
         .detach();
     }
 
+    /// Reloads the current remote directory.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.refresh(cx);
+    }
+
+    /// Uploads the selected local file or directory to the remote directory.
+    pub fn upload_selected(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(idx)) = (self.client.clone(), self.local_selected) else {
+            return;
+        };
+        let Some(entry) = self.local_entries.get(idx) else {
+            return;
+        };
+        let local_path = self.local_cwd.join(&entry.name);
+        let remote_path = format!("{}/{}", self.cwd.trim_end_matches('/'), entry.name);
+        let is_dir = entry.is_dir;
+
+        cx.spawn(async move |pane, cx| {
+            let res = if is_dir {
+                client.upload_dir(local_path, remote_path).await
+            } else {
+                client.upload(local_path, remote_path).await
+            };
+            pane.update(cx, |this, cx| match res {
+                Ok(_) => this.reload(cx),
+                Err(err) => {
+                    this.error = Some(err.to_string());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Downloads the selected remote file or directory to the local directory.
+    pub fn download_selected(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(idx)) = (self.client.clone(), self.selected) else {
+            return;
+        };
+        let Some(entry) = self.entries.get(idx) else {
+            return;
+        };
+        let remote_path = format!("{}/{}", self.cwd.trim_end_matches('/'), entry.name());
+        let local_path = self.local_cwd.join(entry.name());
+        let is_dir = entry.is_dir();
+
+        cx.spawn(async move |pane, cx| {
+            let res = if is_dir {
+                client.download_dir(remote_path, local_path).await
+            } else {
+                client.download(remote_path, local_path).await
+            };
+            pane.update(cx, |this, cx| match res {
+                Ok(_) => {
+                    let local_cwd = this.local_cwd.clone();
+                    this.load_local(local_cwd, cx);
+                }
+                Err(err) => {
+                    this.error = Some(err.to_string());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     // ── Local browser rendering ───────────────────────────────────────────
 
     fn render_local_header(&self, cx: &mut Context<Self>) -> Div {
@@ -618,6 +696,7 @@ impl SftpPane {
             .flex_shrink_0()
             .child(bar)
             .when(self.local_actions_open, |el| {
+                let can_upload = self.client.is_some() && self.local_selected.is_some();
                 el.child(
                     div()
                         .flex()
@@ -625,6 +704,18 @@ impl SftpPane {
                         .flex_shrink_0()
                         .border_b_1()
                         .border_color(border)
+                        .when(can_upload, |el| {
+                            el.child(
+                                Button::new("local-action-upload")
+                                    .ghost()
+                                    .small()
+                                    .label("Upload to Remote")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.local_actions_open = false;
+                                        this.upload_selected(cx);
+                                    })),
+                            )
+                        })
                         .child(
                             Button::new("local-action-refresh")
                                 .ghost()
@@ -1048,6 +1139,7 @@ impl SftpPane {
             .flex_shrink_0()
             .child(bar)
             .when(self.remote_actions_open, |el| {
+                let can_download = self.selected.is_some();
                 el.child(
                     div()
                         .flex()
@@ -1055,6 +1147,18 @@ impl SftpPane {
                         .flex_shrink_0()
                         .border_b_1()
                         .border_color(border)
+                        .when(can_download, |el| {
+                            el.child(
+                                Button::new("remote-action-download")
+                                    .ghost()
+                                    .small()
+                                    .label("Download to Local")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.remote_actions_open = false;
+                                        this.download_selected(cx);
+                                    })),
+                            )
+                        })
                         .child(
                             Button::new("remote-action-refresh")
                                 .ghost()
@@ -1626,7 +1730,7 @@ impl SftpPane {
             })
             .collect();
         if sort_alpha {
-            hosts.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+            hosts.sort_by_key(|a| a.label.to_lowercase());
         }
         let host_rows: Vec<_> = hosts
             .into_iter()
@@ -2202,7 +2306,7 @@ fn picker_subtitle(host: &Host) -> String {
         tokens.push("ssh".to_string());
     }
     if !host.username.is_empty() {
-        let logins = std::iter::repeat(host.username.clone()).take(tokens.len());
+        let logins = std::iter::repeat_n(host.username.clone(), tokens.len());
         tokens.extend(logins);
     }
     tokens.join(", ")
@@ -2431,5 +2535,21 @@ mod tests {
         assert_eq!(at(0), "1/1/1970, 12:00 AM");
         assert_eq!(at(43_200), "1/1/1970, 12:00 PM");
         assert_eq!(at(1_789_635_780), "9/17/2026, 9:03 AM");
+    }
+
+    #[test]
+    fn upload_download_target_paths_format_correctly() {
+        let cwd = "/home/user/";
+        let entry_name = "test.txt";
+        let remote_path = format!("{}/{}", cwd.trim_end_matches('/'), entry_name);
+        assert_eq!(remote_path, "/home/user/test.txt");
+
+        let root_cwd = "/";
+        let root_remote_path = format!("{}/{}", root_cwd.trim_end_matches('/'), entry_name);
+        assert_eq!(root_remote_path, "/test.txt");
+
+        let local_cwd = PathBuf::from("/Users/test");
+        let local_path = local_cwd.join(entry_name);
+        assert_eq!(local_path, PathBuf::from("/Users/test/test.txt"));
     }
 }

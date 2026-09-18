@@ -41,8 +41,8 @@ use gpui_kit::InteractiveElement as _;
 // is deliberately 10 000 — `docs/BUDGET.md` treats unbounded scrollback as the
 // memory cliff — so this view can never offer more.
 use sshdeck_config::{
-    DEFAULT_CURSOR_BLINK, DEFAULT_FONT_SIZE, DEFAULT_SCROLLBACK, MAX_FONT_SIZE, MAX_SCROLLBACK,
-    MIN_FONT_SIZE, MIN_SCROLLBACK,
+    DEFAULT_FONT_SIZE, DEFAULT_SCROLLBACK, MAX_FONT_SIZE, MAX_SCROLLBACK, MIN_FONT_SIZE,
+    MIN_SCROLLBACK,
 };
 use sshdeck_core::HostStore;
 
@@ -158,6 +158,7 @@ fn read_only(cx: &App, value: SharedString) -> impl IntoElement {
 
 /// A `−  value  +` stepper. Both ends disable at the bounds of the range the
 /// numbers came from, so the control cannot request an out-of-range value.
+#[allow(clippy::too_many_arguments)]
 fn stepper(
     decrement_id: &'static str,
     increment_id: &'static str,
@@ -244,13 +245,16 @@ fn read_only_item(
 ///
 /// Construct with `cx.new(|cx| SettingsView::new(window, cx))`.
 pub struct SettingsView {
+    config: sshdeck_config::Settings,
     font_size: f32,
     scrollback_lines: usize,
     cursor_blink: bool,
     /// Renders the settings surface with the smaller control size.
     compact: bool,
-    /// Reveals the not-yet-wired "Experimental" group.
+    /// Reveals the "Experimental" group.
     show_experimental: bool,
+    /// Whether experimental autocomplete is enabled.
+    autocomplete_enabled: bool,
     /// The OS appearance this window opened with, shown as a read-only row.
     system_mode: ThemeMode,
     focus_handle: FocusHandle,
@@ -258,30 +262,65 @@ pub struct SettingsView {
 
 impl SettingsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let config = sshdeck_config::Settings::load();
         Self {
-            font_size: DEFAULT_FONT_SIZE,
-            scrollback_lines: DEFAULT_SCROLLBACK,
-            cursor_blink: DEFAULT_CURSOR_BLINK,
-            compact: false,
-            show_experimental: false,
+            font_size: config.font_size(),
+            scrollback_lines: config.scrollback_lines(),
+            cursor_blink: config.cursor_blink(),
+            compact: config.compact(),
+            show_experimental: config.show_experimental(),
+            autocomplete_enabled: config.autocomplete_enabled(),
             system_mode: ThemeMode::from(window.appearance()),
             focus_handle: cx.focus_handle(),
+            config,
         }
     }
 
+    fn save_settings(&mut self) {
+        self.config.set_font_size(self.font_size);
+        self.config.set_scrollback_lines(self.scrollback_lines);
+        self.config.set_cursor_blink(self.cursor_blink);
+        self.config.set_compact(self.compact);
+        self.config.set_show_experimental(self.show_experimental);
+        self.config
+            .set_autocomplete_enabled(self.autocomplete_enabled);
+        let _ = self.config.save();
+    }
+
     /// The terminal font size held by this view, in pixels.
+    #[allow(dead_code)]
     pub fn font_size(&self) -> f32 {
         self.font_size
     }
 
     /// The scrollback line count held by this view.
+    #[allow(dead_code)]
     pub fn scrollback_lines(&self) -> usize {
         self.scrollback_lines
     }
 
     /// Whether the cursor is expected to blink.
+    #[allow(dead_code)]
     pub fn cursor_blink(&self) -> bool {
         self.cursor_blink
+    }
+
+    /// Whether compact rows mode is enabled.
+    #[allow(dead_code)]
+    pub fn compact(&self) -> bool {
+        self.compact
+    }
+
+    /// Whether experimental settings are shown.
+    #[allow(dead_code)]
+    pub fn show_experimental(&self) -> bool {
+        self.show_experimental
+    }
+
+    /// Whether experimental autocomplete is enabled.
+    #[allow(dead_code)]
+    pub fn autocomplete_enabled(&self) -> bool {
+        self.autocomplete_enabled
     }
 
     /// Gives the surface keyboard focus. The wiring pass can call this when it
@@ -436,6 +475,7 @@ impl SettingsView {
                                             this.font_size = clamp_font_size(
                                                 f64::from(this.font_size) - FONT_SIZE_STEP,
                                             );
+                                            this.save_settings();
                                             cx.notify();
                                         })
                                         .ok();
@@ -446,6 +486,7 @@ impl SettingsView {
                                             this.font_size = clamp_font_size(
                                                 f64::from(this.font_size) + FONT_SIZE_STEP,
                                             );
+                                            this.save_settings();
                                             cx.notify();
                                         })
                                         .ok();
@@ -480,6 +521,7 @@ impl SettingsView {
                                             this.scrollback_lines = clamp_scrollback(
                                                 this.scrollback_lines as f64 - SCROLLBACK_STEP,
                                             );
+                                            this.save_settings();
                                             cx.notify();
                                         })
                                         .ok();
@@ -490,6 +532,7 @@ impl SettingsView {
                                             this.scrollback_lines = clamp_scrollback(
                                                 this.scrollback_lines as f64 + SCROLLBACK_STEP,
                                             );
+                                            this.save_settings();
                                             cx.notify();
                                         })
                                         .ok();
@@ -523,6 +566,7 @@ impl SettingsView {
                                     blink_view
                                         .update(cx, |this, cx| {
                                             this.cursor_blink = next;
+                                            this.save_settings();
                                             cx.notify();
                                         })
                                         .ok();
@@ -538,9 +582,11 @@ impl SettingsView {
     fn general_page(&self, cx: &mut Context<Self>) -> SettingPage {
         let view = cx.entity().downgrade();
         let compact_view = view.clone();
-        let experimental_view = view;
+        let experimental_view = view.clone();
+        let autocomplete_view = view;
         let compact = self.compact;
         let experimental = self.show_experimental;
+        let autocomplete = self.autocomplete_enabled;
         let size = if compact { Size::Small } else { Size::Medium };
 
         let mut groups = vec![
@@ -565,6 +611,7 @@ impl SettingsView {
                                     compact_view
                                         .update(cx, |this, cx| {
                                             this.compact = next;
+                                            this.save_settings();
                                             cx.notify();
                                         })
                                         .ok();
@@ -598,6 +645,7 @@ impl SettingsView {
                                     experimental_view
                                         .update(cx, |this, cx| {
                                             this.show_experimental = next;
+                                            this.save_settings();
                                             cx.notify();
                                         })
                                         .ok();
@@ -621,8 +669,12 @@ impl SettingsView {
                 ))
                 .item(read_only_item(
                     "Settings store",
-                    SharedString::from("in memory (not persisted yet)"),
-                    "No settings file is written yet.",
+                    SharedString::from(
+                        sshdeck_config::Settings::default_path()
+                            .display()
+                            .to_string(),
+                    ),
+                    "Where saved settings live.",
                     &["Settings store", "settings", "file"],
                 ))
                 .item(read_only_item(
@@ -639,22 +691,32 @@ impl SettingsView {
                     .item(section_item("Experimental", None))
                     .item(
                         SettingItem::render(move |_, _, cx: &mut App| {
+                            let autocomplete_view = autocomplete_view.clone();
                             setting_row(
                                 cx,
                                 "Autocomplete",
-                                SharedString::from("Not implemented — disabled."),
+                                SharedString::from(
+                                    "Suggests commands and arguments inline in the terminal.",
+                                ),
                                 toggle(
                                     "autocomplete",
                                     "Autocomplete",
+                                    autocomplete,
                                     false,
-                                    true,
                                     size,
-                                    |_, _| {},
+                                    move |next, cx| {
+                                        autocomplete_view
+                                            .update(cx, |this, cx| {
+                                                this.autocomplete_enabled = next;
+                                                this.save_settings();
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                    },
                                 ),
                             )
                         })
-                        .keywords(["Autocomplete", "experimental"])
-                        .disabled(true),
+                        .keywords(["Autocomplete", "experimental"]),
                     ),
             );
         }
@@ -673,7 +735,7 @@ impl Render for SettingsView {
         // Cap the pages at the 720px reference width, shrinking to 90% of the
         // window on narrow screens so the rows keep their 44px shape.
         let win_w = f32::from(window.bounds().size.width);
-        let cap = (win_w * 0.9).min(720.0).max(200.0);
+        let cap = (win_w * 0.9).clamp(200.0, 720.0);
 
         div()
             .size_full()

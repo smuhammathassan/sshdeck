@@ -72,7 +72,7 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
 };
-use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, rgb, AppContext as _, Context, Div, Entity, FocusHandle, Focusable as _, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
@@ -115,7 +115,9 @@ fn card_cols(win_w: f32) -> usize {
 pub enum LogLevel {
     Info,
     Success,
+    #[allow(dead_code)]
     Warning,
+    #[allow(dead_code)]
     Error,
 }
 
@@ -154,6 +156,7 @@ pub struct LogEntry {
     level: LogLevel,
 }
 
+#[allow(dead_code)]
 impl LogEntry {
     /// Creates an entry. `id` is assigned by the pane; callers supply the visible fields.
     pub fn new(
@@ -241,21 +244,25 @@ impl LogsPane {
     }
 
     /// How many entries are buffered (0..=MAX_LOG_ENTRIES).
+    #[allow(dead_code)]
     pub fn entry_count(&self) -> usize {
         self.entries.len()
     }
 
     /// The buffered entries, oldest first.
+    #[allow(dead_code)]
     pub fn entries(&self) -> &[LogEntry] {
         &self.entries
     }
 
     /// Whether the buffer is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// The cap of the ring buffer.
+    #[allow(dead_code)]
     pub fn cap(&self) -> usize {
         MAX_LOG_ENTRIES
     }
@@ -275,6 +282,7 @@ impl LogsPane {
     /// Convenience: append a session-interval entry with a level. The wiring pass
     /// calls this for connect/close/failure events; nothing fabricates lines at
     /// startup.
+    #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
         date: impl Into<String>,
@@ -652,7 +660,7 @@ impl LogsPane {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
         let fg = cx.theme().foreground;
-        let marker_color = entry.level.color(&**cx);
+        let marker_color = entry.level.color(cx);
         let host_lower = entry.host.to_lowercase();
         let host_bg = if host_lower.contains("horly") || host_lower.contains("local terminal") {
             rgb(0x204b6b)
@@ -771,47 +779,6 @@ impl LogsPane {
             )
     }
 
-    fn render_upgrade_banner(&self, cx: &mut Context<Self>) -> Div {
-        let border = cx.theme().border;
-        let fg = cx.theme().foreground;
-
-        div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .px_4()
-            .py_2p5()
-            .mx_3()
-            .mt_3()
-            .rounded(px(8.))
-            .bg(cx.theme().background)
-            .border_1()
-            .border_color(border)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(120.))
-                    .text_size(px(14.))
-                    .text_color(fg)
-                    .child("Logs are not available on your current plan."),
-            )
-            // Neutral grey chip, not a button: sshdeck is 100% free and local,
-            // so there is no plan to upgrade to — the chip only mirrors the
-            // reference, which draws it as a flat grey pill with dark text.
-            .child(
-                div()
-                    .px_2p5()
-                    .py_1()
-                    .rounded_full()
-                    .bg(cx.theme().muted)
-                    .text_size(px(12.))
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Upgrade ↑"),
-            )
-    }
     fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let border = cx.theme().border;
         let empty = self.entries.is_empty();
@@ -948,7 +915,6 @@ impl Render for LogsPane {
             .when(self.search_open && has_entries, |el| {
                 el.child(self.render_search_row(cx))
             })
-            .child(self.render_upgrade_banner(cx))
             .child(self.render_body(win_w, cx))
     }
 }
