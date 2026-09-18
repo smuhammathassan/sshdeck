@@ -7892,6 +7892,7 @@ impl SshDeck {
                         .text_color(rgb(0x8d91a5))
                         .child(SharedString::from(format!("ssh, {username}"))),
                 )
+                .into_any_element()
         } else {
             div()
                 .flex()
@@ -7901,6 +7902,7 @@ impl SshDeck {
                 .overflow_hidden()
                 .flex_1()
                 .children(tab_elements)
+                .into_any_element()
         };
 
         let tab_bar = div()
