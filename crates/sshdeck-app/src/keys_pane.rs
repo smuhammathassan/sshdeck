@@ -1527,8 +1527,8 @@ impl KeysPane {
                                 .flex_shrink_0()
                                 .size(px(48.))
                                 .rounded(px(12.))
-                                // Termius host-tile orange, same literal as main.rs.
-                                .bg(rgb(0xd96c2b))
+                                // Vibrant Ubuntu orange.
+                                .bg(rgb(0xe95420))
                                 .child(
                                     Icon::default()
                                         .data(crate::glyph::UBUNTU)

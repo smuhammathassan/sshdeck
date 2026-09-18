@@ -55,7 +55,7 @@
 //!   with a glyph, heading `No activity yet` and one line of explanation.
 //!
 //! Hardcoded values (no theme token exists):
-//! - Host/user avatar fills: host orange `rgb(0xd96c2b)`, host blue
+//! - Host/user avatar fills: host orange `rgb(0xe95420)`, host blue
 //!   `rgb(0x204b6b)` for the two `horly`/`Local Terminal` rows, user avatar
 //!   `rgb(0xf0a75a)` (the `MH` peach). These are platform/host tints recovered
 //!   from the reference; no semantic token covers them.
@@ -395,7 +395,7 @@ impl LogsPane {
         let host_bg = if host_lower.contains("horly") || host_lower.contains("local terminal") {
             rgb(0x204b6b)
         } else {
-            rgb(0xd96c2b)
+            rgb(0xe95420)
         };
         let user_bg = rgb(0xf0a75a);
         let initials = user_initials(&entry.user);
@@ -665,7 +665,7 @@ impl LogsPane {
         let host_bg = if host_lower.contains("horly") || host_lower.contains("local terminal") {
             rgb(0x204b6b)
         } else {
-            rgb(0xd96c2b)
+            rgb(0xe95420)
         };
         let user_bg = rgb(0xf0a75a);
         let initials = user_initials(&entry.user);

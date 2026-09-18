@@ -52,6 +52,7 @@ actions!(
         FindInTerminal,
         NewTabAction,
         CloseTabAction,
+        ToggleSidebarAction,
         OpenSettingsAction,
         ZoomInAction,
         ZoomOutAction,
@@ -87,6 +88,8 @@ fn main() {
                 KeyBinding::new("ctrl-t", NewTabAction, None),
                 KeyBinding::new("cmd-w", CloseTabAction, None),
                 KeyBinding::new("ctrl-w", CloseTabAction, None),
+                KeyBinding::new("cmd-b", ToggleSidebarAction, None),
+                KeyBinding::new("ctrl-b", ToggleSidebarAction, None),
                 KeyBinding::new("cmd-,", OpenSettingsAction, None),
                 KeyBinding::new("ctrl-,", OpenSettingsAction, None),
                 KeyBinding::new("cmd-=", ZoomInAction, None),
@@ -1691,9 +1694,23 @@ impl SshDeck {
                 }
                 _ => {}
             }),
-            cx.subscribe_in(&new_tab_query, window, |_, _, event, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
+            cx.subscribe_in(&new_tab_query, window, |this, _, event, window, cx| {
+                match event {
+                    InputEvent::Change => cx.notify(),
+                    InputEvent::PressEnter { .. } => {
+                        let query = this.new_tab_query.read(cx).value().trim().to_string();
+                        if !query.is_empty() {
+                            if let Some(host) = parse_quick_connect(&query) {
+                                this.connect(host, window, cx);
+                            } else {
+                                let filtered = this.store.inventory().filtered(&query);
+                                if let Some(first) = filtered.first().cloned() {
+                                    this.connect(first, window, cx);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }),
             // Details editors commit each keystroke to the selected host, so the
@@ -1897,10 +1914,27 @@ impl SshDeck {
             self.close_add_host(cx);
             return;
         }
+        if self.tab == MainTab::NewTab {
+            let fallback = self.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
+            self.select_tab(fallback, window, cx);
+            return;
+        }
         if let Some(active) = self.active {
             if active < self.sessions.len() {
                 self.close_session(active, window, cx);
             }
+        }
+    }
+
+    fn handle_toggle_sidebar(
+        &mut self,
+        _: &ToggleSidebarAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.tab, MainTab::Session(_) | MainTab::Workspace) {
+            self.sidebar_open = !self.sidebar_open;
+            cx.notify();
         }
     }
 
@@ -2288,18 +2322,6 @@ impl SshDeck {
     /// Opens a session for `host`, prompting for a password first when the host
     /// authenticates with one and no secret is available yet.
     fn connect(&mut self, host: Host, window: &mut Window, cx: &mut Context<Self>) {
-        // An existing tab for this host is focused instead of opening a second
-        // connection to the same place.
-        if let Some(index) = self.sessions.iter().position(|s| s.host == host.id) {
-            self.active = Some(index);
-            self.tab = MainTab::Session(index);
-            self.overlay = None;
-            let pane = self.sessions[index].pane.clone();
-            pane.update(cx, |pane, cx| pane.focus(window, cx));
-            cx.notify();
-            return;
-        }
-
         let config = match &host.auth {
             // The sidebar password box is the password (Termius behaviour):
             // resolve the vaulted secret and connect directly. The prompt is
@@ -3152,11 +3174,24 @@ impl SshDeck {
             .when(
                 matches!(self.tab, MainTab::Session(_) | MainTab::Workspace),
                 |this| {
+                    let open = self.sidebar_open;
                     this.child(
                         Button::new("right-sidebar-toggle")
                             .ghost()
-                            .icon(IconName::PanelRight)
-                            .tooltip("Toggle sidebar")
+                            .icon(
+                                Icon::new(IconName::PanelRight)
+                                    .size(px(16.))
+                                    .text_color(if open {
+                                        rgb(0x10b981)
+                                    } else {
+                                        rgb(0x8d91a5)
+                                    }),
+                            )
+                            .tooltip(if open {
+                                "Hide sidebar (⌘B)"
+                            } else {
+                                "Show sidebar (⌘B)"
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.sidebar_open = !this.sidebar_open;
                                 cx.notify();
@@ -3480,19 +3515,26 @@ impl SshDeck {
             .items_center()
             .gap_1()
             .h(px(30.))
-            .flex_1()
             .min_w(px(0.))
             .overflow_x_scrollbar()
             .child(vaults)
             .child(sftp);
 
         for (index, session) in self.sessions.iter().enumerate() {
+            let host_label = self
+                .store
+                .inventory()
+                .get(&session.host)
+                .map(|host| host.label.clone())
+                .unwrap_or_else(|| session.host.to_string());
             let label = session.status.title.clone().unwrap_or_else(|| {
-                self.store
-                    .inventory()
-                    .get(&session.host)
-                    .map(|host| host.label.clone())
-                    .unwrap_or_else(|| session.host.to_string())
+                let same_host_count = self.sessions.iter().filter(|s| s.host == session.host).count();
+                if same_host_count > 1 {
+                    let instance_num = self.sessions[..=index].iter().filter(|s| s.host == session.host).count();
+                    format!("{host_label} ({instance_num})")
+                } else {
+                    host_label
+                }
             });
             // A session tab is only selected while no pane overlay covers it.
             let is_active = self.overlay.is_none() && active == Some(index);
@@ -3516,21 +3558,21 @@ impl SshDeck {
                 let tint = host_os_tint(host, rgb(0xe95420).into());
                 div()
                     .size(px(20.))
-                    .rounded(px(5.))
-                    .bg(rgb(0x351d18))
+                    .rounded(px(6.))
+                    .bg(tint)
                     .flex()
                     .items_center()
                     .justify_center()
                     .child(
                         Icon::default()
                             .data(glyph::UBUNTU_SOLID)
-                            .size(px(14.))
-                            .text_color(tint),
+                            .size(px(13.))
+                            .text_color(rgb(0xffffff)),
                     )
             } else {
                 div()
                     .size(px(20.))
-                    .rounded(px(5.))
+                    .rounded(px(6.))
                     .bg(rgb(0x282b3d))
                     .flex()
                     .items_center()
@@ -3545,7 +3587,7 @@ impl SshDeck {
 
             strip = strip.child(
                 div()
-                    .id(SharedString::from(format!("tab-{id}")))
+                    .id(SharedString::from(format!("tab-{index}-{id}")))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -3578,7 +3620,7 @@ impl SshDeck {
                     // wired to mouse listeners, checked alongside `is_active`.
                     .when(is_active, |el| {
                         el.child(
-                            Button::new(SharedString::from(format!("close-tab-{close_id}")))
+                            Button::new(SharedString::from(format!("close-tab-{index}-{close_id}")))
                                 .ghost()
                                 .icon(IconName::Close)
                                 .tooltip("Close session")
@@ -3630,27 +3672,29 @@ impl SshDeck {
                             .tooltip("Close tab")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.select_tab(MainTab::Vaults, window, cx);
+                                let fallback = this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
+                                this.select_tab(fallback, window, cx);
                             })),
                     ),
             );
         }
 
         // The `+` control lives outside the scrolling strip so it stays
-        // visible no matter how many tabs overflow.
+        // visible right next to the tabs across all views.
         div()
             .flex()
             .flex_row()
             .items_center()
             .flex_1()
             .min_w(px(0.))
+            .gap_1()
             .child(strip.flex_shrink_1())
             .child(
                 div().flex_shrink_0().child(
                     Button::new("add-tab-btn")
                         .ghost()
-                        .icon(IconName::Plus)
-                        .tooltip("New tab")
+                        .icon(Icon::new(IconName::Plus).size(px(15.)).text_color(muted))
+                        .tooltip("New tab (⌘T)")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.select_tab(MainTab::NewTab, window, cx);
                         })),
@@ -4381,7 +4425,7 @@ impl SshDeck {
         let card_bg = cx.theme().popover;
         let border_selected = cx.theme().primary;
         let border_default = cx.theme().border;
-        let orange = rgb(0xd96c2b);
+        let orange = rgb(0xe95420);
         let is_list = self.view_mode == ViewMode::List;
         let win_w = f32::from(window.bounds().size.width);
         let card_h = host_card_height(is_list, win_w);
@@ -4576,8 +4620,7 @@ impl SshDeck {
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
         let card_bg = cx.theme().popover;
-        // Termius host-tile orange #d96c2b.
-        let orange = rgb(0xd96c2b);
+        let orange = rgb(0xe95420);
         let win_size = window.bounds().size;
         let win_w = f32::from(win_size.width);
         let win_h = f32::from(win_size.height);
@@ -5664,6 +5707,7 @@ impl SshDeck {
                                 .p_3()
                                 .rounded(px(10.))
                                 .bg(row_bg)
+                                .hover(|s| s.bg(rgb(0xe4e9ec)))
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.connect(connect_host.clone(), window, cx);
@@ -5679,17 +5723,17 @@ impl SshDeck {
                                         .overflow_hidden()
                                         .child(
                                             div()
-                                                .size(px(22.))
+                                                .size(px(24.))
                                                 .flex_shrink_0()
-                                                .rounded(px(6.))
-                                                .bg(rgb(0xd96c2b))
+                                                .rounded(px(7.))
+                                                .bg(rgb(0xe95420))
                                                 .flex()
                                                 .items_center()
                                                 .justify_center()
                                                 .child(
                                                     Icon::default()
-                                                        .data(glyph::UBUNTU)
-                                                        .size(px(14.))
+                                                        .data(glyph::UBUNTU_SOLID)
+                                                        .size(px(15.))
                                                         .text_color(rgb(0xffffff)),
                                                 ),
                                         )
@@ -5976,7 +6020,12 @@ impl SshDeck {
                         .icon(icon.text_color(if selected { green } else { muted }))
                         .tooltip(tip)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.sidebar_tab = tab;
+                            if this.sidebar_tab == tab && this.sidebar_open {
+                                this.sidebar_open = false;
+                            } else {
+                                this.sidebar_tab = tab;
+                                this.sidebar_open = true;
+                            }
                             cx.notify();
                         })),
                 )
@@ -6060,7 +6109,21 @@ impl SshDeck {
                                 Icon::new(IconName::Palette),
                                 SidebarTab::Appearance,
                                 cx,
-                            )),
+                            ))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .child(
+                                        Button::new("side-close-btn")
+                                            .ghost()
+                                            .icon(Icon::new(IconName::Close).size(px(14.)).text_color(muted))
+                                            .tooltip("Close sidebar (⌘B)")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.sidebar_open = false;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
                     )
                     .child(
                         div()
@@ -7655,7 +7718,7 @@ impl SshDeck {
                                     .size(px(40.))
                                     .flex_shrink_0()
                                     .rounded(px(10.))
-                                    .bg(rgb(0xd96c2b))
+                                    .bg(rgb(0xe95420))
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -7794,6 +7857,7 @@ impl Render for SshDeck {
             .on_action(cx.listener(Self::handle_find_in_terminal))
             .on_action(cx.listener(Self::handle_new_tab))
             .on_action(cx.listener(Self::handle_close_tab))
+            .on_action(cx.listener(Self::handle_toggle_sidebar))
             .on_action(cx.listener(Self::handle_open_settings))
             .on_action(cx.listener(Self::handle_zoom_in))
             .on_action(cx.listener(Self::handle_zoom_out))
