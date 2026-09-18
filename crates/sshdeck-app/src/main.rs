@@ -40,6 +40,7 @@ use snippets_pane::SnippetsPane;
 use sshdeck_core::session::{Session as SshSession, SessionConfig, SessionEvent};
 use sshdeck_core::{Host, HostId, HostStore, SessionState};
 use sshdeck_sftp::SftpClient;
+use sshdeck_vault::Vault;
 use terminal::{
     PaneHeaderAction, PaneStatus, TerminalOptions, TerminalPane, TerminalScheme, SCHEMES,
 };
@@ -854,6 +855,10 @@ struct SshDeck {
     draft_port: Entity<InputState>,
     /// The in-flight secret prompt, when a host needs a password we do not have.
     secret: Option<(HostId, Entity<InputState>)>,
+    /// Encrypted password store (OS-keychain master key). `None` when the
+    /// vault could not be opened — password hosts then fall back to the
+    /// per-connection prompt instead of persisting anything.
+    vault: Option<Vault>,
     /// The command palette while it is open, if at all.
     palette: Option<Entity<PaletteView>>,
     /// The settings or keys pane showing over the session, if at all.
@@ -939,12 +944,81 @@ struct SshDeck {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Stable vault id for a host's login password: `login:{host-id}`.
+///
+/// The inventory only ever stores this id. The secret itself lives in the
+/// encrypted vault, never in `hosts.json` in plaintext.
+fn password_secret_id(host_id: &HostId) -> String {
+    format!("login:{}", host_id.as_str())
+}
+
+/// Resolves a vault reference to its secret. Vault errors and missing entries
+/// both mean "no secret" — the caller falls back to the prompt, never to a
+/// guess.
+fn resolve_password(vault: Option<&Vault>, secret_ref: &str) -> Option<String> {
+    vault
+        .and_then(|vault| vault.get(secret_ref).ok())
+        .flatten()
+        .map(|secret| secret.to_string())
+}
+
+/// One-time rescue for inventories written when the details field stored its
+/// text as the reference: any `Password` reference the vault cannot resolve
+/// (and which is not already a stable id) is treated as the legacy secret,
+/// re-stored under the stable id, and the host is pointed at it. Returns the
+/// number of hosts migrated.
+fn migrate_legacy_password_refs(store: &mut HostStore, vault: &mut Vault) -> usize {
+    let mut migrated = 0;
+    for mut host in store.inventory().hosts().to_vec() {
+        let sshdeck_core::AuthMethod::Password { secret_ref } = &host.auth else {
+            continue;
+        };
+        let stable = password_secret_id(&host.id);
+        if secret_ref == &stable {
+            continue;
+        }
+        if vault.get(secret_ref).ok().flatten().is_some() {
+            continue;
+        }
+        if secret_ref.is_empty() {
+            continue;
+        }
+        let legacy = secret_ref.clone();
+        if vault.set(stable.clone(), &legacy).is_err() {
+            continue;
+        }
+        host.auth = sshdeck_core::AuthMethod::Password { secret_ref: stable };
+        store.inventory_mut().upsert(host);
+        migrated += 1;
+    }
+    if migrated > 0 {
+        let _ = vault.save();
+        let _ = store.save();
+    }
+    migrated
+}
+
 impl SshDeck {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut store = HostStore::at_default_path();
         // A store that cannot be read is empty, not fatal: the UI surfaces the
         // problem on the next save rather than refusing to start.
         let load_error = store.load().err();
+
+        // The vault owns every login secret; the inventory keeps only opaque
+        // ids. Legacy plaintext references are rescued into it on startup so
+        // `hosts.json` ends up secret-free after one launch.
+        let mut vault_error = None;
+        let vault = match Vault::open_default() {
+            Ok(mut vault) => {
+                migrate_legacy_password_refs(&mut store, &mut vault);
+                Some(vault)
+            }
+            Err(error) => {
+                vault_error = Some(format!("Password vault unavailable: {error}"));
+                None
+            }
+        };
 
         let filter = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Find a host or ssh user@hostname...")
@@ -1031,9 +1105,16 @@ impl SshDeck {
                 window.push_notification(Notification::error(message), cx);
             });
         }
+        if let Some(error) = vault_error {
+            let message = SharedString::from(error);
+            cx.defer_in(window, move |_, window, cx| {
+                window.push_notification(Notification::error(message), cx);
+            });
+        }
 
         let view = Self {
             store,
+            vault,
             selected: None,
             tab: MainTab::Vaults,
             left_nav: LeftNav::Hosts,
@@ -1242,7 +1323,11 @@ impl SshDeck {
                 state.set_value(host.username.as_str(), window, cx);
             });
             let password = match &host.auth {
-                sshdeck_core::AuthMethod::Password { secret_ref } => secret_ref.clone(),
+                // The box shows the secret itself (Termius behaviour), resolved
+                // from the vault — the inventory id is never user-facing.
+                sshdeck_core::AuthMethod::Password { secret_ref } => {
+                    resolve_password(self.vault.as_ref(), secret_ref).unwrap_or_default()
+                }
                 _ => String::new(),
             };
             self.details_password.update(cx, |state, cx| {
@@ -1353,48 +1438,72 @@ impl SshDeck {
 
     /// Writes the details Password input back to the selected host.
     ///
-    /// A non-empty value selects password auth with that keychain reference;
-    /// clearing the field drops a password-auth host back to agent auth rather
-    /// than persisting an empty secret. Other methods (key, FIDO2) are left
-    /// alone until their own editors exist — typing here must not silently
-    /// discard a key path.
+    /// Termius behaviour: this box IS the password. A non-empty value is
+    /// sealed into the encrypted vault under the host's stable id and the
+    /// inventory keeps only that opaque id — never the secret. Clearing the
+    /// field drops a password-auth host back to agent auth and removes the
+    /// vault entry. Key-based methods are left alone until their own editors
+    /// exist. Without an open vault there is no honest place to keep a
+    /// secret, so the edit is reverted with an error instead of persisting
+    /// plaintext.
     fn commit_details_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.details_edit_host.clone() else {
             return;
         };
         let password = self.details_password.read(cx).value().to_string();
+        let secret_id = password_secret_id(&id);
+        let Some(vault) = self.vault.as_mut() else {
+            self.details_password.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+            window.push_notification(
+                Notification::error("Password vault unavailable: cannot save password"),
+                cx,
+            );
+            return;
+        };
+        let current = vault.get(&secret_id).ok().flatten();
+        if current.as_deref().map(|secret| secret.as_str()) == Some(password.as_str()) {
+            return;
+        }
         if let Some(mut host) = self.store.inventory().get(&id).cloned() {
-            let next = match &host.auth {
-                sshdeck_core::AuthMethod::Password { secret_ref } if secret_ref == &password => {
-                    None
+            if password.is_empty() {
+                let _ = vault.remove(&secret_id);
+                if matches!(host.auth, sshdeck_core::AuthMethod::Password { .. }) {
+                    host.auth = sshdeck_core::AuthMethod::Agent;
+                    self.store.inventory_mut().upsert(host);
                 }
-                sshdeck_core::AuthMethod::Password { .. } => Some(if password.is_empty() {
-                    sshdeck_core::AuthMethod::Agent
-                } else {
-                    sshdeck_core::AuthMethod::Password {
-                        secret_ref: password,
-                    }
-                }),
-                sshdeck_core::AuthMethod::Agent if !password.is_empty() => {
-                    Some(sshdeck_core::AuthMethod::Password {
-                        secret_ref: password,
-                    })
-                }
-                // Key-based and other methods are left alone: typing here
-                // must not silently discard a key path.
-                _ => None,
-            };
-            if let Some(auth) = next {
-                host.auth = auth;
-                self.store.inventory_mut().upsert(host);
-                if let Err(error) = self.store.save() {
+            } else {
+                if let Err(error) = vault.set(secret_id.clone(), &password) {
                     window.push_notification(
-                        Notification::error(format!("Could not save: {error}")),
+                        Notification::error(format!("Could not save password: {error}")),
                         cx,
                     );
+                    return;
                 }
-                cx.notify();
+                // Key-based and other methods are left alone: typing here
+                // must not silently discard a key path — but a host on agent
+                // auth with a fresh password means password auth.
+                if !matches!(host.auth, sshdeck_core::AuthMethod::Password { .. })
+                    && !matches!(host.auth, sshdeck_core::AuthMethod::Agent)
+                {
+                    return;
+                }
+                host.auth = sshdeck_core::AuthMethod::Password {
+                    secret_ref: secret_id,
+                };
+                self.store.inventory_mut().upsert(host);
             }
+            if let Err(error) = vault.save() {
+                window.push_notification(
+                    Notification::error(format!("Could not save password: {error}")),
+                    cx,
+                );
+            } else if let Err(error) = self.store.save() {
+                window
+                    .push_notification(Notification::error(format!("Could not save: {error}")), cx);
+            }
+            cx.notify();
         }
     }
 
@@ -1467,9 +1576,9 @@ impl SshDeck {
         }
 
         let config = match &host.auth {
-            // The password lives in the OS keychain, which the vault crate owns.
-            // Until that is wired into this view, ask for it once and use it for
-            // this connection only: it is never written to the inventory.
+            // The sidebar password box is the password (Termius behaviour):
+            // resolve the vaulted secret and connect directly. The prompt is
+            // only the fallback for hosts with no stored secret.
             //
             // Development and test affordance, not a user feature: when
             // `SSHDECK_PASSWORD` is set, use it instead of prompting so an
@@ -1477,13 +1586,15 @@ impl SshDeck {
             // environment into the connection config — never logged, never
             // written to disk, never shown in the UI. Without it, the prompt is
             // exactly as before.
-            sshdeck_core::AuthMethod::Password { .. } => match env_password() {
-                Some(password) => SessionConfig::from_host(&host).with_password(password),
-                None => {
-                    self.prompt_for_secret(&host, window, cx);
-                    return;
+            sshdeck_core::AuthMethod::Password { secret_ref } => {
+                match resolve_password(self.vault.as_ref(), secret_ref).or_else(env_password) {
+                    Some(password) => SessionConfig::from_host(&host).with_password(password),
+                    None => {
+                        self.prompt_for_secret(&host, window, cx);
+                        return;
+                    }
                 }
-            },
+            }
             _ => SessionConfig::from_host(&host),
         };
 
@@ -1492,9 +1603,9 @@ impl SshDeck {
 
     /// Asks for the host's password before connecting.
     ///
-    /// The password is used for this connection only and never reaches the
-    /// inventory. The keychain-backed vault owns persistent secrets; until it is
-    /// wired into this view, this is the honest way to connect at all.
+    /// Fallback for hosts with no vaulted secret. Submitting seals the secret
+    /// into the vault (see `submit_secret`), so this prompt appears at most
+    /// once per host.
     fn prompt_for_secret(&mut self, host: &Host, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = cx.new(|cx| InputState::new(window, cx).placeholder("Password"));
         let label = host.label.clone();
@@ -1504,6 +1615,10 @@ impl SshDeck {
     }
 
     /// Connects the host whose password was just entered, then clears the prompt.
+    ///
+    /// The password is also sealed into the vault under the host's stable id
+    /// (Termius remembers it), so the next Connect goes straight through.
+    /// Without an open vault it stays connection-only, as before.
     fn submit_secret(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((host_id, input)) = self.secret.take() else {
             return;
@@ -1511,8 +1626,27 @@ impl SshDeck {
         let Some(host) = self.store.inventory().get(&host_id).cloned() else {
             return;
         };
-        // A password is not persisted; it exists for this connection only.
         let password = input.read(cx).value().to_string();
+        if !password.is_empty() {
+            let secret_id = password_secret_id(&host_id);
+            if let Some(vault) = self.vault.as_mut() {
+                if vault.set(secret_id.clone(), &password).is_ok() {
+                    let _ = vault.save();
+                    let mut host = host.clone();
+                    host.auth = sshdeck_core::AuthMethod::Password {
+                        secret_ref: secret_id,
+                    };
+                    self.store.inventory_mut().upsert(host);
+                    let _ = self.store.save();
+                }
+            }
+        }
+        let host = self
+            .store
+            .inventory()
+            .get(&host_id)
+            .cloned()
+            .unwrap_or(host);
         let config = SessionConfig::from_host(&host).with_password(password);
         self.open_pane(&host, config, window, cx);
     }
@@ -6698,5 +6832,65 @@ mod tests {
         assert_eq!(host_card_height(true, 400.0), 48.0);
         assert_eq!(host_card_height(false, 400.0), 56.0);
         assert_eq!(host_card_height(false, 1200.0), 68.0);
+    }
+
+    fn test_vault(name: &str) -> (Vault, std::path::PathBuf) {
+        // Passphrase vaults never touch the OS keychain: safe on CI runners.
+        let dir = std::env::temp_dir().join(format!("sshdeck-vault-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault =
+            Vault::open_with_passphrase(dir.join("vault.json"), b"test-passphrase").unwrap();
+        (vault, dir)
+    }
+
+    #[test]
+    fn password_secret_id_is_stable_per_host() {
+        let host = Host::new("vps", "10.0.0.1");
+        let first = password_secret_id(&host.id);
+        assert!(first.starts_with("login:"));
+        assert_eq!(first, password_secret_id(&host.id));
+        assert_ne!(
+            first,
+            password_secret_id(&Host::new("other", "10.0.0.2").id)
+        );
+    }
+
+    #[test]
+    fn vaulted_password_resolves_and_missing_is_none() {
+        let (mut vault, dir) = test_vault("resolve");
+        assert_eq!(resolve_password(Some(&vault), "login:x"), None);
+        assert_eq!(resolve_password(None, "login:x"), None);
+        vault.set("login:x", "s3cret").unwrap();
+        assert_eq!(
+            resolve_password(Some(&vault), "login:x").as_deref(),
+            Some("s3cret")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_plaintext_refs_migrate_to_stable_ids() {
+        let dir = std::env::temp_dir().join("sshdeck-vault-test-migrate");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = HostStore::new(dir.join("hosts.json"));
+        let mut host = Host::new("vps", "10.0.0.1");
+        host.auth = sshdeck_core::AuthMethod::Password {
+            secret_ref: "legacy-typed-password".into(),
+        };
+        store.inventory_mut().upsert(host.clone());
+        let (mut vault, _) = test_vault("migrate");
+        assert_eq!(migrate_legacy_password_refs(&mut store, &mut vault), 1);
+        let migrated = store.inventory().get(&host.id).unwrap();
+        let sshdeck_core::AuthMethod::Password { secret_ref } = &migrated.auth else {
+            panic!("auth must stay password");
+        };
+        assert_eq!(secret_ref, &password_secret_id(&host.id));
+        assert_eq!(
+            resolve_password(Some(&vault), secret_ref).as_deref(),
+            Some("legacy-typed-password")
+        );
+        // Second run is a no-op: the stable id already resolves.
+        assert_eq!(migrate_legacy_password_refs(&mut store, &mut vault), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
