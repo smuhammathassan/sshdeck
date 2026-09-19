@@ -5198,7 +5198,7 @@ impl SshDeck {
     }
 
     /// Miniature terminal preview swatch matching Termius design (Screenshot 2026-09-17 at 3.09.09 PM).
-    fn render_terminal_theme_swatch(scheme: &TerminalScheme) -> Div {
+    fn render_terminal_theme_swatch(scheme: &TerminalScheme) -> impl IntoElement {
         let bg = scheme.background();
         let fg = scheme.foreground();
         let cursor = scheme.cursor();
@@ -5258,8 +5258,11 @@ impl SshDeck {
     fn render_theme_browser(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
-        let accent = rgb(0x1677ff);
+        let accent: Hsla = rgb(0x1677ff).into();
         let card_bg = cx.theme().popover;
+        let chosen_bg: Hsla = rgba(0x1677ff14).into();
+        let chosen_border: Hsla = rgba(0x1677ff55).into();
+        let transparent: Hsla = rgba(0x00000000).into();
         let selected = self.selected_theme.clone();
         div()
             .flex()
@@ -5311,13 +5314,9 @@ impl SshDeck {
                     .px_3()
                     .py_2()
                     .rounded(px(12.))
-                    .bg(if chosen { rgba(0x1677ff14) } else { card_bg })
+                    .bg(if chosen { chosen_bg } else { card_bg })
                     .border_1()
-                    .border_color(if chosen {
-                        rgba(0x1677ff55)
-                    } else {
-                        rgba(0x00000000)
-                    })
+                    .border_color(if chosen { chosen_border } else { transparent })
                     .cursor_pointer()
                     .hover(|s| s.bg(cx.theme().muted))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -7767,74 +7766,75 @@ impl SshDeck {
                             .child(format!("{} themes", SCHEMES.len())),
                     ),
             )
-            .children(SCHEMES.iter().map(|(name, scheme)| {
-                let chosen = selected == *name;
-                let theme_name = name.to_string();
-                let meta_text = match *name {
-                    "Termius Dark" => "∞",
-                    "Flexoki Dark" | "Flexoki Light" => "new",
-                    _ => scheme.meta(),
-                };
-                div()
-                    .id(SharedString::from(format!("side-theme-{name}")))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .w_full()
-                    .p_2()
-                    .rounded(px(10.))
-                    .bg(if chosen {
-                        rgba(0x1677ff14)
-                    } else {
-                        rgba(0x00000000)
-                    })
-                    .border_1()
-                    .border_color(if chosen {
-                        rgba(0x1677ff55)
-                    } else {
-                        rgba(0x8d91a51a).into()
-                    })
-                    .cursor_pointer()
-                    .hover(|s| s.bg(cx.theme().muted))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.selected_theme = theme_name.clone();
-                        this.apply_terminal_scheme(window, cx);
-                        cx.notify();
-                    }))
-                    .child(Self::render_terminal_theme_swatch(scheme))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .flex_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(if chosen {
-                                        gpui_kit::FontWeight::SEMIBOLD
-                                    } else {
-                                        gpui_kit::FontWeight::MEDIUM
-                                    })
-                                    .text_color(if chosen {
-                                        rgb(0x1677ff)
-                                    } else {
-                                        cx.theme().foreground
-                                    })
-                                    .child(SharedString::from(name.to_string())),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(SharedString::from(meta_text.to_string())),
-                            ),
-                    )
-                    .when(chosen, |el| {
-                        el.child(Icon::new(IconName::Check).text_color(rgb(0x1677ff)))
-                    })
-            }))
+            .children({
+                let blue_accent: Hsla = rgb(0x1677ff).into();
+                let chosen_bg: Hsla = rgba(0x1677ff14).into();
+                let chosen_border: Hsla = rgba(0x1677ff55).into();
+                let unchosen_border: Hsla = rgba(0x8d91a51a).into();
+                let transparent: Hsla = rgba(0x00000000).into();
+                let fg = cx.theme().foreground;
+                let muted = cx.theme().muted_foreground;
+                SCHEMES.iter().map(move |(name, scheme)| {
+                    let chosen = selected == *name;
+                    let theme_name = name.to_string();
+                    let meta_text = match *name {
+                        "Termius Dark" => "∞",
+                        "Flexoki Dark" | "Flexoki Light" => "new",
+                        _ => scheme.meta(),
+                    };
+                    div()
+                        .id(SharedString::from(format!("side-theme-{name}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .w_full()
+                        .p_2()
+                        .rounded(px(10.))
+                        .bg(if chosen { chosen_bg } else { transparent })
+                        .border_1()
+                        .border_color(if chosen {
+                            chosen_border
+                        } else {
+                            unchosen_border
+                        })
+                        .cursor_pointer()
+                        .hover(|s| s.bg(cx.theme().muted))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.selected_theme = theme_name.clone();
+                            this.apply_terminal_scheme(window, cx);
+                            cx.notify();
+                        }))
+                        .child(Self::render_terminal_theme_swatch(scheme))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(if chosen {
+                                            gpui_kit::FontWeight::SEMIBOLD
+                                        } else {
+                                            gpui_kit::FontWeight::MEDIUM
+                                        })
+                                        .text_color(if chosen { blue_accent } else { fg })
+                                        .child(SharedString::from(name.to_string())),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(SharedString::from(meta_text.to_string())),
+                                ),
+                        )
+                        .when(chosen, |el| {
+                            el.child(Icon::new(IconName::Check).text_color(blue_accent))
+                        })
+                })
+            })
             .into_any_element()
     }
 

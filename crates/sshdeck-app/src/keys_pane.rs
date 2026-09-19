@@ -61,6 +61,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::glyph::RADIOWAVES;
+
 use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariants as _},
@@ -1751,10 +1753,8 @@ impl KeysPane {
                 let meta = String::new();
                 let id = SharedString::from(format!("known-{title}-{}", entry.key_type));
                 let row = match self.view {
-                    ViewMode::Grid => card(id, glyph::RADIOWAVES, title, meta, false, alarm, cx),
-                    ViewMode::List => {
-                        list_row(id, glyph::RADIOWAVES, title, meta, false, alarm, cx)
-                    }
+                    ViewMode::Grid => card(id, RADIOWAVES, title, meta, false, alarm, cx),
+                    ViewMode::List => list_row(id, RADIOWAVES, title, meta, false, alarm, cx),
                 };
                 match (entry.revoked, changed) {
                     (true, _) => row.child(state_pill("REVOKED", cx.theme().danger, cx)),
