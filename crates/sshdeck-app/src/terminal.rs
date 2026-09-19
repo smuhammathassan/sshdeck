@@ -2055,35 +2055,47 @@ impl Render for TerminalPane {
                     .min_h(px(0.))
                     .w_full()
                     .overflow_hidden()
-                    .child(div().absolute().size_full().child(gpui_kit::canvas(
-                        move |bounds: Bounds<gpui_kit::Pixels>, _, _| bounds.size,
-                        {
-                            // A canvas paints with `&mut App`, so the pane is reached
-                            // through a weak handle rather than `Context::listener`.
-                            let view = cx.entity().downgrade();
-                            move |bounds: Bounds<gpui_kit::Pixels>,
-                                  size: gpui_kit::Size<gpui_kit::Pixels>,
-                                  _,
-                                  cx| {
-                                view.update(cx, |pane, cx| {
-                                    // The grid shares the wrapper's top-left, so this is
-                                    // the origin a mouse position is measured from.
-                                    pane.grid_origin = bounds.origin;
-                                    let cols =
-                                        (f32::from(size.width) / cell_w).floor().max(1.0) as u16;
-                                    let rows =
-                                        (f32::from(size.height) / cell_h).floor().max(1.0) as u16;
-                                    // Re-render only when the grid actually changed shape;
-                                    // otherwise every frame would schedule the next one.
-                                    if pane.resize(cols, rows) {
-                                        cx.notify();
+                    .pl(px(14.))
+                    .pr(px(10.))
+                    .pt(px(8.))
+                    .pb(px(8.))
+                    .child(
+                        div()
+                            .relative()
+                            .size_full()
+                            .overflow_hidden()
+                            .child(div().absolute().size_full().child(gpui_kit::canvas(
+                                move |bounds: Bounds<gpui_kit::Pixels>, _, _| bounds.size,
+                                {
+                                    // A canvas paints with `&mut App`, so the pane is reached
+                                    // through a weak handle rather than `Context::listener`.
+                                    let view = cx.entity().downgrade();
+                                    move |bounds: Bounds<gpui_kit::Pixels>,
+                                          size: gpui_kit::Size<gpui_kit::Pixels>,
+                                          _,
+                                          cx| {
+                                        view.update(cx, |pane, cx| {
+                                            // The grid shares the wrapper's top-left, so this is
+                                            // the origin a mouse position is measured from.
+                                            pane.grid_origin = bounds.origin;
+                                            let cols =
+                                                (f32::from(size.width) / cell_w).floor().max(1.0)
+                                                    as u16;
+                                            let rows =
+                                                (f32::from(size.height) / cell_h).floor().max(1.0)
+                                                    as u16;
+                                            // Re-render only when the grid actually changed shape;
+                                            // otherwise every frame would schedule the next one.
+                                            if pane.resize(cols, rows) {
+                                                cx.notify();
+                                            }
+                                        })
+                                        .ok();
                                     }
-                                })
-                                .ok();
-                            }
-                        },
-                    )))
-                    .child(grid),
+                                },
+                            )))
+                            .child(grid),
+                    ),
             );
 
         if let Some(label) = search_label {

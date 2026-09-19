@@ -4277,7 +4277,7 @@ impl SshDeck {
                     div()
                         .text_size(px(12.))
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .min_w(px(0.))
+                        .max_w(px(180.))
                         .truncate()
                         .child(SharedString::from(label)),
                 )
@@ -8096,6 +8096,7 @@ impl SshDeck {
             .h_full()
             .min_h(px(0.))
             .overflow_hidden()
+            .bg(rgb(0x0f111a))
             .when(show_toolbar, |el| el.child(toolbar))
             .child(
                 div()
@@ -8105,7 +8106,7 @@ impl SshDeck {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .p(px(8.))
+                    .p(px(10.))
                     .child(
                         div()
                             .flex()
@@ -8167,7 +8168,7 @@ impl SshDeck {
                     .min_w(px(0.))
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .gap_2()
+                    .gap(px(10.))
                     .when(column, |el| el.flex_col())
                     .when(!column, |el| el.flex_row())
                     .children(items)
@@ -8207,14 +8208,19 @@ impl SshDeck {
             };
 
             let tab_bg = if is_active {
-                rgb(0x0e3a2f)
+                rgb(0x282c3f)
             } else {
-                rgb(0x1d2033)
+                rgba(0xffffff00)
             };
             let tab_fg = if is_active {
-                rgb(0x10b981)
+                rgb(0xffffff)
             } else {
                 rgb(0x8d91a5)
+            };
+            let tab_border = if is_active {
+                rgba(0xffffff1e)
+            } else {
+                rgba(0xffffff00)
             };
 
             let drag_btn = Button::new(SharedString::from(format!("drag-{pane_index}-{tab_idx}")))
@@ -8237,7 +8243,7 @@ impl SshDeck {
                 Icon::new(IconName::Close)
                     .size(px(11.))
                     .text_color(if is_active {
-                        rgb(0x10b981)
+                        rgb(0xd0d4e4)
                     } else {
                         rgb(0x8d91a5)
                     }),
@@ -8254,15 +8260,17 @@ impl SshDeck {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_1()
+                .gap_1p5()
                 .h(px(26.))
-                .px_2()
-                .rounded_t(px(4.))
+                .px_2p5()
+                .rounded(px(6.))
                 .bg(tab_bg)
+                .border_1()
+                .border_color(tab_border)
                 .text_color(tab_fg)
                 .text_size(px(12.))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(0x32364c)))
+                .when(!is_active, |el| el.hover(|s| s.bg(rgb(0x222638))))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
@@ -8288,22 +8296,12 @@ impl SshDeck {
                     }),
                 );
 
-            tab_item = if is_active {
-                tab_item
-                    .child(close_btn)
-                    .child(div().max_w(px(140.)).overflow_hidden().child(label))
-                    .when(is_connected, |el| {
-                        el.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)))
-                    })
-            } else {
-                tab_item
-                    .child(drag_btn)
-                    .child(div().max_w(px(140.)).overflow_hidden().child(label))
-                    .when(is_connected, |el| {
-                        el.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)))
-                    })
-                    .child(close_btn)
-            };
+            tab_item = tab_item
+                .child(div().max_w(px(140.)).truncate().child(label))
+                .when(is_connected, |el| {
+                    el.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)))
+                })
+                .child(close_btn);
 
             tab_item = tab_item.on_click(cx.listener(move |this, _, window, cx| {
                 this.workspace = workspace_switch_tab(&this.workspace, pane_index, tab_idx);
@@ -8319,10 +8317,20 @@ impl SshDeck {
         }
 
         // 2. Pane controls on the right
+        let btn_color = if is_focused {
+            rgb(0xd0d4e4)
+        } else {
+            rgb(0x8d91a5)
+        };
+
         let add_btn = Button::new(SharedString::from(format!("pane-add-{pane_index}")))
             .ghost()
             .xsmall()
-            .icon(IconName::Plus)
+            .icon(
+                Icon::new(IconName::Plus)
+                    .size(px(12.))
+                    .text_color(btn_color),
+            )
             .tooltip("New tab in this pane")
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_tab(MainTab::NewTab, window, cx);
@@ -8335,7 +8343,7 @@ impl SshDeck {
                 Icon::default()
                     .data(glyph::SPLIT_HORIZONTAL)
                     .size(px(13.))
-                    .text_color(rgb(0x10b981)),
+                    .text_color(btn_color),
             )
             .tooltip("Split side by side")
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -8358,7 +8366,7 @@ impl SshDeck {
                 Icon::default()
                     .data(glyph::SPLIT_VERTICAL)
                     .size(px(13.))
-                    .text_color(rgb(0x10b981)),
+                    .text_color(btn_color),
             )
             .tooltip("Split stacked")
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -8381,7 +8389,7 @@ impl SshDeck {
                 Icon::default()
                     .data(glyph::EXPAND)
                     .size(px(13.))
-                    .text_color(rgb(0x10b981)),
+                    .text_color(btn_color),
             )
             .tooltip(if self.workspace_maximized {
                 "Tile all"
@@ -8401,7 +8409,7 @@ impl SshDeck {
             .icon(
                 Icon::new(IconName::Close)
                     .size(px(12.))
-                    .text_color(rgb(0x10b981)),
+                    .text_color(btn_color),
             )
             .tooltip("Close pane")
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -8448,7 +8456,7 @@ impl SshDeck {
                         })
                         .unwrap_or_else(|| {
                             if is_local {
-                                "~".to_string()
+                                "local".to_string()
                             } else {
                                 "root".to_string()
                             }
@@ -8482,13 +8490,13 @@ impl SshDeck {
             single_session_info
         {
             let title_color = if is_focused {
-                rgb(0x10b981)
+                rgb(0xffffff)
             } else {
-                rgb(0xd0d4e4)
+                rgb(0xc5c9db)
             };
             let icon_element = if is_local {
                 div()
-                    .size(px(18.))
+                    .size(px(20.))
                     .rounded(px(5.))
                     .bg(rgb(0x282c3f))
                     .flex()
@@ -8497,7 +8505,7 @@ impl SshDeck {
                     .child(
                         Icon::default()
                             .data(glyph::TERMINAL_PROMPT)
-                            .size(px(11.))
+                            .size(px(12.))
                             .text_color(if is_focused {
                                 rgb(0x10b981)
                             } else {
@@ -8506,7 +8514,7 @@ impl SshDeck {
                     )
             } else {
                 div()
-                    .size(px(18.))
+                    .size(px(20.))
                     .rounded(px(5.))
                     .bg(tint)
                     .flex()
@@ -8515,13 +8523,13 @@ impl SshDeck {
                     .child(
                         Icon::default()
                             .data(glyph::UBUNTU_SOLID)
-                            .size(px(12.))
+                            .size(px(13.))
                             .text_color(rgb(0xffffff)),
                     )
             };
 
             let subtitle_text = if is_local {
-                "~".to_string()
+                "local".to_string()
             } else {
                 format!("ssh, {username}")
             };
@@ -8579,8 +8587,10 @@ impl SshDeck {
             .flex()
             .flex_row()
             .items_center()
-            .h(px(32.))
-            .bg(rgb(0x131722))
+            .h(px(38.))
+            .bg(rgb(0x1a1d2d))
+            .border_b_1()
+            .border_color(rgba(0xffffff0e))
             .px_3()
             .child(header_left)
             .child(
@@ -8607,12 +8617,10 @@ impl SshDeck {
                         )
                     })
                     .when(tabs.len() > 1, |el| el.child(add_btn))
-                    .when(is_focused, |el| {
-                        el.child(split_h_btn)
-                            .child(split_v_btn)
-                            .child(max_btn)
-                            .child(close_pane_btn)
-                    }),
+                    .child(split_h_btn)
+                    .child(split_v_btn)
+                    .child(max_btn)
+                    .child(close_pane_btn),
             );
 
         // 3. Active session pane
@@ -8951,13 +8959,18 @@ impl SshDeck {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .rounded(px(8.))
+            .rounded(px(10.))
+            .bg(rgb(0x161928))
             .border_1()
             .border_color(if is_focused {
-                rgb(0x10b981)
+                rgba(0x10b98188)
             } else {
-                rgba(0xffffff14)
+                rgba(0xffffff10)
             })
+            .when(!is_focused, |el| {
+                el.hover(|s| s.border_color(rgba(0xffffff24)))
+            })
+            .shadow_sm()
             .child(tab_bar)
             .child(
                 div()
