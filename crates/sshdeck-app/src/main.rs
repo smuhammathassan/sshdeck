@@ -1051,6 +1051,38 @@ fn workspace_add_tab_to_pane(
     rec(node, target_pane, session, &mut counter)
 }
 
+/// Returns the tabs and active tab index for `target_pane` leaf.
+fn workspace_get_pane(node: &WorkspaceNode, target_pane: usize) -> Option<(Vec<usize>, usize)> {
+    let mut counter = 0;
+    fn rec(
+        node: &WorkspaceNode,
+        target: usize,
+        counter: &mut usize,
+    ) -> Option<(Vec<usize>, usize)> {
+        match node {
+            WorkspaceNode::Empty => None,
+            WorkspaceNode::Pane { tabs, active } => {
+                let cur = *counter;
+                *counter += 1;
+                if cur == target {
+                    Some((tabs.clone(), *active))
+                } else {
+                    None
+                }
+            }
+            WorkspaceNode::Split { children, .. } => {
+                for ch in children {
+                    if let Some(res) = rec(ch, target, counter) {
+                        return Some(res);
+                    }
+                }
+                None
+            }
+        }
+    }
+    rec(node, target_pane, &mut counter)
+}
+
 /// Switches active tab in a specific pane leaf.
 fn workspace_switch_tab(
     node: &WorkspaceNode,
@@ -2947,7 +2979,7 @@ impl SshDeck {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let current_sess_idx = find_pane(&self.workspace, pane_index, &mut 0)
+        let current_sess_idx = workspace_get_pane(&self.workspace, pane_index)
             .and_then(|(tabs, active)| tabs.get(active).copied())
             .or(self.active)
             .unwrap_or(0);
@@ -2966,7 +2998,7 @@ impl SshDeck {
             if let Some(host) = host {
                 let config = match &host.auth {
                     sshdeck_core::AuthMethod::Password { secret_ref } => {
-                        match resolve_password(self.vault.as_ref(), secret_ref)
+                        match resolve_password(self.vault.as_ref(), secret_ref.as_str())
                             .or_else(env_password)
                         {
                             Some(password) => {
@@ -3046,9 +3078,10 @@ impl SshDeck {
                     if next_tabs.is_empty() {
                         next_tabs.push(tabs[0]);
                     }
+                    let active_idx = (*active).min(next_tabs.len() - 1);
                     WorkspaceNode::Pane {
                         tabs: next_tabs,
-                        active: (*active).min(next_tabs.len() - 1),
+                        active: active_idx,
                     }
                 }
                 WorkspaceNode::Split {
@@ -3418,7 +3451,7 @@ impl SshDeck {
                 if let Some(host) = host {
                     let config = match &host.auth {
                         sshdeck_core::AuthMethod::Password { secret_ref } => {
-                            match resolve_password(self.vault.as_ref(), secret_ref)
+                            match resolve_password(self.vault.as_ref(), secret_ref.as_str())
                                 .or_else(env_password)
                             {
                                 Some(password) => {
@@ -8937,7 +8970,7 @@ impl SshDeck {
                 if from_pane == pane_index {
                     tabs.get(from_tab).copied()
                 } else {
-                    find_pane(&self.workspace, from_pane, &mut 0)
+                    workspace_get_pane(&self.workspace, from_pane)
                         .and_then(|(p_tabs, _)| p_tabs.get(from_tab).copied())
                 }
             })
