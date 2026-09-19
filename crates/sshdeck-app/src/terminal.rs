@@ -1680,6 +1680,7 @@ impl TerminalPane {
                     .top(px(0.0))
                     .w(px(cell_w))
                     .h(px(cell_h))
+                    .rounded(px(1.))
                     // The scheme's cursor colour, translucent so the glyph under
                     // the block stays readable.
                     .bg(translucent(scheme.cursor(), 0.4)),
@@ -1892,7 +1893,9 @@ fn measure_cell(window: &mut Window, font_size: f32) -> (f32, f32) {
     let text_system = window.text_system().clone();
     let font_id = text_system.resolve_font(&font("Menlo"));
     let bounds = text_system.bounding_box(font_id, px(font_size));
-    let height = (f32::from(bounds.size.height) / 0.7).max(font_size).round();
+    let height = (f32::from(bounds.size.height) * 1.06)
+        .max(font_size * 1.2)
+        .round();
     let advance = f32::from(text_system.layout_width(font_id, px(font_size), 'M'));
     let advance = if advance > 0.0 {
         advance.round()

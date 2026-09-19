@@ -1343,7 +1343,109 @@ fn workspace_split_pane_with_session(
         }
     }
 
-    split_pane(&clean, target_pane, session, dir, place_after, &mut counter)
+    let clean_panes = workspace_panes_count(&clean);
+    let target = target_pane.min(clean_panes.saturating_sub(1));
+
+    split_pane(&clean, target, session, dir, place_after, &mut counter)
+}
+
+/// Splits `target_pane` by creating a new adjacent pane with `new_session`.
+/// Returns the updated `WorkspaceNode` tree and the newly focused pane index.
+fn workspace_split_pane_new_session(
+    node: &WorkspaceNode,
+    target_pane: usize,
+    new_session: usize,
+    dir: SplitDir,
+    place_after: bool,
+) -> (WorkspaceNode, usize) {
+    let panes = workspace_panes_count(node);
+    if panes == 0 {
+        return (
+            WorkspaceNode::Pane {
+                tabs: vec![new_session],
+                active: 0,
+            },
+            0,
+        );
+    }
+    let target = target_pane.min(panes.saturating_sub(1));
+    let mut counter = 0;
+    let mut new_focus = 0;
+
+    fn split_pane(
+        node: &WorkspaceNode,
+        target: usize,
+        sess: usize,
+        dir: SplitDir,
+        place_after: bool,
+        counter: &mut usize,
+        new_focus: &mut usize,
+    ) -> WorkspaceNode {
+        match node {
+            WorkspaceNode::Empty => WorkspaceNode::Pane {
+                tabs: vec![sess],
+                active: 0,
+            },
+            WorkspaceNode::Pane { tabs, active } => {
+                let cur = *counter;
+                *counter += 1;
+                if cur == target {
+                    let old_pane = WorkspaceNode::Pane {
+                        tabs: tabs.clone(),
+                        active: *active,
+                    };
+                    let new_pane = WorkspaceNode::Pane {
+                        tabs: vec![sess],
+                        active: 0,
+                    };
+                    let children = if place_after {
+                        *new_focus = cur + 1;
+                        vec![old_pane, new_pane]
+                    } else {
+                        *new_focus = cur;
+                        vec![new_pane, old_pane]
+                    };
+                    WorkspaceNode::Split {
+                        dir,
+                        weights: vec![1.0, 1.0],
+                        children,
+                    }
+                } else {
+                    node.clone()
+                }
+            }
+            WorkspaceNode::Split {
+                dir: parent_dir,
+                weights,
+                children,
+            } => {
+                let next_ch: Vec<WorkspaceNode> = children
+                    .iter()
+                    .map(|c| split_pane(c, target, sess, dir, place_after, counter, new_focus))
+                    .collect();
+                WorkspaceNode::Split {
+                    dir: *parent_dir,
+                    weights: if next_ch.len() == weights.len() {
+                        weights.clone()
+                    } else {
+                        vec![1.0; next_ch.len()]
+                    },
+                    children: next_ch,
+                }
+            }
+        }
+    }
+
+    let tree = split_pane(
+        node,
+        target,
+        new_session,
+        dir,
+        place_after,
+        &mut counter,
+        &mut new_focus,
+    );
+    (tree, new_focus)
 }
 
 /// Removes a session without renumbering other sessions (used for drag & drop).
@@ -2597,32 +2699,23 @@ impl SshDeck {
         self.open_pane(&host, config, window, cx);
     }
 
-    /// Creates the pane and appends it as a tab.
-    fn open_pane(
+    /// Creates the pane session for `host` with `config` and registers it in `self.sessions`.
+    /// Returns the session index.
+    fn create_host_session(
         &mut self,
         host: &Host,
         config: SessionConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        // Construct the pane inside its own entity context; the shell only holds
-        // the handle. `TerminalPane::new` returns the pane state, not an entity.
-        // The sidebar's font size and theme apply here so a new pane opens
-        // looking like the existing ones; unknown theme names fall back to the
-        // pane default rather than refusing to connect.
+    ) -> usize {
         let font_size = self.terminal_font_size;
         let scheme = TerminalScheme::by_name(&self.selected_theme).unwrap_or_default();
         let options = TerminalOptions::new(font_size, 10_000, true).with_scheme(scheme);
-        // The default constructor covers the default options; anything else
-        // goes through the options form so the sidebar's font size and theme
-        // apply to the new pane.
         let pane = if options == TerminalOptions::default() {
             cx.new(|cx| TerminalPane::new(config, window, cx))
         } else {
             cx.new(|cx| TerminalPane::new_with_options(config, options, window, cx))
         };
-        // The pane header reports split/max/close back through a weak handle,
-        // the same shape as the palette's `set_on_select`.
         let weak = cx.entity().downgrade();
         let pane_handle = pane.clone();
         pane.update(cx, |pane, _| {
@@ -2656,17 +2749,11 @@ impl SshDeck {
                     .ok();
             });
         });
-        // Re-render the chrome whenever the pane's status changes. The pane is
-        // the only thing that reads the event channel; the shell just mirrors.
         let subscription = cx.observe_in(&pane, window, |this, pane, window, cx| {
             let status = pane.read(cx).status();
-            // Match by handle rather than trusting the active index: the pane can
-            // notify before the tab is registered.
             if let Some(session) = this.sessions.iter_mut().find(|s| s.pane == pane) {
                 session.status = status;
             }
-            // A session that just authenticated is what the SFTP pane attaches
-            // to; a session that ended is what it detaches from.
             this.reconcile_sftp(window, cx);
             this.reconcile_forward(cx);
             cx.notify();
@@ -2681,14 +2768,6 @@ impl SshDeck {
         });
         self.last_session_host = Some(host.id.clone());
         let index = self.sessions.len() - 1;
-        self.active = Some(index);
-        self.tab = MainTab::Session(index);
-        self.overlay = None;
-        pane.update(cx, |pane, cx| pane.focus(window, cx));
-        // The new tab is active now; the SFTP pane must follow it even before the
-        // session reaches `Connected` (it detaches until then).
-        self.reconcile_sftp(window, cx);
-        self.reconcile_forward(cx);
 
         let host_lbl = host.label.clone();
         let host_ep = host.endpoint();
@@ -2722,11 +2801,37 @@ impl SshDeck {
                 cx,
             );
         }
+
+        index
+    }
+
+    /// Creates the pane and appends it as a tab.
+    fn open_pane(
+        &mut self,
+        host: &Host,
+        config: SessionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.create_host_session(host, config, window, cx);
+        self.active = Some(index);
+        self.tab = MainTab::Session(index);
+        self.overlay = None;
+        if let Some(session) = self.sessions.get(index) {
+            session.pane.update(cx, |pane, cx| pane.focus(window, cx));
+        }
+        self.reconcile_sftp(window, cx);
+        self.reconcile_forward(cx);
         cx.notify();
     }
 
-    /// Spawns a local terminal session running the system shell and adds it as a tab.
-    fn open_local_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Spawns a new local terminal session running the system shell and registers it in `self.sessions`.
+    /// Returns the session index.
+    fn create_local_terminal_session(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let font_size = self.terminal_font_size;
         let scheme = TerminalScheme::by_name(&self.selected_theme).unwrap_or_default();
         let options = TerminalOptions::new(font_size, 10_000, true).with_scheme(scheme);
@@ -2801,12 +2906,6 @@ impl SshDeck {
         });
         self.last_session_host = Some(host_id);
         let index = self.sessions.len() - 1;
-        self.active = Some(index);
-        self.tab = MainTab::Session(index);
-        self.overlay = None;
-        pane.update(cx, |pane, cx| pane.focus(window, cx));
-        self.reconcile_sftp(window, cx);
-        self.reconcile_forward(cx);
 
         let logs_pane = self.ensure_logs_pane(window, cx);
         let time_str = current_time_str();
@@ -2823,7 +2922,155 @@ impl SshDeck {
             );
         });
 
+        index
+    }
+
+    /// Spawns a local terminal session running the system shell and adds it as a tab.
+    fn open_local_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.create_local_terminal_session(window, cx);
+        self.active = Some(index);
+        self.tab = MainTab::Session(index);
+        self.overlay = None;
+        if let Some(session) = self.sessions.get(index) {
+            session.pane.update(cx, |pane, cx| pane.focus(window, cx));
+        }
+        self.reconcile_sftp(window, cx);
+        self.reconcile_forward(cx);
         cx.notify();
+    }
+
+    /// Splits `pane_index` in `self.workspace` across `dir`, creating a brand-new independent terminal session.
+    fn split_workspace_pane(
+        &mut self,
+        pane_index: usize,
+        dir: SplitDir,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current_sess_idx = find_pane(&self.workspace, pane_index, &mut 0)
+            .and_then(|(tabs, active)| tabs.get(active).copied())
+            .or(self.active)
+            .unwrap_or(0);
+
+        let is_local = self
+            .sessions
+            .get(current_sess_idx)
+            .map(|s| s.pane.read(cx).is_local())
+            .unwrap_or(true);
+
+        let new_sess_idx = if is_local {
+            self.create_local_terminal_session(window, cx)
+        } else {
+            let host_id = self.sessions.get(current_sess_idx).map(|s| s.host.clone());
+            let host = host_id.and_then(|hid| self.store.inventory().get(&hid).cloned());
+            if let Some(host) = host {
+                let config = match &host.auth {
+                    sshdeck_core::AuthMethod::Password { secret_ref } => {
+                        match resolve_password(self.vault.as_ref(), secret_ref)
+                            .or_else(env_password)
+                        {
+                            Some(password) => {
+                                Some(SessionConfig::from_host(&host).with_password(password))
+                            }
+                            None => None,
+                        }
+                    }
+                    _ => Some(SessionConfig::from_host(&host)),
+                };
+                if let Some(cfg) = config {
+                    self.create_host_session(&host, cfg, window, cx)
+                } else {
+                    self.create_local_terminal_session(window, cx)
+                }
+            } else {
+                self.create_local_terminal_session(window, cx)
+            }
+        };
+
+        let (tree, new_focus) =
+            workspace_split_pane_new_session(&self.workspace, pane_index, new_sess_idx, dir, true);
+        self.workspace = tree;
+        self.workspace_focus = new_focus;
+        self.active = Some(new_sess_idx);
+        self.tab = MainTab::Workspace;
+        self.workspace_maximized = false;
+        if let Some(s) = self.sessions.get(new_sess_idx) {
+            s.pane.update(cx, |p, cx| p.focus(window, cx));
+        }
+        self.reconcile_sftp(window, cx);
+        self.reconcile_forward(cx);
+        cx.notify();
+    }
+
+    /// Checks all leaves in `self.workspace` and ensures each leaf has a unique session.
+    /// If any session is duplicated across panes, duplicate occurrences are replaced with
+    /// fresh independent local terminal sessions.
+    fn ensure_workspace_sessions_unique(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut seen = std::collections::HashSet::new();
+        let leaves = workspace_leaves(&self.workspace);
+        let mut duplicates = Vec::new();
+        for &s in &leaves {
+            if !seen.insert(s) {
+                duplicates.push(s);
+            }
+        }
+        if duplicates.is_empty() {
+            return;
+        }
+
+        let mut replacements = Vec::new();
+        for dup in duplicates {
+            let fresh = self.create_local_terminal_session(window, cx);
+            replacements.push((dup, fresh));
+        }
+
+        fn replace_duplicates(
+            node: &WorkspaceNode,
+            seen: &mut std::collections::HashSet<usize>,
+            replacements: &mut Vec<(usize, usize)>,
+        ) -> WorkspaceNode {
+            match node {
+                WorkspaceNode::Empty => WorkspaceNode::Empty,
+                WorkspaceNode::Pane { tabs, active } => {
+                    let mut next_tabs = Vec::new();
+                    for &t in tabs {
+                        if seen.insert(t) {
+                            next_tabs.push(t);
+                        } else if let Some(pos) = replacements.iter().position(|(old, _)| *old == t)
+                        {
+                            let (_, new_s) = replacements.remove(pos);
+                            next_tabs.push(new_s);
+                            seen.insert(new_s);
+                        }
+                    }
+                    if next_tabs.is_empty() {
+                        next_tabs.push(tabs[0]);
+                    }
+                    WorkspaceNode::Pane {
+                        tabs: next_tabs,
+                        active: (*active).min(next_tabs.len() - 1),
+                    }
+                }
+                WorkspaceNode::Split {
+                    dir,
+                    weights,
+                    children,
+                } => {
+                    let next_ch: Vec<WorkspaceNode> = children
+                        .iter()
+                        .map(|c| replace_duplicates(c, seen, replacements))
+                        .collect();
+                    WorkspaceNode::Split {
+                        dir: *dir,
+                        weights: weights.clone(),
+                        children: next_ch,
+                    }
+                }
+            }
+        }
+
+        let mut second_seen = std::collections::HashSet::new();
+        self.workspace = replace_duplicates(&self.workspace, &mut second_seen, &mut replacements);
     }
 
     #[allow(dead_code)]
@@ -3062,6 +3309,7 @@ impl SshDeck {
                     self.workspace_focus = 0;
                 }
             }
+            self.ensure_workspace_sessions_unique(window, cx);
             self.set_workspace_chrome(false, cx);
             if let Some(&index) = workspace_leaves(&self.workspace).get(self.workspace_focus) {
                 self.active = Some(index);
@@ -3155,11 +3403,69 @@ impl SshDeck {
     /// the upgrade path; it needs the host's `SessionConfig` (and possibly a
     /// second password) and is deliberately not opened here.
     fn workspace_split(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let (workspace, focus) = workspace_insert(&self.workspace, self.workspace_focus, index);
-        self.workspace = workspace;
-        self.workspace_focus = focus;
-        self.workspace_maximized = false;
-        self.select_tab(MainTab::Workspace, window, cx);
+        let leaves = workspace_leaves(&self.workspace);
+        if leaves.is_empty() || (leaves.len() == 1 && leaves.contains(&index)) {
+            let is_local = self
+                .sessions
+                .get(index)
+                .map(|s| s.pane.read(cx).is_local())
+                .unwrap_or(true);
+            let new_session = if is_local {
+                self.create_local_terminal_session(window, cx)
+            } else {
+                let host_id = self.sessions.get(index).map(|s| s.host.clone());
+                let host = host_id.and_then(|hid| self.store.inventory().get(&hid).cloned());
+                if let Some(host) = host {
+                    let config = match &host.auth {
+                        sshdeck_core::AuthMethod::Password { secret_ref } => {
+                            match resolve_password(self.vault.as_ref(), secret_ref)
+                                .or_else(env_password)
+                            {
+                                Some(password) => {
+                                    Some(SessionConfig::from_host(&host).with_password(password))
+                                }
+                                None => None,
+                            }
+                        }
+                        _ => Some(SessionConfig::from_host(&host)),
+                    };
+                    if let Some(cfg) = config {
+                        self.create_host_session(&host, cfg, window, cx)
+                    } else {
+                        self.create_local_terminal_session(window, cx)
+                    }
+                } else {
+                    self.create_local_terminal_session(window, cx)
+                }
+            };
+            self.workspace = WorkspaceNode::Split {
+                dir: SplitDir::Row,
+                weights: vec![1.0, 1.0],
+                children: vec![
+                    WorkspaceNode::Pane {
+                        tabs: vec![index],
+                        active: 0,
+                    },
+                    WorkspaceNode::Pane {
+                        tabs: vec![new_session],
+                        active: 0,
+                    },
+                ],
+            };
+            self.workspace_focus = 1;
+            self.active = Some(new_session);
+            if let Some(session) = self.sessions.get(new_session) {
+                session.pane.update(cx, |p, cx| p.focus(window, cx));
+            }
+            self.workspace_maximized = false;
+            self.select_tab(MainTab::Workspace, window, cx);
+        } else {
+            let (workspace, focus) = workspace_insert(&self.workspace, self.workspace_focus, index);
+            self.workspace = workspace;
+            self.workspace_focus = focus;
+            self.workspace_maximized = false;
+            self.select_tab(MainTab::Workspace, window, cx);
+        }
     }
 
     /// Tiles two sessions side-by-side (active session and `other_index`) in a 2-pane workspace.
@@ -3179,34 +3485,26 @@ impl SshDeck {
         } else if self.sessions.len() > 1 {
             (0..self.sessions.len())
                 .find(|&i| i != current_active)
-                .unwrap_or(0)
+                .unwrap_or_else(|| self.create_local_terminal_session(window, cx))
         } else {
-            current_active
+            self.create_local_terminal_session(window, cx)
         };
 
-        if left == right {
-            self.workspace = WorkspaceNode::Pane {
-                tabs: vec![left],
-                active: 0,
-            };
-            self.workspace_focus = 0;
-        } else {
-            self.workspace = WorkspaceNode::Split {
-                dir: SplitDir::Row,
-                weights: vec![1.0, 1.0],
-                children: vec![
-                    WorkspaceNode::Pane {
-                        tabs: vec![left],
-                        active: 0,
-                    },
-                    WorkspaceNode::Pane {
-                        tabs: vec![right],
-                        active: 0,
-                    },
-                ],
-            };
-            self.workspace_focus = 1;
-        }
+        self.workspace = WorkspaceNode::Split {
+            dir: SplitDir::Row,
+            weights: vec![1.0, 1.0],
+            children: vec![
+                WorkspaceNode::Pane {
+                    tabs: vec![left],
+                    active: 0,
+                },
+                WorkspaceNode::Pane {
+                    tabs: vec![right],
+                    active: 0,
+                },
+            ],
+        };
+        self.workspace_focus = 1;
         self.workspace_maximized = false;
         self.dragged_session = None;
         self.dragged_tab = None;
@@ -3227,10 +3525,15 @@ impl SshDeck {
             return;
         }
         let current_active = self.active.unwrap_or(0);
-        let (first, second) = if place_after {
-            (current_active, dragged)
+        let actual_dragged = if dragged == current_active {
+            self.create_local_terminal_session(window, cx)
         } else {
-            (dragged, current_active)
+            dragged
+        };
+        let (first, second) = if place_after {
+            (current_active, actual_dragged)
+        } else {
+            (actual_dragged, current_active)
         };
         self.workspace = WorkspaceNode::Split {
             dir,
@@ -8333,7 +8636,15 @@ impl SshDeck {
             )
             .tooltip("New tab in this pane")
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.select_tab(MainTab::NewTab, window, cx);
+                let new_session = this.create_local_terminal_session(window, cx);
+                this.workspace =
+                    workspace_insert_tab_into_pane(&this.workspace, pane_index, new_session);
+                this.workspace_focus = pane_index;
+                this.active = Some(new_session);
+                if let Some(session) = this.sessions.get(new_session) {
+                    session.pane.update(cx, |pane, cx| pane.focus(window, cx));
+                }
+                cx.notify();
             }));
 
         let split_h_btn = Button::new(SharedString::from(format!("pane-splith-{pane_index}")))
@@ -8346,17 +8657,8 @@ impl SshDeck {
                     .text_color(btn_color),
             )
             .tooltip("Split side by side")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(active_sess) = this.active {
-                    this.workspace = workspace_split_pane_with_session(
-                        &this.workspace,
-                        pane_index,
-                        active_sess,
-                        SplitDir::Row,
-                        true,
-                    );
-                    cx.notify();
-                }
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.split_workspace_pane(pane_index, SplitDir::Row, window, cx);
             }));
 
         let split_v_btn = Button::new(SharedString::from(format!("pane-splitv-{pane_index}")))
@@ -8369,17 +8671,8 @@ impl SshDeck {
                     .text_color(btn_color),
             )
             .tooltip("Split stacked")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(active_sess) = this.active {
-                    this.workspace = workspace_split_pane_with_session(
-                        &this.workspace,
-                        pane_index,
-                        active_sess,
-                        SplitDir::Col,
-                        true,
-                    );
-                    cx.notify();
-                }
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.split_workspace_pane(pane_index, SplitDir::Col, window, cx);
             }));
 
         let max_btn = Button::new(SharedString::from(format!("pane-max-{pane_index}")))
@@ -8644,8 +8937,8 @@ impl SshDeck {
                 if from_pane == pane_index {
                     tabs.get(from_tab).copied()
                 } else {
-                    let leaves = workspace_leaves(&self.workspace);
-                    leaves.get(from_tab).copied()
+                    find_pane(&self.workspace, from_pane, &mut 0)
+                        .and_then(|(p_tabs, _)| p_tabs.get(from_tab).copied())
                 }
             })
         });
@@ -9667,6 +9960,29 @@ mod tests {
                 active: 1,
             }
         );
+    }
+
+    #[test]
+    fn workspace_split_pane_new_session_works() {
+        let tree = pane(0);
+        let (split_tree, focus) =
+            workspace_split_pane_new_session(&tree, 0, 1, SplitDir::Row, true);
+        assert_eq!(focus, 1);
+        assert_eq!(
+            split_tree,
+            WorkspaceNode::Split {
+                dir: SplitDir::Row,
+                weights: vec![1.0, 1.0],
+                children: vec![pane(0), pane(1)],
+            }
+        );
+        assert_eq!(workspace_leaves(&split_tree), vec![0, 1]);
+
+        // Splitting pane 1 vertically
+        let (split_tree2, focus2) =
+            workspace_split_pane_new_session(&split_tree, 1, 2, SplitDir::Col, true);
+        assert_eq!(focus2, 2);
+        assert_eq!(workspace_leaves(&split_tree2), vec![0, 1, 2]);
     }
 
     #[test]
