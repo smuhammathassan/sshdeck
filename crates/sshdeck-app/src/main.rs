@@ -2126,10 +2126,15 @@ impl SshDeck {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(self.tab, MainTab::Session(_) | MainTab::Workspace) {
-            self.sidebar_open = !self.sidebar_open;
-            cx.notify();
+        match self.tab {
+            MainTab::Vaults => {
+                self.details_open = !self.details_open;
+            }
+            _ => {
+                self.sidebar_open = !self.sidebar_open;
+            }
         }
+        cx.notify();
     }
 
     fn handle_open_settings(
@@ -3066,6 +3071,11 @@ impl SshDeck {
                 }
             }
         }
+        if matches!(tab, MainTab::NewTab) {
+            self.new_tab_query.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        }
         self.reconcile_sftp(window, cx);
         self.reconcile_forward(cx);
         cx.notify();
@@ -3540,6 +3550,11 @@ impl SshDeck {
         let header_bg = rgb(0x1a1d2d);
         let header_fg = rgb(0xffffff);
 
+        let is_panel_open = match self.tab {
+            MainTab::Vaults => self.details_open,
+            _ => self.sidebar_open,
+        };
+
         let update_btn = Button::new("header-update-btn")
             .ghost()
             .small()
@@ -3565,35 +3580,71 @@ impl SshDeck {
                         this.select_left_nav(LeftNav::Logs, window, cx);
                     })),
             )
-            .when(
-                matches!(self.tab, MainTab::Session(_) | MainTab::Workspace),
-                |this| {
-                    let open = self.sidebar_open;
-                    this.child(
-                        Button::new("right-sidebar-toggle")
-                            .ghost()
-                            .icon(
-                                Icon::new(IconName::PanelRight)
-                                    .size(px(16.))
-                                    .text_color(if open { rgb(0x10b981) } else { rgb(0x8d91a5) }),
-                            )
-                            .tooltip(if open {
-                                "Hide sidebar (⌘B)"
+            .child(
+                div()
+                    .id("right-sidebar-toggle-container")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(28.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if is_panel_open {
+                        rgba(0x10b98160)
+                    } else {
+                        rgba(0xffffff18)
+                    })
+                    .bg(if is_panel_open {
+                        rgba(0x10b98126)
+                    } else {
+                        rgba(0xffffff00)
+                    })
+                    .cursor_pointer()
+                    .hover(move |s| {
+                        s.bg(if is_panel_open {
+                            rgba(0x10b9813a)
+                        } else {
+                            rgb(0x25293d)
+                        })
+                        .border_color(if is_panel_open {
+                            rgba(0x10b98190)
+                        } else {
+                            rgba(0xffffff30)
+                        })
+                    })
+                    .tooltip(if is_panel_open {
+                        "Hide sidebar (⌘B)"
+                    } else {
+                        "Show sidebar (⌘B)"
+                    })
+                    .child(
+                        Icon::default()
+                            .data(glyph::PANEL_RIGHT)
+                            .size(px(15.))
+                            .text_color(if is_panel_open {
+                                rgb(0x10b981)
                             } else {
-                                "Show sidebar (⌘B)"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.sidebar_open = !this.sidebar_open;
-                                cx.notify();
-                            })),
+                                rgb(0x8d91a5)
+                            }),
                     )
-                },
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        match this.tab {
+                            MainTab::Vaults => {
+                                this.details_open = !this.details_open;
+                            }
+                            _ => {
+                                this.sidebar_open = !this.sidebar_open;
+                            }
+                        }
+                        cx.notify();
+                    })),
             );
 
         div()
             .flex()
             .flex_row()
             .items_center()
+            .justify_between()
             .gap_2()
             .flex_shrink_0()
             .h(px(40.))
@@ -3608,8 +3659,21 @@ impl SshDeck {
             .border_b_1()
             .border_color(rgba(0xffffff14))
             .window_control_area(WindowControlArea::Drag)
-            .child(self.render_tabs(cx))
-            .child(actions)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .window_control_area(WindowControlArea::None)
+                    .child(self.render_tabs(cx)),
+            )
+            .child(
+                div()
+                    .window_control_area(WindowControlArea::None)
+                    .child(actions),
+            )
     }
 
     /// Opens the add-host sheet. Host creation lives behind the header's `+`
@@ -4063,38 +4127,29 @@ impl SshDeck {
             let close_id = id.clone();
 
             let tab_bg = if is_active {
-                rgb(0x0e3a2f)
+                rgb(0x282c3f)
             } else {
-                rgb(0x222638)
+                rgba(0xffffff00)
             };
             let tab_border = if is_active {
-                rgba(0x10b98160)
+                rgba(0xffffff1e)
             } else {
-                rgba(0xffffff14)
+                rgba(0xffffff00)
             };
             let tab_fg = if is_active {
-                rgb(0x10b981)
+                rgb(0xffffff)
             } else {
-                unselected_fg
+                rgb(0x9fa4ba)
             };
 
             let host_opt = self.store.inventory().get(&session.host);
-            let os_tile = if let Some(host) = host_opt {
-                let tint = host_os_tint(host, rgb(0xe95420).into());
-                div()
-                    .size(px(18.))
-                    .rounded(px(4.))
-                    .bg(tint)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Icon::default()
-                            .data(glyph::UBUNTU_SOLID)
-                            .size(px(12.))
-                            .text_color(rgb(0xffffff)),
-                    )
+            let tint = if let Some(host) = host_opt {
+                host_os_tint(host, rgb(0xe95420).into())
             } else {
+                rgb(0xe95420).into()
+            };
+
+            let os_tile = if is_local {
                 div()
                     .size(px(18.))
                     .rounded(px(4.))
@@ -4108,9 +4163,27 @@ impl SshDeck {
                     .justify_center()
                     .child(
                         Icon::default()
-                            .data(glyph::TERMINAL_PROMPT)
-                            .size(px(11.))
-                            .text_color(tab_fg),
+                            .data(glyph::LOCAL_HOST)
+                            .size(px(12.))
+                            .text_color(if is_active {
+                                rgb(0x10b981)
+                            } else {
+                                rgb(0xd0d4e4)
+                            }),
+                    )
+            } else {
+                div()
+                    .size(px(18.))
+                    .rounded(px(4.))
+                    .bg(tint)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .data(glyph::UBUNTU_SOLID)
+                            .size(px(12.))
+                            .text_color(rgb(0xffffff)),
                     )
             };
 
@@ -4122,9 +4195,9 @@ impl SshDeck {
                         .data(glyph::SPLIT_HORIZONTAL)
                         .size(px(12.))
                         .text_color(if is_active {
-                            rgb(0x10b981)
+                            rgb(0xd0d4e4)
                         } else {
-                            unselected_fg
+                            rgb(0x8d91a5)
                         }),
                 )
                 .tooltip("Tile side-by-side with active session")
@@ -4132,6 +4205,25 @@ impl SshDeck {
                     cx.stop_propagation();
                     this.tile_sessions_side_by_side(index, window, cx);
                 }));
+
+            let close_btn =
+                Button::new(SharedString::from(format!("close-tab-{index}-{close_id}")))
+                    .ghost()
+                    .xsmall()
+                    .icon(
+                        Icon::new(IconName::Close)
+                            .size(px(11.))
+                            .text_color(if is_active {
+                                rgb(0x8d91a5)
+                            } else {
+                                rgba(0xffffff40)
+                            }),
+                    )
+                    .tooltip("Close session (⌘W)")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_session(index, window, cx);
+                    }));
 
             let mut tab_div = div()
                 .id(SharedString::from(format!("tab-{index}-{id}")))
@@ -4149,7 +4241,9 @@ impl SshDeck {
                 .border_1()
                 .border_color(tab_border)
                 .text_color(tab_fg)
-                .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
+                .when(!is_active, |el| {
+                    el.hover(move |s| s.bg(hover_bg).text_color(rgb(0xffffff)))
+                })
                 .when(is_this_dragged, |el| {
                     el.bg(rgba(0x2091f630))
                         .border_1()
@@ -4182,42 +4276,17 @@ impl SshDeck {
                             }
                         }
                     }),
-                );
-
-            // Close button on the LEFT for active tab (matching Termius Screenshot 13, 22),
-            // and host/terminal icon on the left for inactive tabs (matching Termius Screenshot 1, 12).
-            if is_active {
-                tab_div = tab_div.child(
-                    Button::new(SharedString::from(format!("close-tab-{index}-{close_id}")))
-                        .ghost()
-                        .xsmall()
-                        .icon(
-                            Icon::new(IconName::Close)
-                                .size(px(12.))
-                                .text_color(rgb(0x10b981)),
-                        )
-                        .tooltip("Close session")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.close_session(index, window, cx);
-                        })),
-                );
-            } else {
-                tab_div = tab_div.child(os_tile);
-            }
-
-            tab_div = tab_div.child(
-                div()
-                    .text_size(px(12.))
-                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .min_w(px(0.))
-                    .truncate()
-                    .child(SharedString::from(label)),
-            );
-
-            if is_active {
-                tab_div = tab_div.child(div().size(px(5.)).rounded_full().bg(rgb(0x10b981)));
-            }
+                )
+                .child(os_tile)
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .min_w(px(0.))
+                        .truncate()
+                        .child(SharedString::from(label)),
+                )
+                .child(close_btn);
 
             if has_multi {
                 tab_div = tab_div.child(split_btn);
@@ -4228,10 +4297,9 @@ impl SshDeck {
             })));
         }
 
-        // 5. [ ✕ New Tab ] / [ + New Tab ] tab pill (matching Termius Screenshot 12, 19, 22, 27)
+        // 5. [ ✕ New Tab ] tab pill when active (matching Termius Screenshot 12, 19, 22, 27)
         let is_new_tab_active = self.tab == MainTab::NewTab && self.overlay.is_none();
-        let show_new_tab_pill = is_new_tab_active || !self.sessions.is_empty() || show_ws_tab;
-        if show_new_tab_pill {
+        if is_new_tab_active {
             let new_tab_item = div()
                 .id("tab-new-tab")
                 .flex()
@@ -4243,45 +4311,23 @@ impl SshDeck {
                 .rounded(px(6.))
                 .cursor_pointer()
                 .flex_shrink_0()
-                .bg(if is_new_tab_active {
-                    selected_bg
-                } else {
-                    rgb(0x222638)
-                })
+                .bg(rgb(0x282c3f))
                 .border_1()
-                .border_color(if is_new_tab_active {
-                    selected_border
-                } else {
-                    rgba(0xffffff14)
-                })
-                .text_color(if is_new_tab_active {
-                    selected_fg
-                } else {
-                    unselected_fg
-                })
-                .when(!is_new_tab_active, |el| el.hover(move |s| s.bg(hover_bg)))
-                .when(is_new_tab_active, |el| {
-                    el.child(
-                        Button::new("close-new-tab")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .tooltip("Close tab")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                cx.stop_propagation();
-                                let fallback =
-                                    this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
-                                this.select_tab(fallback, window, cx);
-                            })),
-                    )
-                })
-                .when(!is_new_tab_active, |el| {
-                    el.child(
-                        Icon::new(IconName::Plus)
-                            .size(px(12.))
-                            .text_color(unselected_fg),
-                    )
-                })
+                .border_color(rgba(0xffffff1e))
+                .text_color(selected_fg)
+                .child(
+                    Button::new("close-new-tab")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip("Close tab")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            let fallback =
+                                this.active.map(MainTab::Session).unwrap_or(MainTab::Vaults);
+                            this.select_tab(fallback, window, cx);
+                        })),
+                )
                 .child(
                     div()
                         .text_size(px(12.))
@@ -4289,24 +4335,27 @@ impl SshDeck {
                         .min_w(px(0.))
                         .truncate()
                         .child("New Tab"),
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.select_tab(MainTab::NewTab, window, cx);
-                }));
+                );
 
             strip = strip.child(new_tab_item);
         }
 
-        // 6. Quick add tab `+` button right next to `New Tab`
-        let add_btn = Button::new("add-tab-btn")
-            .ghost()
-            .xsmall()
-            .icon(
+        // 6. Quick add tab `+` button directly next to tabs
+        let add_btn = div()
+            .id("add-tab-btn")
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(26.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0x222638)))
+            .tooltip("New tab (⌘T)")
+            .child(
                 Icon::new(IconName::Plus)
                     .size(px(14.))
-                    .text_color(unselected_fg),
+                    .text_color(rgb(0x8d91a5)),
             )
-            .tooltip("New tab (⌘T)")
             .on_click(cx.listener(|this, _, window, cx| {
                 this.select_tab(MainTab::NewTab, window, cx);
             }));
@@ -5099,29 +5148,31 @@ impl SshDeck {
         let tint = host_os_tint(host, orange.into());
 
         let edit_id = host.id.clone();
-        let edit_btn = div()
-            .id(SharedString::from(format!("card-edit-{}", host.id)))
-            .p_1()
-            .rounded(px(6.))
-            .hover(|s| s.bg(rgb(0xf0f2f5)))
-            .cursor_pointer()
-            .child(
-                Icon::default()
-                    .data(glyph::PENCIL)
-                    .size(px(14.))
-                    .text_color(if is_selected {
-                        border_selected
-                    } else {
-                        rgb(0x8d9ba3)
-                    }),
+        let edit_btn = if is_selected {
+            Some(
+                div()
+                    .id(SharedString::from(format!("card-edit-{}", host.id)))
+                    .p_1()
+                    .rounded(px(6.))
+                    .hover(|s| s.bg(rgb(0xf0f2f5)))
+                    .cursor_pointer()
+                    .child(
+                        Icon::default()
+                            .data(glyph::PENCIL)
+                            .size(px(14.))
+                            .text_color(border_selected),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.selected = Some(edit_id.clone());
+                        this.details_open = true;
+                        this.sync_details_inputs(window, cx);
+                        cx.notify();
+                    })),
             )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                cx.stop_propagation();
-                this.selected = Some(edit_id.clone());
-                this.details_open = true;
-                this.sync_details_inputs(window, cx);
-                cx.notify();
-            }));
+        } else {
+            None
+        };
 
         div()
             .id(SharedString::from(format!("vault-card-{id}")))
@@ -5144,6 +5195,9 @@ impl SshDeck {
                 border_default
             })
             .when(is_selected, |el| el.border_2())
+            .when(!is_selected, |el| {
+                el.hover(|s| s.border_color(rgb(0xb0c4de)))
+            })
             .shadow_xs()
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -5193,7 +5247,7 @@ impl SshDeck {
                             .child(SharedString::from(tags_str)),
                     ),
             )
-            .child(edit_btn)
+            .when_some(edit_btn, |el, btn| el.child(btn))
             .into_any_element()
     }
 
