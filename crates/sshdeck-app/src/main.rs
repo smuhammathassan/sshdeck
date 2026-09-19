@@ -2998,14 +2998,9 @@ impl SshDeck {
             if let Some(host) = host {
                 let config = match &host.auth {
                     sshdeck_core::AuthMethod::Password { secret_ref } => {
-                        match resolve_password(self.vault.as_ref(), secret_ref.as_str())
+                        resolve_password(self.vault.as_ref(), secret_ref.as_str())
                             .or_else(env_password)
-                        {
-                            Some(password) => {
-                                Some(SessionConfig::from_host(&host).with_password(password))
-                            }
-                            None => None,
-                        }
+                            .map(|password| SessionConfig::from_host(&host).with_password(password))
                     }
                     _ => Some(SessionConfig::from_host(&host)),
                 };
@@ -3451,14 +3446,11 @@ impl SshDeck {
                 if let Some(host) = host {
                     let config = match &host.auth {
                         sshdeck_core::AuthMethod::Password { secret_ref } => {
-                            match resolve_password(self.vault.as_ref(), secret_ref.as_str())
+                            resolve_password(self.vault.as_ref(), secret_ref.as_str())
                                 .or_else(env_password)
-                            {
-                                Some(password) => {
-                                    Some(SessionConfig::from_host(&host).with_password(password))
-                                }
-                                None => None,
-                            }
+                                .map(|password| {
+                                    SessionConfig::from_host(&host).with_password(password)
+                                })
                         }
                         _ => Some(SessionConfig::from_host(&host)),
                     };
@@ -8558,17 +8550,6 @@ impl SshDeck {
             } else {
                 rgba(0xffffff00)
             };
-
-            let drag_btn = Button::new(SharedString::from(format!("drag-{pane_index}-{tab_idx}")))
-                .ghost()
-                .xsmall()
-                .label("⋮⋮")
-                .tooltip("Drag tab to move or split")
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.dragged_tab = Some((pane_index, tab_idx));
-                    this.dragged_session = Some(session_idx);
-                    cx.notify();
-                }));
 
             let close_btn = Button::new(SharedString::from(format!(
                 "close-tab-{pane_index}-{tab_idx}"
