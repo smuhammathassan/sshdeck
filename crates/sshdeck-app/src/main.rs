@@ -3612,10 +3612,13 @@ impl SshDeck {
                             rgba(0xffffff30)
                         })
                     })
-                    .tooltip(if is_panel_open {
-                        "Hide sidebar (⌘B)"
-                    } else {
-                        "Show sidebar (⌘B)"
+                    .tooltip({
+                        let tip = if is_panel_open {
+                            "Hide sidebar (⌘B)"
+                        } else {
+                            "Show sidebar (⌘B)"
+                        };
+                        move |window, cx| Tooltip::new(tip).build(window, cx)
                     })
                     .child(
                         Icon::default()
@@ -3658,22 +3661,14 @@ impl SshDeck {
             .pr_3()
             .border_b_1()
             .border_color(rgba(0xffffff14))
-            .window_control_area(WindowControlArea::Drag)
+            .child(self.render_tabs(cx))
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
                     .flex_1()
-                    .min_w(px(0.))
-                    .window_control_area(WindowControlArea::None)
-                    .child(self.render_tabs(cx)),
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag),
             )
-            .child(
-                div()
-                    .window_control_area(WindowControlArea::None)
-                    .child(actions),
-            )
+            .child(actions)
     }
 
     /// Opens the add-host sheet. Host creation lives behind the header's `+`
@@ -4350,7 +4345,7 @@ impl SshDeck {
             .rounded(px(6.))
             .cursor_pointer()
             .hover(|s| s.bg(rgb(0x222638)))
-            .tooltip("New tab (⌘T)")
+            .tooltip(|window, cx| Tooltip::new("New tab (⌘T)").build(window, cx))
             .child(
                 Icon::new(IconName::Plus)
                     .size(px(14.))
