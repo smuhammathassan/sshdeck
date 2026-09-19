@@ -790,6 +790,24 @@ impl KeysPane {
                                 this.cert_only = !this.cert_only;
                                 cx.notify();
                             })),
+                    )
+                    .child(
+                        Button::new("keys-touch-id")
+                            .ghost()
+                            .icon(Icon::default().data(glyph::FINGERPRINT))
+                            .label("Touch ID")
+                            .tooltip(
+                                "Touch ID biometric authentication (Requires hardware enclave)",
+                            )
+                            .disabled(true),
+                    )
+                    .child(
+                        Button::new("keys-fido2")
+                            .ghost()
+                            .icon(Icon::default().data(glyph::SECURITY_KEY))
+                            .label("FIDO2")
+                            .tooltip("FIDO2 / WebAuthn hardware security key authentication")
+                            .disabled(true),
                     );
             }
             KeysSection::Hosts => {
@@ -800,7 +818,6 @@ impl KeysPane {
                     .child(
                         Button::new("import-known-hosts")
                             .small()
-                            .icon(IconName::Inbox)
                             .label("Import")
                             .tooltip("Import known_hosts file")
                             .selected(self.show_import)
@@ -1734,9 +1751,9 @@ impl KeysPane {
                 let meta = String::new();
                 let id = SharedString::from(format!("known-{title}-{}", entry.key_type));
                 let row = match self.view {
-                    ViewMode::Grid => card(id, glyph::FINGERPRINT, title, meta, false, alarm, cx),
+                    ViewMode::Grid => card(id, glyph::RADIOWAVES, title, meta, false, alarm, cx),
                     ViewMode::List => {
-                        list_row(id, glyph::FINGERPRINT, title, meta, false, alarm, cx)
+                        list_row(id, glyph::RADIOWAVES, title, meta, false, alarm, cx)
                     }
                 };
                 match (entry.revoked, changed) {

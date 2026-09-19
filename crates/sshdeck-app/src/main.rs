@@ -5197,15 +5197,68 @@ impl SshDeck {
             .into_any_element()
     }
 
+    /// Miniature terminal preview swatch matching Termius design (Screenshot 2026-09-17 at 3.09.09 PM).
+    fn render_terminal_theme_swatch(scheme: &TerminalScheme) -> Div {
+        let bg = scheme.background();
+        let fg = scheme.foreground();
+        let cursor = scheme.cursor();
+        let green = scheme.ansi(2).unwrap_or(fg);
+        let cyan = scheme.ansi(6).unwrap_or(fg);
+        let blue = scheme.ansi(4).unwrap_or(fg);
+
+        div()
+            .w(px(60.))
+            .h(px(38.))
+            .flex_shrink_0()
+            .rounded(px(6.))
+            .bg(bg)
+            .border_1()
+            .border_color(rgba(0x8d91a520))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(3.5))
+            .px(px(6.))
+            // Line 1: prompt + command
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(3.))
+                    .child(div().w(px(24.)).h(px(3.5)).rounded_full().bg(green))
+                    .child(div().w(px(14.)).h(px(3.5)).rounded_full().bg(fg)),
+            )
+            // Line 2: output line
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(3.))
+                    .child(div().w(px(16.)).h(px(3.5)).rounded_full().bg(cyan))
+                    .child(div().w(px(22.)).h(px(3.5)).rounded_full().bg(blue)),
+            )
+            // Line 3: prompt + cursor
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(3.))
+                    .child(div().w(px(10.)).h(px(3.5)).rounded_full().bg(green))
+                    .child(div().w(px(4.)).h(px(5.)).rounded(px(1.)).bg(cursor)),
+            )
+    }
+
     /// Full-panel theme browser: back header plus one h56 row per scheme.
     ///
-    /// The inline dropdown could not show swatches, so the theme row
-    /// navigates here instead. Rows reuse the `SCHEMES` registry and the same
-    /// apply path as the sidebar theme list.
+    /// Navigates back to host details on selection. Rows reuse the `SCHEMES`
+    /// registry with rich miniature terminal swatches and Termius blue selection.
     fn render_theme_browser(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
-        let accent = cx.theme().primary;
+        let accent = rgb(0x1677ff);
         let card_bg = cx.theme().popover;
         let selected = self.selected_theme.clone();
         div()
@@ -5220,11 +5273,12 @@ impl SshDeck {
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .mb_1()
                     .child(
                         Button::new("theme-browser-back")
                             .ghost()
-                            .small()
-                            .label("‹ Back")
+                            .icon(Icon::default().data(glyph::ARROW_LEFT))
+                            .tooltip("Back to Host Details")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.theme_picker_open = false;
                                 cx.notify();
@@ -5232,7 +5286,7 @@ impl SshDeck {
                     )
                     .child(
                         div()
-                            .text_size(px(17.))
+                            .text_size(px(16.))
                             .font_weight(gpui_kit::FontWeight::BOLD)
                             .text_color(fg)
                             .child("Select Color Theme"),
@@ -5240,9 +5294,12 @@ impl SshDeck {
             )
             .children(SCHEMES.iter().map(|(name, scheme)| {
                 let chosen = *name == selected;
-                let swatch_bg: Hsla = scheme.background().into();
-                let swatch_fg: Hsla = scheme.foreground().into();
                 let theme_name = name.to_string();
+                let meta_text = match *name {
+                    "Termius Dark" => "∞",
+                    "Flexoki Dark" | "Flexoki Light" => "new",
+                    _ => scheme.meta(),
+                };
                 div()
                     .id(SharedString::from(format!("details-theme-{name}")))
                     .flex()
@@ -5251,10 +5308,16 @@ impl SshDeck {
                     .gap_3()
                     .w_full()
                     .h(px(56.))
-                    .p_2()
-                    .rounded(px(14.))
-                    .bg(card_bg)
-                    .when(chosen, |s| s.border_1().border_color(accent))
+                    .px_3()
+                    .py_2()
+                    .rounded(px(12.))
+                    .bg(if chosen { rgba(0x1677ff14) } else { card_bg })
+                    .border_1()
+                    .border_color(if chosen {
+                        rgba(0x1677ff55)
+                    } else {
+                        rgba(0x00000000)
+                    })
                     .cursor_pointer()
                     .hover(|s| s.bg(cx.theme().muted))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -5263,37 +5326,31 @@ impl SshDeck {
                         this.apply_terminal_scheme(window, cx);
                         cx.notify();
                     }))
-                    .child(
-                        div()
-                            .w(px(64.))
-                            .h(px(40.))
-                            .flex_shrink_0()
-                            .rounded(px(6.))
-                            .bg(swatch_bg)
-                            .border_1()
-                            .border_color(swatch_fg)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(div().text_size(px(10.)).text_color(swatch_fg).child("$▮")),
-                    )
+                    .child(Self::render_terminal_theme_swatch(scheme))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap_1()
+                            .gap_0p5()
                             .flex_1()
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(fg)
+                                    .font_weight(if chosen {
+                                        gpui_kit::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui_kit::FontWeight::MEDIUM
+                                    })
+                                    .text_color(if chosen { accent } else { fg })
                                     .child(SharedString::from(name.to_string())),
                             )
-                            .child(div().text_xs().text_color(muted).child("16 colors")),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(SharedString::from(meta_text.to_string())),
+                            ),
                     )
-                    .when(chosen, |s| {
-                        s.child(Icon::new(IconName::Check).text_color(accent))
-                    })
             }))
             .into_any_element()
     }
@@ -6081,39 +6138,10 @@ impl SshDeck {
                                                         },
                                                     ))
                                                     .child(
-                                                        // Termius terminal preview
-                                                        // (#1d2033) with green bars.
-                                                        div()
-                                                            .w(px(56.))
-                                                            .h(px(36.))
-                                                            .rounded(px(6.))
-                                                            .bg(rgb(0x1d2033))
-                                                            .flex()
-                                                            .flex_col()
-                                                            .justify_center()
-                                                            .gap_1()
-                                                            .px_2()
-                                                            .child(
-                                                                div()
-                                                                    .w(px(28.))
-                                                                    .h(px(3.))
-                                                                    .rounded_full()
-                                                                    .bg(rgb(0x21b568)),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(36.))
-                                                                    .h(px(3.))
-                                                                    .rounded_full()
-                                                                    .bg(rgb(0x21b568)),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(20.))
-                                                                    .h(px(3.))
-                                                                    .rounded_full()
-                                                                    .bg(rgb(0x21b568)),
-                                                            ),
+                                                        Self::render_terminal_theme_swatch(
+                                                            &TerminalScheme::by_name(&selected_theme)
+                                                                .unwrap_or_default(),
+                                                        ),
                                                     )
                                                     .child(
                                                         div()
@@ -7741,11 +7769,12 @@ impl SshDeck {
             )
             .children(SCHEMES.iter().map(|(name, scheme)| {
                 let chosen = selected == *name;
-                let swatch_bg: Hsla = scheme.background().into();
-                let swatch_fg: Hsla = scheme.foreground().into();
-                let swatch_cursor: Hsla = scheme.cursor().into();
                 let theme_name = name.to_string();
-                let theme_meta = scheme.meta();
+                let meta_text = match *name {
+                    "Termius Dark" => "∞",
+                    "Flexoki Dark" | "Flexoki Light" => "new",
+                    _ => scheme.meta(),
+                };
                 div()
                     .id(SharedString::from(format!("side-theme-{name}")))
                     .flex()
@@ -7754,10 +7783,15 @@ impl SshDeck {
                     .gap_3()
                     .w_full()
                     .p_2()
-                    .rounded(px(8.))
+                    .rounded(px(10.))
+                    .bg(if chosen {
+                        rgba(0x1677ff14)
+                    } else {
+                        rgba(0x00000000)
+                    })
                     .border_1()
                     .border_color(if chosen {
-                        cx.theme().success
+                        rgba(0x1677ff55)
                     } else {
                         rgba(0x8d91a51a).into()
                     })
@@ -7768,60 +7802,37 @@ impl SshDeck {
                         this.apply_terminal_scheme(window, cx);
                         cx.notify();
                     }))
-                    .child(
-                        div()
-                            .w(px(64.))
-                            .h(px(40.))
-                            .flex_shrink_0()
-                            .rounded(px(6.))
-                            .bg(swatch_bg)
-                            .border_1()
-                            .border_color(swatch_fg)
-                            .flex()
-                            .flex_col()
-                            .justify_center()
-                            .gap(px(4.))
-                            .px(px(8.))
-                            // Mini terminal preview: two text bars plus a
-                            // prompt row with a cursor block, in the scheme's
-                            // own colours on its background.
-                            .child(div().w_full().h(px(4.)).rounded_full().bg(swatch_fg))
-                            .child(div().w(px(36.)).h(px(4.)).rounded_full().bg(swatch_fg))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(3.))
-                                    .child(
-                                        div().w(px(10.)).h(px(4.)).rounded_full().bg(swatch_cursor),
-                                    )
-                                    .child(
-                                        div().w(px(6.)).h(px(8.)).rounded(px(1.)).bg(swatch_cursor),
-                                    ),
-                            ),
-                    )
+                    .child(Self::render_terminal_theme_swatch(scheme))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap_1()
+                            .gap_0p5()
                             .flex_1()
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(cx.theme().foreground)
+                                    .font_weight(if chosen {
+                                        gpui_kit::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui_kit::FontWeight::MEDIUM
+                                    })
+                                    .text_color(if chosen {
+                                        rgb(0x1677ff)
+                                    } else {
+                                        cx.theme().foreground
+                                    })
                                     .child(SharedString::from(name.to_string())),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(theme_meta),
+                                    .child(SharedString::from(meta_text.to_string())),
                             ),
                     )
                     .when(chosen, |el| {
-                        el.child(Icon::new(IconName::Check).text_color(cx.theme().success))
+                        el.child(Icon::new(IconName::Check).text_color(rgb(0x1677ff)))
                     })
             }))
             .into_any_element()
